@@ -4,6 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
+use super::code::CodeCommand;
 use super::editor::{InsertTarget, Path};
 use crate::protocol::{Component, ComponentAction};
 
@@ -18,14 +19,15 @@ pub enum InputPurpose {
     ProfileUrl(String),
     ProfileInterval(String),
     ExportProfile(String),
-    /// A scalar of the profile open in the editor.
+    /// A scalar of the profile open in the tree view.
     EditValue(Path),
-    /// Any node of the profile open in the editor, typed as JSON.
-    EditJson(Path),
     RenameKey(Path),
     /// Name of a new object member; its value is chosen next.
     NewKey(InsertTarget),
     Search,
+    /// A field drawn inside a view (the code editor's find bar), never
+    /// submitted as a popup.
+    Inline,
 }
 
 pub struct Input {
@@ -118,8 +120,9 @@ impl Input {
                 let (before, _) = self.split();
                 let trimmed = before.trim_end();
                 let start = trimmed
-                    .rfind(|c: char| c.is_whitespace() || "/.:,".contains(c))
-                    .map_or(0, |i| i + 1);
+                    .char_indices()
+                    .rfind(|(_, c)| c.is_whitespace() || "/.:,".contains(*c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
                 let removed = before[start..].chars().count();
                 let end = self.byte(self.cursor);
                 self.value.replace_range(start..end, "");
@@ -166,19 +169,13 @@ pub enum ProfileAction {
     Delete,
 }
 
-/// A whole profile, or one node of the profile open in the tree editor,
-/// handed to `$EDITOR`.
+/// A profile handed to `$VISUAL` or `$EDITOR`.
 #[derive(Debug, Clone)]
 pub struct ExternalEdit {
+    pub id: String,
     pub name: String,
+    pub active: bool,
     pub text: String,
-    pub target: ExternalTarget,
-}
-
-#[derive(Debug, Clone)]
-pub enum ExternalTarget {
-    Profile { id: String, active: bool },
-    Node(Path),
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +202,8 @@ pub enum MenuAction {
         from_editor: bool,
     },
     EditAgain(ExternalEdit),
+    /// A command of the code editor.
+    Code(CodeCommand),
     Dismiss,
 }
 
@@ -306,5 +305,9 @@ mod tests {
         assert_eq!(input.value, "置文x ");
         input.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(input.value.is_empty() && input.cursor == 0);
+        // Words end at any space, full-width ones too.
+        input.paste("a\u{3000}b");
+        input.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(input.value, "a\u{3000}");
     }
 }

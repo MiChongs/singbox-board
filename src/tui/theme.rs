@@ -27,6 +27,12 @@ pub const YELLOW: Color = Color::Rgb(249, 226, 175);
 pub const PEACH: Color = Color::Rgb(250, 179, 135);
 pub const RED: Color = Color::Rgb(243, 139, 168);
 
+/// Backgrounds of the text editor: the cursor line, the selection and
+/// search matches.
+pub const CURRENT_LINE: Color = Color::Rgb(40, 41, 59);
+pub const SELECTION: Color = Color::Rgb(66, 78, 122);
+pub const MATCH: Color = Color::Rgb(94, 84, 52);
+
 /// Upload / download colours used for traffic everywhere.
 pub const UP: Color = PEACH;
 pub const DOWN: Color = TEAL;

@@ -724,7 +724,7 @@ pub async fn profile_new(
     let (profile, message) = client.profile_saved(request).await?;
     println!("{message}");
     if edit {
-        profile_edit(client, &profile.id, false).await?;
+        profile_edit(client, &profile.id, false, false).await?;
         if activate {
             let request = Request::ProfileActivate {
                 id: profile.id,
@@ -746,9 +746,26 @@ pub async fn profile_show(client: &DaemonClient, query: &str) -> Result<()> {
     Ok(())
 }
 
-/// Opens a profile in the user's editor until it is saved or given up.
-pub async fn profile_edit(client: &DaemonClient, query: &str, force: bool) -> Result<()> {
+/// Opens a profile in the built-in editor, or with `external` in
+/// `$VISUAL`/`$EDITOR` until it is saved or given up.
+pub async fn profile_edit(
+    client: &DaemonClient,
+    query: &str,
+    force: bool,
+    external: bool,
+) -> Result<()> {
     let (profile, original) = client.profile(query).await?;
+    if !external {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!(fl!("ctl-profile-edit-needs-terminal"));
+        }
+        let message = crate::tui::edit(client.clone(), profile, original, force).await?;
+        println!(
+            "{}",
+            message.unwrap_or_else(|| fl!("ctl-profile-no-changes"))
+        );
+        return Ok(());
+    }
     let mut text = original.clone();
     loop {
         text = crate::util::edit_text(&text, &profile.name)?;

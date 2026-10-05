@@ -56,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Popup::Menu(menu)) => draw_menu(frame, menu),
         Some(Popup::Input(input)) => draw_input(frame, input),
         Some(Popup::EditorHelp) => draw_editor_help(frame),
+        Some(Popup::CodeHelp) => draw_code_help(frame),
         None => {}
     }
 }
@@ -186,7 +187,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Overview => Vec::new(),
     };
     // The editor takes these keys itself.
-    let global = if app.tab == Tab::Profiles && app.profiles.editor.is_some() {
+    let global = if app.tab == Tab::Profiles && app.profiles.code.is_some() {
         Vec::new()
     } else {
         vec![
@@ -966,6 +967,10 @@ fn wrapped_rows(lines: &[Line], width: u16) -> u16 {
 
 /// A section title (empty key) or a `key  description` row.
 fn help_lines(rows: &[(&'static str, String)]) -> Vec<Line<'static>> {
+    help_lines_with(rows, 13)
+}
+
+fn help_lines_with(rows: &[(&'static str, String)], key_width: usize) -> Vec<Line<'static>> {
     rows.iter()
         .map(|(k, desc)| {
             if k.is_empty() && desc.is_empty() {
@@ -974,7 +979,7 @@ fn help_lines(rows: &[(&'static str, String)]) -> Vec<Line<'static>> {
                 Line::from(Span::styled(desc.clone(), Style::new().fg(ACCENT).bold()))
             } else {
                 Line::from(vec![
-                    Span::styled(format!("  {k:<13}"), Style::new().fg(TEXT).bold()),
+                    Span::styled(format!("  {k:<key_width$} "), Style::new().fg(TEXT).bold()),
                     dim(desc.clone()),
                 ])
             }
@@ -1280,13 +1285,12 @@ fn draw_editor_help(frame: &mut Frame) {
         ("", fl!("help-editor-file")),
         ("s", fl!("help-editor-save")),
         ("u / U", fl!("help-editor-undo")),
-        ("q / Esc", fl!("help-editor-close")),
+        ("q / Esc / F2", fl!("help-editor-close")),
     ]);
     let right = help_lines(&[
         ("", fl!("help-editor-change")),
         ("Enter / e", fl!("help-editor-edit")),
-        (":", fl!("help-editor-json")),
-        ("E", fl!("help-editor-external")),
+        (": / E", fl!("help-editor-json")),
         ("a / A", fl!("help-editor-add")),
         ("r", fl!("help-editor-rename")),
         ("d", fl!("help-editor-delete")),
@@ -1305,6 +1309,29 @@ fn draw_editor_help(frame: &mut Frame) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
     frame.render_widget(Paragraph::new(left), l);
     frame.render_widget(Paragraph::new(right), r);
+}
+
+fn draw_code_help(frame: &mut Frame) {
+    let [left, right] = super::code::help_rows();
+    let left = help_lines_with(&left, 13);
+    let right = help_lines_with(&right, 13);
+    let height = left.len().max(right.len()) as u16 + 4;
+    let area = popup_area(frame, 116, height);
+    frame.render_widget(Clear, area);
+    let block = panel(&fl!("help-code-title"), true)
+        .title_top(Line::from(dim(format!(" {} ", fl!("help-close-hint")))).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [columns, note] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+    let [l, r] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(columns);
+    frame.render_widget(Paragraph::new(left), l);
+    frame.render_widget(Paragraph::new(right), r);
+    frame.render_widget(
+        Paragraph::new(dim(fl!("help-code-note"))).wrap(Wrap { trim: true }),
+        note,
+    );
 }
 
 fn first_line(text: &str) -> String {

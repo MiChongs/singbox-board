@@ -1,6 +1,6 @@
 //! The "Profiles" tab: the configuration store with an overview of the
 //! selected profile, actions to import, create, switch and update profiles,
-//! and the tree editor.
+//! and the tree view of the editor (the text view lives in `code`).
 
 use std::path::PathBuf;
 
@@ -13,13 +13,11 @@ use ratatui::widgets::{Cell, List, ListItem, ListState, Paragraph, Row, Table, T
 use serde_json::Value;
 
 use super::app::{App, AppEvent, PendingAction, Popup, Tab};
+use super::code::{self, CodeEditor};
 use super::editor::{
-    Editor, InsertTarget, Path, Seg, display_path, get, index_of, is_container, parse_json,
-    parse_scalar,
+    Editor, InsertTarget, Path, Seg, display_path, get, index_of, is_container, parse_scalar,
 };
-use super::popup::{
-    ExternalEdit, ExternalTarget, Input, InputPurpose, Menu, MenuAction, MenuItem, ProfileAction,
-};
+use super::popup::{ExternalEdit, Input, InputPurpose, Menu, MenuAction, MenuItem, ProfileAction};
 use super::templates;
 use super::theme::{
     self, ACCENT, BLUE, DIM, GREEN, MARK, PEACH, RED, SKY, SUBTEXT, TEXT, YELLOW, chip, dim, field,
@@ -28,12 +26,12 @@ use super::theme::{
 use crate::i18n::fl;
 use crate::profile::{self, Summary, interval_label, item_label, local_time, usage_label};
 use crate::protocol::{Profile, ProfileList, Request};
-use crate::util::{error_chain, fmt_bytes, join_list, now_unix, text_width};
+use crate::util::{
+    error_chain, external_editor_configured, fmt_bytes, join_list, now_unix, text_width,
+};
 
 /// Seconds between list refreshes while the tab is open.
 const REFRESH_TICKS: usize = 40;
-/// Longest JSON typed inline; bigger nodes go to `$EDITOR`.
-const INLINE_JSON: usize = 4000;
 
 /// Why a profile's content was requested.
 pub enum ContentPurpose {
@@ -50,9 +48,9 @@ pub enum SavePurpose {
     Created {
         edit: bool,
     },
-    /// Saved from the tree editor; `saved` becomes its clean state.
-    Editor {
-        saved: Value,
+    /// Saved from the code editor; `saved` becomes its clean state.
+    Code {
+        saved: String,
     },
     /// Saved from `$EDITOR`; kept to edit again if the save fails.
     External(ExternalEdit),
@@ -79,8 +77,13 @@ pub struct ProfilesView {
     pub preview: Option<Preview>,
     /// (id, updated_at) of a preview request in flight.
     preview_pending: Option<(String, u64)>,
+    /// The code editor of the open profile.
+    pub code: Option<CodeEditor>,
+    /// Its tree view, while shown.
     pub editor: Option<Editor>,
     pub editor_state: ListState,
+    /// What the code editor copied or cut last.
+    pub clip: Option<String>,
     ticks: usize,
 }
 
@@ -115,7 +118,7 @@ impl App {
 
     /// Re-reads the list after an action and every few seconds while shown.
     pub(super) fn profiles_tick(&mut self) {
-        if self.tab != Tab::Profiles || self.profiles.editor.is_some() {
+        if self.tab != Tab::Profiles || self.profiles.code.is_some() {
             return;
         }
         self.profiles.ticks += 1;
@@ -213,31 +216,17 @@ impl App {
                 let Ok((profile, content)) = result else {
                     return;
                 };
-                match Editor::new(profile, &content) {
-                    Ok(editor) => {
-                        if editor.had_comments {
-                            self.notify(fl!("tui-editor-comments"), false);
-                        }
-                        self.profiles.editor = Some(editor);
-                        self.profiles.editor_state = ListState::default();
-                    }
-                    Err(err) => self.notify(
-                        format!("{}\n{}", fl!("tui-editor-unparsable"), error_chain(&err)),
-                        true,
-                    ),
-                }
+                self.open_code_editor(profile, &content);
             }
             ContentPurpose::External => {
                 let Ok((profile, content)) = result else {
                     return;
                 };
                 self.external = Some(ExternalEdit {
-                    name: profile.name.clone(),
+                    id: profile.id,
+                    name: profile.name,
+                    active: profile.active,
                     text: content,
-                    target: ExternalTarget::Profile {
-                        id: profile.id,
-                        active: profile.active,
-                    },
                 });
             }
             ContentPurpose::Duplicate => {
@@ -267,7 +256,12 @@ impl App {
     }
 
     /// Sends a request answered with `profile_saved`.
-    fn profile_save_request(&mut self, label: &str, request: Request, purpose: SavePurpose) {
+    pub(super) fn profile_save_request(
+        &mut self,
+        label: &str,
+        request: Request,
+        purpose: SavePurpose,
+    ) {
         let id = self.begin(label);
         let client = self.client.clone();
         let tx = self.tx.clone();
@@ -300,48 +294,10 @@ impl App {
                     self.profile_content(profile.id, ContentPurpose::Edit);
                 }
             }
-            (SavePurpose::Editor { saved }, Ok((profile, message))) => {
-                if let Some(editor) = &mut self.profiles.editor
-                    && editor.profile.id == profile.id
-                {
-                    editor.saving = false;
-                    editor.mark_saved(saved);
-                    editor.profile = profile;
-                }
-                self.notify(message, false);
-            }
-            (SavePurpose::Editor { .. }, Err(err)) => {
-                let Some(editor) = &mut self.profiles.editor else {
-                    self.notify(err, true);
-                    return;
-                };
-                editor.saving = false;
-                let action = MenuAction::SaveAnyway {
-                    id: editor.profile.id.clone(),
-                    content: editor.text(),
-                    from_editor: true,
-                };
-                self.popup = Some(Popup::Menu(
-                    Menu::new(
-                        fl!("tui-save-failed-title"),
-                        vec![
-                            MenuItem::new(fl!("tui-keep-editing"), "", MenuAction::Dismiss),
-                            MenuItem::new(
-                                fl!("tui-save-anyway"),
-                                fl!("tui-save-anyway-detail"),
-                                action,
-                            ),
-                        ],
-                    )
-                    .body(err),
-                ));
-            }
+            (SavePurpose::Code { saved }, result) => self.code_saved(saved, result),
             (SavePurpose::External(edit), Err(err)) => {
-                let ExternalTarget::Profile { id, .. } = &edit.target else {
-                    return;
-                };
                 let force = MenuAction::SaveAnyway {
-                    id: id.clone(),
+                    id: edit.id.clone(),
                     content: edit.text.clone(),
                     from_editor: false,
                 };
@@ -394,6 +350,9 @@ impl App {
                     force: false,
                 },
             ),
+            KeyCode::Char('E') if !external_editor_configured() => {
+                self.notify(fl!("tui-no-external-editor"), false);
+            }
             KeyCode::Char('A') => {
                 if self.profiles.list.as_ref().is_some_and(|l| l.unmanaged) {
                     self.popup = Some(Popup::Confirm {
@@ -454,11 +413,13 @@ impl App {
             "e".into(),
             ProfileAction::Edit,
         ));
-        items.push(item(
-            fl!("menu-profile-edit-external"),
-            "E".into(),
-            ProfileAction::EditExternal,
-        ));
+        if external_editor_configured() {
+            items.push(item(
+                fl!("menu-profile-edit-external"),
+                "E".into(),
+                ProfileAction::EditExternal,
+            ));
+        }
         if profile.is_remote() {
             items.push(item(
                 fl!("menu-profile-update"),
@@ -647,7 +608,6 @@ impl App {
             PendingAction::ProfileAdopt => {
                 self.daemon_action(&fl!("busy-saving"), Request::ProfileAdopt)
             }
-            PendingAction::DiscardEditor => self.editor_close(),
             _ => {}
         }
     }
@@ -758,14 +718,6 @@ impl App {
                 let value = parse_scalar(&old, &value).map_err(|e| error_chain(&e))?;
                 editor.set(&path, value).map_err(|e| error_chain(&e))?;
             }
-            InputPurpose::EditJson(path) => {
-                let editor = self.profiles.editor.as_mut().ok_or_default()?;
-                let value = parse_json(&value).map_err(|e| error_chain(&e))?;
-                if path.is_empty() && !value.is_object() {
-                    return Err(fl!("profile-not-object"));
-                }
-                editor.set(&path, value).map_err(|e| error_chain(&e))?;
-            }
             InputPurpose::RenameKey(path) => {
                 let editor = self.profiles.editor.as_mut().ok_or_default()?;
                 editor
@@ -814,7 +766,7 @@ impl App {
                 }
                 editor.search = Some(trimmed);
             }
-            InputPurpose::AddSource | InputPurpose::ImportCore => {}
+            InputPurpose::AddSource | InputPurpose::ImportCore | InputPurpose::Inline => {}
         }
         Ok(())
     }
@@ -864,14 +816,17 @@ impl App {
                 content,
                 from_editor,
             } => {
-                let purpose = match (from_editor, profile::parse(&content)) {
-                    (true, Ok(saved)) => SavePurpose::Editor { saved },
-                    _ => SavePurpose::Plain,
+                let purpose = if from_editor {
+                    SavePurpose::Code {
+                        saved: content.clone(),
+                    }
+                } else {
+                    SavePurpose::Plain
                 };
-                if let Some(editor) = &mut self.profiles.editor
+                if let Some(code) = &mut self.profiles.code
                     && from_editor
                 {
-                    editor.saving = true;
+                    code.saving = true;
                 }
                 self.profile_save_request(
                     &fl!("busy-saving"),
@@ -884,11 +839,12 @@ impl App {
                 );
             }
             MenuAction::EditAgain(edit) => self.external = Some(edit),
+            MenuAction::Code(command) => self.code_command(command),
             MenuAction::Component(..) | MenuAction::Dismiss => {}
         }
     }
 
-    /// `$EDITOR` returned: store a profile or replace a node in the editor.
+    /// `$EDITOR` returned: store the profile.
     pub fn external_edit_done(&mut self, edit: ExternalEdit, result: anyhow::Result<String>) {
         let text = match result {
             Ok(text) => text,
@@ -905,11 +861,7 @@ impl App {
             text: text.clone(),
             ..edit
         };
-        let problem = match &edited.target {
-            ExternalTarget::Profile { .. } => profile::parse(&text).err(),
-            ExternalTarget::Node(_) => parse_json(&text).err(),
-        };
-        if let Some(err) = problem {
+        if let Err(err) = profile::parse(&text) {
             self.popup = Some(Popup::Menu(
                 Menu::new(
                     fl!("tui-invalid-edit-title"),
@@ -922,35 +874,17 @@ impl App {
             ));
             return;
         }
-        match edited.target.clone() {
-            ExternalTarget::Profile { id, active } => self.profile_save_request(
-                &if active {
-                    fl!("busy-saving-reloading")
-                } else {
-                    fl!("busy-saving")
-                },
-                Request::ProfileSave {
-                    id,
-                    content: text,
-                    force: false,
-                },
-                SavePurpose::External(edited),
-            ),
-            ExternalTarget::Node(path) => {
-                let Some(editor) = &mut self.profiles.editor else {
-                    return;
-                };
-                let applied = parse_json(&text).and_then(|value| {
-                    if path.is_empty() && !value.is_object() {
-                        anyhow::bail!(fl!("profile-not-object"));
-                    }
-                    editor.set(&path, value)
-                });
-                if let Err(err) = applied {
-                    self.notify(error_chain(&err), true);
-                }
-            }
-        }
+        let label = if edited.active {
+            fl!("busy-saving-reloading")
+        } else {
+            fl!("busy-saving")
+        };
+        let request = Request::ProfileSave {
+            id: edited.id.clone(),
+            content: text,
+            force: false,
+        };
+        self.profile_save_request(&label, request, SavePurpose::External(edited));
     }
 
     // ----- editor keys -----------------------------------------------------------------
@@ -993,18 +927,13 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.editor_search(),
-            KeyCode::Char('s') => self.editor_save(),
-            KeyCode::Char('q') | KeyCode::Esc => {
-                if editor.dirty() {
-                    self.popup = Some(Popup::Confirm {
-                        message: fl!("tui-confirm-discard", name = editor.profile.name.clone()),
-                        action: PendingAction::DiscardEditor,
-                    });
-                } else {
-                    self.editor_close();
-                }
+            KeyCode::Char('s') => {
+                self.code_close_tree(false);
+                self.code_command(code::CodeCommand::Save);
             }
-            KeyCode::Char('?') => self.popup = Some(Popup::EditorHelp),
+            // Back to the text, which takes the changes.
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::F(2) => self.code_close_tree(false),
+            KeyCode::Char('?') | KeyCode::F(1) => self.popup = Some(Popup::EditorHelp),
             KeyCode::Char('a') => self.editor_add(false),
             KeyCode::Char('A') => self.editor_add(true),
             _ => {
@@ -1019,17 +948,8 @@ impl App {
                         }
                     }
                     KeyCode::Char('e') => self.editor_edit(path),
-                    KeyCode::Char(':') => self.editor_json(path),
-                    KeyCode::Char('E') => {
-                        let text = get(&editor.root, &path)
-                            .map(profile::to_text)
-                            .unwrap_or_default();
-                        self.external = Some(ExternalEdit {
-                            name: editor.profile.name.clone(),
-                            text,
-                            target: ExternalTarget::Node(path),
-                        });
-                    }
+                    // The node as text, selected in the code editor.
+                    KeyCode::Char(':' | 'E') => self.code_close_tree(true),
                     KeyCode::Char('r') => {
                         let Some(Seg::Key(name)) = path.last().cloned() else {
                             self.notify(fl!("editor-not-a-member"), true);
@@ -1050,7 +970,7 @@ impl App {
                         }
                         Err(err) => self.notify(error_chain(&err), true),
                     },
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('c') if !ctrl => {
                         if let Err(err) = editor.duplicate(&path) {
                             self.notify(error_chain(&err), true);
                         }
@@ -1065,7 +985,8 @@ impl App {
                             self.notify(error_chain(&err), true);
                         }
                     }
-                    KeyCode::Char('y') => {
+                    // Ctrl+C copies too.
+                    KeyCode::Char('y' | 'c') => {
                         let text = get(&editor.root, &path)
                             .and_then(|v| serde_json::to_string_pretty(v).ok())
                             .unwrap_or_default();
@@ -1095,7 +1016,7 @@ impl App {
     }
 
     /// Changes a value: booleans flip, references offer the existing tags,
-    /// other scalars open a text field, containers the JSON field.
+    /// other scalars open a text field, containers open as text.
     fn editor_edit(&mut self, path: Path) {
         let Some(editor) = &mut self.profiles.editor else {
             return;
@@ -1140,7 +1061,7 @@ impl App {
                 _ => self.editor_type_value(path),
             },
             Value::Number(_) => self.editor_type_value(path),
-            Value::Object(_) | Value::Array(_) => self.editor_json(path),
+            Value::Object(_) | Value::Array(_) => self.code_close_tree(true),
         }
     }
 
@@ -1158,27 +1079,6 @@ impl App {
                 fl!("tui-edit-value-title"),
                 display_path(&path),
                 InputPurpose::EditValue(path),
-            )
-            .value(text),
-        ));
-    }
-
-    fn editor_json(&mut self, path: Path) {
-        let Some(editor) = &self.profiles.editor else {
-            return;
-        };
-        let text = get(&editor.root, &path)
-            .map(Value::to_string)
-            .unwrap_or_default();
-        if text.len() > INLINE_JSON {
-            self.notify(fl!("tui-json-too-long"), false);
-            return;
-        }
-        self.popup = Some(Popup::Input(
-            Input::new(
-                fl!("tui-edit-json-title"),
-                display_path(&path),
-                InputPurpose::EditJson(path),
             )
             .value(text),
         ));
@@ -1309,37 +1209,15 @@ impl App {
         self.popup = Some(Popup::Menu(Menu::new(title, items)));
     }
 
-    fn editor_save(&mut self) {
-        let Some(editor) = &mut self.profiles.editor else {
-            return;
-        };
-        if editor.saving {
-            return;
-        }
-        if !editor.dirty() {
-            self.notify(fl!("ctl-profile-no-changes"), false);
-            return;
-        }
-        editor.saving = true;
-        let request = Request::ProfileSave {
-            id: editor.profile.id.clone(),
-            content: editor.text(),
-            force: false,
-        };
-        let purpose = SavePurpose::Editor {
-            saved: editor.root.clone(),
-        };
-        let label = if editor.profile.active {
-            fl!("busy-saving-reloading")
-        } else {
-            fl!("busy-saving")
-        };
-        self.profile_save_request(&label, request, purpose);
-    }
-
-    fn editor_close(&mut self) {
+    /// Closes the editor without saving.
+    pub(super) fn editor_close(&mut self) {
         self.profiles.editor = None;
+        self.profiles.code = None;
         self.profiles.preview = None;
+        if self.edit_only {
+            self.should_quit = true;
+            return;
+        }
         self.profiles_load();
     }
 }
@@ -1404,6 +1282,10 @@ fn relative(unix: u64) -> String {
 pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.profiles.editor.is_some() {
         draw_editor(frame, area, app);
+        return;
+    }
+    if app.profiles.code.is_some() {
+        code::draw(frame, area, app);
         return;
     }
     let list = app.profiles.list.clone().unwrap_or_default();
@@ -1740,8 +1622,13 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let [tree_area, detail_area] =
         Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(area);
     let rows = editor.rows();
-    let mut title = fl!("tui-editor-title", name = editor.profile.name.clone());
-    if editor.dirty() {
+    let mut title = format!(
+        "{} · {}",
+        fl!("tui-editor-title", name = editor.profile.name.clone()),
+        fl!("tui-tree-view")
+    );
+    let text_dirty = app.profiles.code.as_mut().is_some_and(|c| c.dirty());
+    if editor.dirty() || text_dirty {
         title.push_str(&format!(" {}", fl!("tui-editor-modified")));
     }
     let selected_path = rows
@@ -1924,13 +1811,23 @@ pub fn hints(app: &App) -> Vec<(&'static str, String)> {
             ("u", fl!("key-undo")),
             ("/", fl!("key-search")),
             ("s", fl!("key-save")),
-            ("q", fl!("key-close-editor")),
+            ("q/F2", fl!("key-back-to-text")),
             ("?", fl!("key-help")),
         ];
     }
+    if let Some(code) = &app.profiles.code {
+        return code::hints(code);
+    }
     vec![
         ("⏎", fl!("key-actions")),
-        ("e/E", fl!("key-edit")),
+        (
+            if external_editor_configured() {
+                "e/E"
+            } else {
+                "e"
+            },
+            fl!("key-edit"),
+        ),
         ("n", fl!("key-new")),
         ("i", fl!("key-import")),
         ("f/F", fl!("key-update-profile")),
@@ -2031,6 +1928,9 @@ mod tests {
             purpose: ContentPurpose::Edit,
             result: Ok((home, content)),
         });
+        let text = screen(&mut app, 110, 30);
+        assert!(text.contains("\"inbounds\": ["), "{text}");
+        press(&mut app, &[KeyCode::F(2)]);
         // outbounds › 0 (the selector) › outbounds
         press(
             &mut app,
@@ -2066,7 +1966,11 @@ mod tests {
         // Global keys do not reach sing-box while the editor is open.
         press(&mut app, &[KeyCode::Char('x')]);
         assert!(app.popup.is_none());
+        // q goes back to the text, which is unchanged after the undo.
         press(&mut app, &[KeyCode::Char('q')]);
         assert!(app.profiles.editor.is_none());
+        assert!(!app.profiles.code.as_mut().unwrap().dirty());
+        press(&mut app, &[KeyCode::Esc]);
+        assert!(app.profiles.code.is_none());
     }
 }

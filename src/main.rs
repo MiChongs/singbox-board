@@ -210,6 +210,8 @@ enum ProfileCmd {
         profile: String,
         #[arg(long, help = fl!("cli-profile-force-save"))]
         force: bool,
+        #[arg(long, help = fl!("cli-profile-edit-external"))]
+        external: bool,
     },
     #[command(about = fl!("cli-profile-update"))]
     Update {
@@ -547,7 +549,11 @@ async fn run_profile(client: &DaemonClient, action: Option<ProfileCmd>) -> Resul
             ctl::command(client, Request::ProfileActivate { id: profile, force }).await
         }
         ProfileCmd::Show { profile } => ctl::profile_show(client, &profile).await,
-        ProfileCmd::Edit { profile, force } => ctl::profile_edit(client, &profile, force).await,
+        ProfileCmd::Edit {
+            profile,
+            force,
+            external,
+        } => ctl::profile_edit(client, &profile, force, external).await,
         ProfileCmd::Update { profile, force } => {
             eprintln!("{}", fl!("ctl-profile-downloading"));
             ctl::command(client, Request::ProfileUpdate { id: profile, force }).await

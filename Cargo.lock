@@ -1457,6 +1457,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "json_comments"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dbbfed4e59ba9750e15ba154fdfd9329cee16ff3df539c2666b70f58cc32105"
+
+[[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "kasuari"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2121,6 +2136,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratatui-textarea"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c78d5ba0f26f97baed69a4c479f268a31c7b5b89d68ab939842152e383d6e73"
+dependencies = [
+ "ratatui-core",
+ "ratatui-widgets",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "ratatui-widgets"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2607,9 +2634,13 @@ dependencies = [
  "hex",
  "i18n-embed",
  "i18n-embed-fl",
+ "json_comments",
+ "jsonc-parser",
  "ksni",
  "nix 0.31.3",
  "ratatui",
+ "ratatui-textarea",
+ "regex",
  "reqwest",
  "rust-embed",
  "rustls",
@@ -2621,6 +2652,7 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width",
  "zbus",
  "zip",

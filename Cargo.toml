@@ -17,9 +17,13 @@ futures = "0.3.34"
 hex = "0.4.3"
 i18n-embed = { version = "0.16", features = ["fluent-system"] }
 i18n-embed-fl = "0.10"
+json_comments = "0.2.2"
+jsonc-parser = { version = "0.34", features = ["serde"] }
 ksni = "0.3.6"
 nix = { version = "0.31.3", features = ["user", "signal", "process", "fs", "net"] }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+ratatui-textarea = { version = "0.9", default-features = false }
+regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls-no-provider", "socks", "http2"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -31,6 +35,7 @@ tokio = { version = "1.53.2", features = ["full"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-segmentation = "1"
 unicode-width = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }

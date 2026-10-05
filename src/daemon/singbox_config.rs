@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::config::{ClashApiOverride, CoreConfig};
-use crate::profile::strip_json_comments;
+use crate::profile::parse_jsonc;
 use crate::protocol::ClashApi;
 
 /// Configuration files in the order sing-box merges them.
@@ -35,7 +35,7 @@ pub fn discover_clash_api(core: &CoreConfig, overrides: &ClashApiOverride) -> Op
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&strip_json_comments(&content)) else {
+        let Ok(value) = parse_jsonc(&content) else {
             tracing::debug!("cannot parse {} for clash_api discovery", path.display());
             continue;
         };

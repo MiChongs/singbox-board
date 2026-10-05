@@ -188,9 +188,9 @@ pub fn shorten_url(url: &str) -> String {
     text
 }
 
-/// Opens `text` in `$VISUAL`, `$EDITOR` or the first of nano, vim and vi
-/// found in `PATH`, and returns what was saved. Blocks until the editor
-/// exits; the temporary file is readable by the current user only.
+/// Opens `text` in `$VISUAL` or `$EDITOR` and returns what was saved.
+/// Blocks until the editor exits; the temporary file is readable by the
+/// current user only.
 pub fn edit_text(text: &str, name: &str) -> Result<String> {
     let (program, args) = editor_command()?;
     let name: String = name
@@ -232,7 +232,8 @@ pub fn edit_text(text: &str, name: &str) -> Result<String> {
     result
 }
 
-/// The editor program and its arguments.
+/// The editor program from `$VISUAL` or `$EDITOR` and its arguments. There
+/// is no fallback: without either, the built-in editor is used.
 fn editor_command() -> Result<(String, Vec<String>)> {
     for var in ["VISUAL", "EDITOR"] {
         if let Ok(value) = std::env::var(var) {
@@ -242,13 +243,12 @@ fn editor_command() -> Result<(String, Vec<String>)> {
             }
         }
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for candidate in ["nano", "vim", "vi"] {
-        if std::env::split_paths(&path).any(|dir| dir.join(candidate).is_file()) {
-            return Ok((candidate.to_owned(), Vec::new()));
-        }
-    }
     bail!(fl!("editor-none"))
+}
+
+/// Whether `$VISUAL` or `$EDITOR` names an external editor.
+pub fn external_editor_configured() -> bool {
+    editor_command().is_ok()
 }
 
 /// An executable named `name` in `PATH`; a name with a slash is a path.

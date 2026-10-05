@@ -4,7 +4,7 @@
 
 - **root daemon**：以 root 运行并托管 `sing-box run` 子进程（TUN、`auto_route`、tproxy、eBPF 入站都需要 root），负责启停、崩溃后指数退避重启、配置校验与热重载，并从 GitHub Releases 安装或更新内核。
 - **核心版本管理**：内置 MiChongs（xiaobaf14g）与 SagerNet 官方两个发布源，可添加任意 GitHub 源或导入自编译核心。可列出某个源的全部版本及本机可用的构建变体（ebpf、easytier、glibc、musl 等），一键下载、校验、切换或回退，多个版本并存，切换瞬间完成，启动失败会自动回滚。
-- **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；在 TUI 中可用树形编辑器可视化修改，或交给 `$EDITOR` 编辑原文。
+- **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；内置全屏编辑器：语法高亮、输入时校验并标出错误位置、查找替换、按行号或 JSON 路径跳转，sing-box 校验失败时直接跳到出错的字段，并可随时切换到带模板的树形视图。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
 - **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，Wayland 与 X11 下均可使用。
 - **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置。
@@ -119,7 +119,7 @@ singbox-board profile add https://example.com/sub --use   # 导入订阅配置�
 singbox-board profile add ./config.json --name 家里       # 导入文件（- 表示标准输入）
 singbox-board profile new 测试 --edit         # 用模板新建并在编辑器中打开
 singbox-board profile use 家里                # 校验、切换并重启 sing-box
-singbox-board profile edit 家里               # 用 $EDITOR 编辑，正在使用的配置保存后自动重载
+singbox-board profile edit 家里               # 在内置编辑器中编辑（--external 改用 $EDITOR），正在使用的配置保存后自动重载
 singbox-board setup                         # 选择可选组件
 singbox-board component sub-store           # 状态、Web 地址、订阅的 sing-box 链接
 singbox-board component http-meta update    # start|stop|restart|enable|disable|update
@@ -161,7 +161,7 @@ SINGBOX_BOARD_LANG=en singbox-board
 | Core 页 `←→` `Enter` `v` `i` `d` | 在来源、版本、已安装之间切换焦点 / 下载并切换 / 切换变体 / 仅下载 / 删除 |
 | Core 页 `p` `n` `f` `a` `I` | 只看正式版 / 下一页 / 刷新 / 添加源 / 导入核心 |
 | 配置页 `Enter` | 操作菜单：使用、编辑、更新、重命名、订阅地址与更新间隔、复制、校验、导出、删除 |
-| 配置页 `e` `E` `n` `i` | 树形编辑 / 用 `$EDITOR` 编辑 / 用模板新建 / 导入文件或订阅地址（支持粘贴） |
+| 配置页 `e` `E` `n` `i` | 内置编辑器 / 用 `$EDITOR` 编辑（设置了 `$VISUAL` 或 `$EDITOR` 时）/ 用模板新建 / 导入文件或订阅地址（支持粘贴） |
 | 配置页 `f` `F` `d` `A` | 更新所选订阅 / 更新全部订阅 / 删除 / 将当前配置文件收入配置库 |
 | `?` / `q` | 帮助 / 退出 |
 
@@ -219,8 +219,8 @@ SINGBOX_BOARD_LANG=en singbox-board
 | 导入订阅 | `i`，输入或粘贴 http(s) 地址 | `singbox-board profile add <url> [--interval 分钟]` |
 | 用模板新建 | `n` | `singbox-board profile new <名称> [--edit]` |
 | 切换 | `Enter` → 使用此配置 | `singbox-board profile use <名称或 ID>` |
-| 可视化编辑 | `e` | 无 |
-| 编辑原文 | `E` | `singbox-board profile edit <名称>` |
+| 编辑 | `e`（内置编辑器，`F2` 切换树形视图） | `singbox-board profile edit <名称>`（同一个编辑器） |
+| 用外部编辑器编辑 | `E`（需设置 `$VISUAL` 或 `$EDITOR`） | `singbox-board profile edit <名称> --external` |
 | 更新订阅 | `f`（全部为 `F`） | `singbox-board profile update [<名称>]` |
 | 改名、订阅地址、更新间隔 | `Enter` 菜单 | `singbox-board profile set <名称> --name … --url … --interval …`，`--local` 转为本地配置 |
 | 校验 | `Enter` → 用 sing-box 校验 | `singbox-board profile check <名称>` |
@@ -233,21 +233,48 @@ SINGBOX_BOARD_LANG=en singbox-board
 - **订阅配置**：从提供 sing-box 完整配置的地址下载，默认 User-Agent 为 `sing-box/<内核版本>`（`profiles.user_agent` 可改），服务商据此返回 sing-box 格式；如果返回的是节点列表，会提示改用 sing-box 格式或用 Sub-Store 转换。会读取 `subscription-userinfo`（流量与到期时间）、`profile-update-interval`（建议的更新间隔）和 `content-disposition`（默认名称）。之后按间隔自动更新（默认 24 小时，0 表示仅手动），正在使用的订阅配置只有在新内容通过校验后才会替换并重载，否则保留原配置并在列表中显示错误。日志与错误信息只显示订阅地址的主机名，不会泄露其中的令牌。
 - **保存**：正在使用的配置保存前会先校验，通过后写入并重载 sing-box；未使用的配置直接保存，并附带校验结果供参考。
 
-### 可视化编辑
+### 内置编辑器
 
-在配置页按 `e` 打开树形编辑器，左侧为 JSON 树，右侧显示所选项的完整内容。编辑器打开时，`s`、`r` 等键只作用于编辑器，不会误操作 sing-box；`Tab` 和数字键仍可切换标签页，编辑状态会保留。
+在配置页按 `e`（或运行 `singbox-board profile edit <名称>`）打开全屏文本编辑器，不依赖 nano、vim 等外部程序。编辑器打开时所有按键都交给编辑器，数字键和 `Tab` 也会作为文字输入，不会误操作 sing-box。
+
+- **校验**：每次输入后都按 sing-box 的规则（允许注释和尾随逗号）检查 JSON，在行号旁标出出错的行，底部写明原因（例如“此值后面缺少逗号”），`F8` 跳到出错位置；重复的键会给出警告。
+- **定位**：边框底部显示光标所在的路径（如 `outbounds › 3 › server`），`Ctrl+G` 可输入行号、`行:列` 或路径（如 `outbounds[0].server`）跳转。
+- **保存**：`Ctrl+S` 先在本地检查语法，再交给守护进程用 sing-box 校验。校验失败时编辑器会根据 sing-box 报告的路径（如 `route.rules[1].outbound`）定位并标出对应字段。
+- **注释**：文件中的注释和格式原样保留；只有格式化文档或在树形视图中修改时才会按标准 JSON 重新排版，这两种操作都可以用 `Ctrl+Z` 撤销。
+- **实现**：JSON（含注释）的解析、校验、高亮和定位使用 [jsonc-parser](https://crates.io/crates/jsonc-parser)，注释（包括 sing-box 接受的 `#` 注释）由 [json_comments](https://crates.io/crates/json_comments) 处理；文本、光标、选区和撤销历史由 [ratatui-textarea](https://crates.io/crates/ratatui-textarea) 管理，查找使用 [regex](https://crates.io/crates/regex)。
+- **撤销**：`Ctrl+Z` 按编辑步骤撤销：输入的文字逐字撤销，格式化、树形视图中的修改、移动行、粘贴、全部替换等命令一次撤销。
+- **超长行**：编辑内核只能直接跳到第 65535 列以内，单行超过这个长度时（压缩成一行的订阅配置），跳转和点击只能到达该行开头附近；先按 `Alt+F` 格式化即可。
+- **剪贴板与鼠标**：复制会同时通过终端（OSC 52）和 `wl-copy` / `xclip` / `xsel` 写入系统剪贴板；终端自带的粘贴（通常是 `Ctrl+Shift+V`）直接插入文字。编辑器支持点击定位、拖动选择、双击选词和滚轮；按住 `Shift` 拖动仍可使用终端自带的选择。
+
+| 按键 | 功能 |
+|---|---|
+| `Ctrl+S` / `Esc` `Ctrl+Q` | 校验并保存 / 关闭（有未保存修改时询问：保存并关闭、放弃修改或继续编辑） |
+| `F2` / `F10` `Ctrl+P` / `F1` | 树形视图 / 全部命令菜单 / 快捷键帮助 |
+| `Ctrl+F` / `Ctrl+R` / `F3` `Shift+F3` | 查找（`Alt+C` 区分大小写）/ 替换（`Alt+A` 全部替换）/ 下一个、上一个 |
+| `Ctrl+G` / `F8` / `Alt+F` | 跳转到行或路径 / 跳到问题所在 / 格式化文档 |
+| `Ctrl+Z` `Ctrl+Y` | 撤销 / 重做 |
+| `Ctrl+C` `Ctrl+X` `Ctrl+V` `Ctrl+A` | 复制 / 剪切 / 粘贴（没有选区时作用于整行）/ 全选 |
+| `Ctrl+D` `Ctrl+K` `Alt+↑↓` | 复制行 / 删除行 / 移动行 |
+| `Tab` `Shift+Tab` `Ctrl+/` | 缩进 / 减少缩进 / 用 `//` 注释或取消注释 |
+| `Shift+方向键` `Ctrl+←→` `Ctrl+Home/End` | 选择 / 按词移动 / 文档开头或结尾 |
+
+括号和引号会自动补全，回车会保持缩进，在 `{}` 或 `[]` 之间回车会自动展开。
+
+### 树形视图
+
+在编辑器中按 `F2` 切换到树形视图：左侧为 JSON 树并定位到光标所在的节点，右侧显示所选项的完整内容。在这里的修改会在返回文本时合并进编辑器，作为一步可撤销的操作。树形视图中 `Tab` 和数字键仍可切换标签页，编辑状态会保留。
 
 | 按键 | 功能 |
 |---|---|
 | `↑↓` `←→` `Space` `*` `-` | 移动 / 折叠或展开 / 切换 / 全部展开 / 全部折叠 |
-| `Enter` / `e` | 编辑值：开关直接切换；`outbound`、`detour`、`final`、DNS `server`、规则中的 `rule_set` 等引用字段从现有标签中选择 |
-| `:` / `E` | 以 JSON 编辑所选项 / 在 `$EDITOR` 中编辑所选项 |
+| `Enter` / `e` | 编辑值：开关直接切换；`outbound`、`detour`、`final`、DNS `server`、规则中的 `rule_set` 等引用字段从现有标签中选择；对象和列表回到文本中编辑 |
+| `:` / `E` | 回到文本编辑器并选中所选项 |
 | `a` / `A` | 在之后添加（所选为展开的容器时添加到其中）/ 在所选容器内添加：在 `inbounds`、`outbounds`、`endpoints`、`route.rules`、`route.rule_set`、`dns.servers`、`dns.rules`、`providers` 中提供常用模板（mixed、tun、selector、urltest、VLESS REALITY、Hysteria2、规则集、DoH 等，均已用 sing-box 校验），`providers` 中还会列出 Sub-Store 的订阅；向分组成员列表添加时列出现有出站 |
 | `r` `d` `c` `K` `J` | 重命名键 / 删除 / 复制一份（自动避开重复的 tag）/ 上移 / 下移 |
 | `u` `U` `/` `n` `N` `y` | 撤销 / 重做 / 搜索 / 下一个 / 上一个 / 复制为 JSON |
-| `s` / `q` | 校验并保存 / 关闭（有未保存修改时会确认） |
+| `s` / `q` `F2` | 保存 / 返回文本编辑器 |
 
-树形编辑器保存时会按标准 JSON 重新排版（保留键的顺序），文件中的注释会被移除；需要保留注释时请用 `E` 编辑原文。
+树形视图中的修改会让全文按标准 JSON 重新排版（保留键的顺序和原有缩进宽度），注释会被移除；返回文本后按 `Ctrl+Z` 即可恢复。
 
 ## Sub-Store 与 http-meta
 

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use futures::StreamExt;
 use ratatui::widgets::{ListState, TableState};
 use tokio::sync::{Notify, watch};
@@ -156,8 +156,6 @@ pub enum PendingAction {
         id: String,
     },
     ProfileAdopt,
-    /// Close the editor without saving.
-    DiscardEditor,
 }
 
 pub enum Popup {
@@ -180,8 +178,10 @@ pub enum Popup {
     Menu(Menu),
     /// Single-line text input.
     Input(Input),
-    /// Keys of the profile editor.
+    /// Keys of the tree view.
     EditorHelp,
+    /// Keys of the code editor.
+    CodeHelp,
 }
 
 pub struct Toast {
@@ -272,6 +272,11 @@ pub struct App {
     pub profiles: ProfilesView,
     /// Text waiting to be opened in `$EDITOR` by the event loop.
     pub(super) external: Option<ExternalEdit>,
+    /// Started for one profile (`singbox-board profile edit`): quit when
+    /// its editor closes.
+    pub(super) edit_only: bool,
+    /// The last save message, printed after an edit-only session.
+    pub(super) exit_message: Option<String>,
 
     pub toast: Option<Toast>,
     pub busy: Vec<(u64, String)>,
@@ -331,6 +336,8 @@ impl App {
             core: CoreView::default(),
             profiles: ProfilesView::default(),
             external: None,
+            edit_only: false,
+            exit_message: None,
             toast: None,
             busy: Vec::new(),
             next_action: 0,
@@ -620,16 +627,30 @@ impl App {
     // ----- input --------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+C copies in an open editor; quitting would lose the edits.
+        let editing = self.tab == Tab::Profiles && self.profiles.code.is_some();
+        if ctrl_c && !editing && self.popup.is_none() {
+            self.quit();
             return;
         }
         if let Some(popup) = self.popup.take() {
+            let key = if ctrl_c {
+                KeyEvent::from(KeyCode::Esc)
+            } else {
+                key
+            };
             self.on_popup_key(popup, key);
             return;
         }
-        // The editor takes every key but tab switching, so letters there
-        // never start or stop sing-box.
+        // The code editor takes every key: digits and Tab are text there.
+        if self.code_active() {
+            self.code_on_key(key);
+            return;
+        }
+        // The tree view takes every key but tab switching, so letters
+        // there never start or stop sing-box.
         let switches_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
             || matches!(key.code, KeyCode::Char(c) if tab_number(c).is_some());
         if self.tab == Tab::Profiles && self.profiles.editor.is_some() && !switches_tab {
@@ -637,7 +658,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.quit(),
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
             KeyCode::Tab => self.tab = Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()],
             KeyCode::BackTab => {
@@ -670,11 +691,61 @@ impl App {
         }
     }
 
-    /// Pasted text goes into an open text field.
-    pub fn on_paste(&mut self, text: &str) {
-        if let Some(Popup::Input(input)) = &mut self.popup {
-            input.paste(text);
+    /// Quits, unless the editor has unsaved changes: then it comes to the
+    /// front and asks what to do with them.
+    fn quit(&mut self) {
+        // Edits in the tree view reach the text when it closes.
+        self.code_close_tree(false);
+        let unsaved = self.profiles.code.as_mut().is_some_and(|c| c.dirty());
+        if !unsaved {
+            self.should_quit = true;
+            return;
         }
+        self.tab = Tab::Profiles;
+        self.code_close_tree(false);
+        self.code_command(super::code::CodeCommand::Close);
+    }
+
+    /// Pasted text goes into an open text field or the code editor.
+    pub fn on_paste(&mut self, text: &str) {
+        match &mut self.popup {
+            Some(Popup::Input(input)) => input.paste(text),
+            Some(_) => {}
+            None => {
+                if self.code_active() {
+                    self.code_on_paste(text);
+                }
+            }
+        }
+    }
+
+    pub fn on_mouse(&mut self, event: MouseEvent) {
+        if self.popup.is_none() && self.code_active() {
+            self.code_on_mouse(event);
+        }
+    }
+
+    /// The code editor uses the mouse; elsewhere the terminal keeps it for
+    /// selecting text.
+    pub fn wants_mouse(&self) -> bool {
+        self.code_active()
+    }
+
+    /// Starts with one profile open in the editor and quits when it closes.
+    pub fn start_editing(&mut self, profile: Profile, content: &str, force: bool) {
+        self.edit_only = true;
+        // The first-run questions can wait for the dashboard.
+        self.wizard_shown = true;
+        self.tab = Tab::Profiles;
+        self.open_code_editor(profile, content);
+        if let Some(code) = &mut self.profiles.code {
+            code.force = force;
+        }
+    }
+
+    /// The last save message of an edit-only session.
+    pub fn take_exit_message(&mut self) -> Option<String> {
+        self.exit_message.take()
     }
 
     pub fn take_external_edit(&mut self) -> Option<ExternalEdit> {
@@ -694,7 +765,7 @@ impl App {
                     self.popup = Some(popup);
                 }
             }
-            Popup::EditorHelp => {}
+            Popup::EditorHelp | Popup::CodeHelp => {}
             Popup::Input(mut input) => match input.on_key(key) {
                 InputOutcome::Editing => self.popup = Some(Popup::Input(input)),
                 InputOutcome::Cancel => {}
@@ -1037,8 +1108,7 @@ impl App {
             | PendingAction::CoreSourceRemove { .. }) => self.core_run_pending(core),
             profile @ (PendingAction::ProfileUse { .. }
             | PendingAction::ProfileDelete { .. }
-            | PendingAction::ProfileAdopt
-            | PendingAction::DiscardEditor) => self.profiles_run_pending(profile),
+            | PendingAction::ProfileAdopt) => self.profiles_run_pending(profile),
             PendingAction::CloseAllConnections => {
                 self.clash_action(&fl!("busy-closing-connections"), |clash| async move {
                     clash.close_all_connections().await?;

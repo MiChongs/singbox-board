@@ -75,7 +75,7 @@ profile-interval-minutes = every { $minutes } min
 profile-usage = { $used } of { $total } used
 profile-usage-unlimited = { $used } used
 profile-expires = expires { $date }
-editor-none = no editor found; set $EDITOR, for example `export EDITOR=nano`
+editor-none = no external editor; set $VISUAL or $EDITOR, or leave out --external to use the built-in editor
 editor-start-failed = failed to start the editor { $editor }
 editor-failed = the editor { $editor } exited with { $status }
 
@@ -188,7 +188,8 @@ cli-profile-use = Switch sing-box to a profile; it is checked first and sing-box
 cli-profile-id = Profile ID or name
 cli-profile-force-use = Switch even if sing-box rejects the profile
 cli-profile-show = Print the content of a profile
-cli-profile-edit = Edit a profile in $VISUAL or $EDITOR; the active profile is checked before it is saved and sing-box is reloaded
+cli-profile-edit = Edit a profile in the built-in editor; the active profile is checked before it is saved and sing-box is reloaded
+cli-profile-edit-external = Use $VISUAL or $EDITOR instead of the built-in editor
 cli-profile-force-save = Save even if sing-box rejects the configuration
 cli-profile-update = Download remote profiles again
 cli-profile-update-id = Profile ID or name (default: every remote profile)
@@ -299,6 +300,7 @@ ctl-profile-interval-local = --interval only applies to subscription URLs
 ctl-profile-no-changes = No changes were made.
 ctl-profile-edit-again = Edit again?
 ctl-profile-discarded = the changes were discarded
+ctl-profile-edit-needs-terminal = the built-in editor needs a terminal; use --external with $VISUAL or $EDITOR
 ctl-profile-nothing-to-set = nothing to change; pass --name, --url, --interval or --local
 
 ## Terminal dashboard: tabs, panels and columns
@@ -872,7 +874,7 @@ summary-route = Route
 summary-route-detail = { $rules } rules, { $sets } rule sets, final { $target }
 summary-log = Log
 summary-no-clash-api = not configured; the dashboard needs it for proxies and connections
-summary-has-comments = The file has comments. The tree editor removes them when saving; $EDITOR keeps them.
+summary-has-comments = The file has comments. The editor keeps them; changes made in the tree view or by formatting remove them.
 menu-profile-use = Use this profile
 menu-profile-use-detail = check, switch, restart sing-box
 menu-profile-edit = Edit
@@ -893,7 +895,6 @@ tui-use-adopts-note = The current configuration file is moved into the store fir
 tui-use-profile-note = sing-box checks it first; if it fails to start, the previous profile is restored.
 tui-confirm-delete-profile = Delete the profile "{ $name }"?
 tui-confirm-adopt = Move the current configuration file into the profile store? sing-box keeps running unchanged.
-tui-confirm-discard = Discard the unsaved changes to "{ $name }"?
 tui-new-profile-title = New profile
 tui-new-profile-hint = The template has a local proxy port, a selector for your nodes, DNS and the Clash API. It opens in the editor.
 tui-new-profile-placeholder = Name (optional)
@@ -921,12 +922,8 @@ tui-invalid-edit-title = The edit is not valid
 tui-editor-title = Editing { $name }
 tui-editor-modified = (modified)
 tui-editor-empty = The document is empty; press a to add a section.
-tui-editor-comments = Saving from the tree removes the comments in this file; press E in the list to keep them
-tui-editor-unparsable = The profile is not valid JSON; edit it in $EDITOR (E) instead:
 tui-reference-hint = ⏎ picks one of the existing tags
 tui-edit-value-title = Edit the value
-tui-edit-json-title = Edit as JSON
-tui-json-too-long = This item is too long to edit here; press E to use $EDITOR
 tui-rename-key-title = Rename the key
 tui-new-key-title = New key
 tui-new-key-hint = Name of the new member
@@ -962,11 +959,11 @@ editor-not-a-number = enter a number
 editor-root-locked = the document itself cannot be moved or deleted
 help-profiles = Profiles
 help-profiles-menu = All actions, including switching
-help-profiles-edit = Edit in the tree or in $EDITOR
+help-profiles-edit = Edit in the built-in editor (E: $EDITOR)
 help-profiles-new = New from the template, import a file or URL
 help-profiles-update = Update one or all remote profiles
 help-profiles-delete = Delete, adopt the current file
-help-editor-title = Profile editor
+help-editor-title = Tree view
 help-editor-move = Navigate
 help-editor-cursor = Move
 help-editor-fold = Collapse or expand
@@ -975,17 +972,129 @@ help-editor-search = Search, next, previous
 help-editor-file = Document
 help-editor-save = Check and save
 help-editor-undo = Undo or redo
-help-editor-close = Close the editor
+help-editor-close = Back to the text editor
 help-editor-change = Change
 help-editor-edit = Edit the value, or pick a tag
-help-editor-json = Edit as JSON
-help-editor-external = Edit in $EDITOR
+help-editor-json = Edit the item as text
 help-editor-add = Add after, or inside
 help-editor-rename = Rename the key
 help-editor-delete = Delete (u undoes)
 help-editor-duplicate = Duplicate
 help-editor-reorder = Move up or down
 help-editor-copy = Copy as JSON
+tui-tree-view = tree view
+tui-tree-comments = Changes here rewrite the text without comments; Ctrl+Z in the text undoes that
+tui-no-external-editor = Set $VISUAL or $EDITOR to use an external editor; press e for the built-in one.
+key-back-to-text = Back to text
+
+## Terminal dashboard: text editor
+
+tui-code-modified = modified
+tui-code-invalid = invalid JSON
+tui-code-position = Ln { $line }, Col { $col }
+tui-code-selected = { $count } selected
+tui-code-status-ok = Valid JSON. Ctrl+S saves after sing-box check; F10 lists every command.
+tui-code-no-problems = No problems found
+tui-code-copied = Copied { $lines ->
+        [one] one line
+       *[other] { $lines } lines
+    }
+tui-code-clipboard-empty = Nothing copied yet; the terminal's own paste (often Ctrl+Shift+V) works too.
+tui-code-fix-first = Line { $line }: { $error }
+tui-code-tree-invalid = The tree view needs valid JSON. Line { $line }: { $error }
+tui-code-formatted = Formatted; Ctrl+Z undoes it
+tui-code-formatted-comments = Formatted, which removed the comments; Ctrl+Z undoes it
+tui-code-formatted-already = Already formatted
+tui-code-unsaved-title = "{ $name }" has unsaved changes
+tui-code-save-close = Save and close
+tui-code-keep-editing-at-error = Keep editing at the reported place
+tui-code-save-in-progress = Still saving; wait for it to finish
+tui-find-label = Find
+tui-replace-label = Replace
+tui-goto-label = Go to
+tui-goto-placeholder = line[:column] or a path like outbounds[0].server
+tui-goto-empty = enter a line number or a path
+tui-goto-not-found = nothing at { $target }
+tui-find-count = { $count ->
+        [one] one match
+       *[other] { $count } matches
+    }
+tui-replaced = Replaced { $count ->
+        [one] one match
+       *[other] { $count } matches
+    }
+key-goto = Go to
+key-replace = Replace
+key-replace-all = Replace all
+key-switch-field = Switch field
+key-previous-next = Previous/next
+key-undo-redo = Undo/redo
+key-tree = Tree
+key-commands = Commands
+code-commands-title = Editor commands
+code-cmd-save = Save (sing-box check)
+code-cmd-format = Format the document
+code-cmd-find = Find
+code-cmd-replace = Replace
+code-cmd-goto = Go to a line or path
+code-cmd-problem = Go to the problem
+code-cmd-tree = Tree view
+code-cmd-comment = Comment or uncomment lines
+code-cmd-duplicate = Duplicate lines
+code-cmd-delete-lines = Delete lines
+code-cmd-undo = Undo
+code-cmd-redo = Redo
+code-cmd-select-all = Select all
+code-cmd-help = Keys
+code-cmd-close = Close the editor
+help-code-title = Text editor
+help-code-file = Document
+help-code-save = Save; sing-box checks it first
+help-code-close = Close, asks about unsaved changes
+help-code-tree = Tree view with sing-box templates
+help-code-commands = All commands
+help-code-format = Format the document
+help-code-find = Find
+help-code-search = Find (Alt+C: match case)
+help-code-replace = Replace (Alt+A: all)
+help-code-next = Next or previous match
+help-code-goto = Go to a line or a path
+help-code-problem = Go to the error
+help-code-edit = Edit
+help-code-undo = Undo, redo
+help-code-clipboard = Copy, cut, paste; no selection: the line
+help-code-select-all = Select all
+help-code-lines = Duplicate or delete lines
+help-code-move-lines = Move lines
+help-code-indent = Indent, outdent
+help-code-comment = Comment lines with //
+help-code-cursor = Cursor
+help-code-select = Select
+help-code-words = Move by word
+help-code-ends = Start or end of the document
+help-code-mouse = Click, drag, wheel; double click: word
+help-code-note = The terminal's own selection still works with Shift held while dragging. Brackets and quotes close themselves and Enter keeps the indentation.
+
+## JSON problems (profiles and the text editor)
+
+json-at = line { $line }, column { $column }: { $message }
+json-expected-colon = a colon is missing after the key
+json-expected-value = a value is missing here
+json-missing-comma = a comma is missing between two values
+json-expected-key = keys must be in double quotes
+json-bad-number = { $number } is not a valid number
+json-single-quotes = strings need double quotes
+json-trailing = unexpected text after the end of the document
+json-unmatched = “{ $token }” has no matching opening bracket
+json-unexpected = “{ $token }” does not belong here
+json-bad-literal = { $word } is not a value; text needs double quotes
+json-unclosed = “{ $bracket }” is not closed
+json-unclosed-string = the string is not closed on this line
+json-unclosed-comment = the comment is not closed
+json-bad-escape = invalid escape sequence in a string; write \\ for a backslash
+json-too-deep = nested too deeply
+json-duplicate-key = "{ $key }" appears more than once here; sing-box uses the last one
+json-odd-space = the invisible character { $name } here is not a space sing-box accepts; replace it with a normal space
 
 ## Terminal dashboard: editor templates
 

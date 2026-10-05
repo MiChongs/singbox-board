@@ -2,7 +2,12 @@
 //! its clients: lenient parsing, the template for new profiles and the
 //! overview shown next to a profile.
 
+use std::io::Read;
+
 use anyhow::{Result, anyhow, bail};
+use jsonc_parser::ParseOptions;
+use jsonc_parser::ParseStringErrorKind;
+use jsonc_parser::errors::{ParseError, ParseErrorKind};
 use serde_json::{Map, Value, json};
 
 use crate::i18n::fl;
@@ -12,79 +17,130 @@ use crate::util::fmt_bytes;
 /// Upper bound for the content of one profile.
 pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Removes `//`, `#` and `/* */` comments plus trailing commas, which the
-/// sing-box parser accepts but strict JSON does not. Line breaks inside
-/// block comments are kept so parse errors point at the right line.
-pub fn strip_json_comments(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            out.push(c);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' => {
-                in_string = true;
-                out.push(c);
-                i += 1;
-            }
-            b'#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
-                    if bytes[i] == b'\n' {
-                        out.push(b'\n');
-                    }
-                    i += 1;
-                }
-                i += 2;
-            }
-            b']' | b'}' => {
-                // Drop a trailing comma (and the whitespace after it) before the closer.
-                let mut end = out.len();
-                while end > 0 && out[end - 1].is_ascii_whitespace() {
-                    end -= 1;
-                }
-                if end > 0 && out[end - 1] == b',' {
-                    out.remove(end - 1);
-                }
-                out.push(c);
-                i += 1;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
+/// What sing-box accepts besides comments: standard JSON plus trailing
+/// commas, none of the JSON5 extensions.
+pub fn jsonc_options() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: true,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
     }
-    String::from_utf8(out).unwrap_or_default()
 }
 
-/// Whether saving `text` as plain JSON would lose comments or trailing commas.
+/// Replaces the `//`, `/* */` and `#` comments sing-box accepts with
+/// spaces, byte for byte, so offsets into the result are offsets into
+/// `input`. `None` when a `/` starts no comment.
+pub fn strip_json_comments(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    json_comments::StripComments::new(input.as_bytes())
+        .read_to_string(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// Parses JSON with comments and trailing commas the way sing-box reads
+/// it. A stray `/` leaves the comments to jsonc-parser, which then reports
+/// where it is.
+pub fn parse_jsonc(text: &str) -> Result<Value, JsoncError> {
+    let stripped = strip_json_comments(text);
+    jsonc_parser::parse_to_serde_value(stripped.as_deref().unwrap_or(text), &jsonc_options())
+        .map_err(|err| JsoncError::new(&err, text))
+}
+
+/// Where and why a document is not valid, in the user's language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsoncError {
+    /// Byte offset of the problem.
+    pub offset: usize,
+    /// 1-based line and character column.
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+impl JsoncError {
+    pub fn new(err: &ParseError, text: &str) -> Self {
+        let range = err.range();
+        let offset = range.start.min(text.len());
+        let before = &text[..floor_char_boundary(text, offset)];
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let token = text
+            .get(range.start..range.end.min(text.len()))
+            .unwrap_or_default();
+        Self {
+            offset,
+            line: before.matches('\n').count() + 1,
+            column: before[line_start..].chars().count() + 1,
+            message: jsonc_message(err.kind(), token),
+        }
+    }
+}
+
+impl std::fmt::Display for JsoncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = fl!(
+            "json-at",
+            line = self.line.to_string(),
+            column = self.column.to_string(),
+            message = self.message.clone()
+        );
+        f.write_str(&text)
+    }
+}
+
+impl std::error::Error for JsoncError {}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// jsonc-parser's error kinds in the user's language; `token` is the text
+/// the error points at.
+fn jsonc_message(kind: &ParseErrorKind, token: &str) -> String {
+    use ParseErrorKind::*;
+    let token: std::string::String = token.chars().take(40).collect();
+    match kind {
+        ExpectedColonAfterObjectKey => fl!("json-expected-colon"),
+        ExpectedObjectValue => fl!("json-expected-value"),
+        ExpectedComma => fl!("json-missing-comma"),
+        ExpectedStringObjectProperty => fl!("json-expected-key"),
+        ExpectedDigit
+        | ExpectedDigitFollowingNegativeSign
+        | ExpectedPlusMinusOrDigitInNumberLiteral
+        | HexadecimalNumbersNotAllowed
+        | UnaryPlusNumbersNotAllowed
+        | BareDecimalPointNumbersNotAllowed
+        | NonFiniteNumbersNotAllowed => fl!("json-bad-number", number = token),
+        SingleQuotedStringsNotAllowed => fl!("json-single-quotes"),
+        MultipleRootJsonValues => fl!("json-trailing"),
+        UnexpectedCloseBrace | UnexpectedCloseBracket => fl!("json-unmatched", token = token),
+        UnexpectedColon | UnexpectedComma | UnexpectedToken | UnexpectedTokenInObject => {
+            fl!("json-unexpected", token = token)
+        }
+        UnexpectedWord => fl!("json-bad-literal", word = token),
+        UnterminatedArray => fl!("json-unclosed", bracket = "["),
+        UnterminatedObject => fl!("json-unclosed", bracket = "{"),
+        UnterminatedCommentBlock => fl!("json-unclosed-comment"),
+        NestingDepthExceeded => fl!("json-too-deep"),
+        String(ParseStringErrorKind::UnterminatedStringLiteral) => fl!("json-unclosed-string"),
+        String(_) => fl!("json-bad-escape"),
+        other => other.to_string(),
+    }
+}
+
+/// Whether the text has comments, which saving it as plain JSON drops.
 pub fn has_comments(text: &str) -> bool {
-    strip_json_comments(text) != text
+    strip_json_comments(text).is_some_and(|stripped| stripped != text)
 }
 
 /// Parses a configuration the way sing-box does (comments allowed) and
@@ -94,7 +150,7 @@ pub fn parse(text: &str) -> Result<Value> {
     if text.trim().is_empty() {
         bail!(fl!("profile-empty"));
     }
-    let value: Value = serde_json::from_str(&strip_json_comments(text)).map_err(|err| {
+    let value = parse_jsonc(text).map_err(|err| {
         if looks_like_subscription(text) {
             anyhow!(fl!("profile-node-list"))
         } else {
@@ -371,18 +427,42 @@ mod tests {
                comment */
             "b": [1, 2,],
         }"#;
-        let value: Value = serde_json::from_str(&strip_json_comments(input)).unwrap();
+        let value = parse_jsonc(input).unwrap();
         assert_eq!(value["a"], "http://x/#not-a-comment");
         assert_eq!(value["b"], json!([1, 2]));
         assert!(has_comments(input));
         assert!(!has_comments(r#"{"a": "// not a comment"}"#));
+        // Offsets survive stripping.
+        assert_eq!(strip_json_comments(input).unwrap().len(), input.len());
+        // Keys keep their order.
+        let ordered = parse_jsonc(r#"{"z": 1, "a": 2}"#).unwrap();
+        assert_eq!(
+            ordered.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["z", "a"]
+        );
     }
 
     #[test]
-    fn block_comments_keep_line_numbers() {
+    fn errors_point_into_the_original_text() {
         let input = "{\n/* one\ntwo\nthree */\n\"a\": oops\n}";
-        let err = parse(input).unwrap_err().to_string();
-        assert!(err.contains("line 5"), "{err}");
+        let err = parse_jsonc(input).unwrap_err();
+        assert_eq!((err.line, err.column), (5, 6));
+        assert!(parse(input).unwrap_err().to_string().contains("line 5"));
+        // A stray slash is left to jsonc-parser, which finds it.
+        let err = parse_jsonc("{\n  \"a\": 1 / 2\n}").unwrap_err();
+        assert_eq!(err.line, 2);
+        // JSON5 extensions sing-box does not accept are errors.
+        for text in [
+            "{'a': 1}",
+            "{a: 1}",
+            "{\"a\": 0x10}",
+            "{\"a\": 1 \"b\": 2}",
+            "{\"a\": .5}",
+        ] {
+            assert!(parse_jsonc(text).is_err(), "{text}");
+        }
+        let err = parse_jsonc("{\"a\": 1\n \"b\": 2}").unwrap_err();
+        assert_eq!(err.message, fl!("json-missing-comma"));
     }
 
     #[test]

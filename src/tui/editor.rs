@@ -1,8 +1,9 @@
-//! Tree editor for a profile: the JSON document as a collapsible tree whose
-//! values can be changed, added, moved and removed, with undo.
+//! Tree view of the code editor: the JSON document as a collapsible tree
+//! whose values can be changed, added, moved and removed, with undo.
 //!
 //! This module holds the document model; key handling and drawing live in
-//! the profiles view.
+//! the profiles view, and changes go back into the text when the view
+//! closes.
 
 use std::collections::HashSet;
 
@@ -97,16 +98,13 @@ struct Snapshot {
 pub struct Editor {
     pub profile: Profile,
     pub root: Value,
-    saved: Value,
-    /// The stored text had comments, which saving from the tree drops.
-    pub had_comments: bool,
+    /// The document as the view opened.
+    opened: Value,
     pub expanded: HashSet<Path>,
     pub cursor: usize,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     pub search: Option<String>,
-    /// A save request is in flight.
-    pub saving: bool,
 }
 
 impl Editor {
@@ -114,31 +112,21 @@ impl Editor {
         let root = profile::parse(content)?;
         Ok(Self {
             profile,
-            saved: root.clone(),
+            opened: root.clone(),
             root,
-            had_comments: profile::has_comments(content),
             expanded: HashSet::new(),
             cursor: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             search: None,
-            saving: false,
         })
     }
 
+    /// Changed in this view. Compared as text: serde_json's map equality
+    /// ignores the order of members, which moving them changes.
     pub fn dirty(&self) -> bool {
-        self.root != self.saved
-    }
-
-    /// The text that saving writes.
-    pub fn text(&self) -> String {
-        profile::to_text(&self.root)
-    }
-
-    /// `text` was stored; it becomes the clean state.
-    pub fn mark_saved(&mut self, saved: Value) {
-        self.saved = saved;
-        self.had_comments = false;
+        let text = |value: &Value| serde_json::to_string(value).unwrap_or_default();
+        text(&self.root) != text(&self.opened)
     }
 
     // ----- rows ---------------------------------------------------------------
@@ -698,7 +686,7 @@ pub fn parse_scalar(old: &Value, text: &str) -> Result<Value> {
 
 /// Typed JSON, comments allowed.
 pub fn parse_json(text: &str) -> Result<Value> {
-    serde_json::from_str(&profile::strip_json_comments(text))
+    profile::parse_jsonc(text)
         .map_err(|err| anyhow::anyhow!(fl!("profile-invalid-json", error = err.to_string())))
 }
 
@@ -764,9 +752,7 @@ mod tests {
         assert!(!e.dirty());
         assert!(e.redo());
         assert_eq!(e.root["log"]["level"], "debug");
-        e.mark_saved(e.root.clone());
-        assert!(!e.dirty());
-        assert!(e.text().ends_with("}\n"));
+        assert!(e.dirty());
     }
 
     #[test]
