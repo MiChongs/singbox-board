@@ -27,6 +27,7 @@ pub struct DaemonConfig {
     pub restart: RestartConfig,
     pub clash_api: ClashApiOverride,
     pub update: UpdateConfig,
+    pub profiles: ProfilesConfig,
     pub components: ComponentsConfig,
     pub sub_store: SubStoreConfig,
     pub http_meta: HttpMetaConfig,
@@ -45,6 +46,7 @@ impl Default for DaemonConfig {
             restart: RestartConfig::default(),
             clash_api: ClashApiOverride::default(),
             update: UpdateConfig::default(),
+            profiles: ProfilesConfig::default(),
             components: ComponentsConfig::default(),
             sub_store: SubStoreConfig::default(),
             http_meta: HttpMetaConfig::default(),
@@ -83,14 +85,22 @@ impl Default for CoreConfig {
 }
 
 impl CoreConfig {
-    /// Global flags shared by `run` and `check`.
-    fn global_args(&self) -> Vec<String> {
+    /// Global flags shared by `run` and `check`; `primary` stands in for the
+    /// first `config` entry.
+    fn global_args(&self, primary: Option<&Path>) -> Vec<String> {
         let mut args = vec!["--disable-color".to_owned()];
         if let Some(dir) = &self.working_dir {
             args.push("-D".to_owned());
             args.push(dir.display().to_string());
         }
-        for path in &self.config {
+        let mut files: Vec<&Path> = self.config.iter().map(PathBuf::as_path).collect();
+        if let Some(primary) = primary {
+            match files.first_mut() {
+                Some(first) => *first = primary,
+                None => files.push(primary),
+            }
+        }
+        for path in files {
             args.push("-c".to_owned());
             args.push(path.display().to_string());
         }
@@ -102,16 +112,27 @@ impl CoreConfig {
     }
 
     pub fn run_args(&self) -> Vec<String> {
-        let mut args = self.global_args();
+        let mut args = self.global_args(None);
         args.push("run".to_owned());
         args.extend(self.extra_args.iter().cloned());
         args
     }
 
     pub fn check_args(&self) -> Vec<String> {
-        let mut args = self.global_args();
+        self.check_args_with(None)
+    }
+
+    /// `check` flags with `primary` in place of the first configuration
+    /// file, to try a profile before it is switched to.
+    pub fn check_args_with(&self, primary: Option<&Path>) -> Vec<String> {
+        let mut args = self.global_args(primary);
         args.push("check".to_owned());
         args
+    }
+
+    /// The first configuration file, which links to the active profile.
+    pub fn config_slot(&self) -> Option<PathBuf> {
+        self.config.first().map(|path| self.resolve(path))
     }
 
     /// sing-box changes into `-D` before reading `-c`, so relative config
@@ -187,6 +208,16 @@ impl Default for UpdateConfig {
             restart_after_update: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfilesConfig {
+    /// User-Agent for downloading remote profiles; empty sends
+    /// `sing-box/<core version>`, which providers use to pick the format.
+    pub user_agent: String,
+    /// Proxy for downloading remote profiles.
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -325,6 +356,17 @@ mod tests {
             ]
         );
         assert_eq!(core.check_args().last().unwrap(), "check");
+        let candidate = core.check_args_with(Some(Path::new("/tmp/candidate.json")));
+        assert_eq!(candidate[3..6], ["-c", "/tmp/candidate.json", "-C"]);
+        let bare = CoreConfig {
+            config: Vec::new(),
+            ..CoreConfig::default()
+        };
+        assert!(bare.config_slot().is_none());
+        assert_eq!(
+            bare.check_args_with(Some(Path::new("/x.json")))[3..5],
+            ["-c", "/x.json"]
+        );
     }
 
     #[test]

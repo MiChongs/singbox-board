@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
 
 use super::app::{App, AppEvent, PendingAction, Popup};
+use super::popup::{Input, InputPurpose};
 use super::theme::{
     self, ACCENT, BLUE, GREEN, MARK, PEACH, SUBTEXT, TEXT, YELLOW, chip, dim, panel, pill, selected,
 };
@@ -27,13 +28,6 @@ pub enum CoreFocus {
     #[default]
     Releases,
     Installed,
-}
-
-/// What a free-text input popup is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputPurpose {
-    AddSource,
-    ImportCore,
 }
 
 #[derive(Default)]
@@ -292,20 +286,24 @@ impl App {
                 self.core_load_installed();
             }
             KeyCode::Char('a') => {
-                self.popup = Some(Popup::Input {
-                    title: fl!("tui-add-source-title"),
-                    hint: fl!("tui-add-source-hint"),
-                    value: String::new(),
-                    purpose: InputPurpose::AddSource,
-                })
+                self.popup = Some(Popup::Input(
+                    Input::new(
+                        fl!("tui-add-source-title"),
+                        fl!("tui-add-source-hint"),
+                        InputPurpose::AddSource,
+                    )
+                    .placeholder("owner/repo"),
+                ))
             }
             KeyCode::Char('I') => {
-                self.popup = Some(Popup::Input {
-                    title: fl!("tui-import-title"),
-                    hint: fl!("tui-import-hint"),
-                    value: String::new(),
-                    purpose: InputPurpose::ImportCore,
-                })
+                self.popup = Some(Popup::Input(
+                    Input::new(
+                        fl!("tui-import-title"),
+                        fl!("tui-import-hint"),
+                        InputPurpose::ImportCore,
+                    )
+                    .placeholder("/path/to/sing-box  [sha256]"),
+                ))
             }
             _ => {}
         }
@@ -534,6 +532,7 @@ impl App {
                     },
                 );
             }
+            _ => {}
         }
     }
 

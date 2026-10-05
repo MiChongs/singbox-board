@@ -22,10 +22,10 @@ use super::github::parse_version_output;
 use super::logs::LogHub;
 use super::process::{self, describe, first_line, pipe_to_logs, sleep_until_opt, wait_child};
 use super::singbox_config::discover_clash_api;
-use crate::config::{DaemonConfig, RestartPolicy};
+use crate::config::{CoreConfig, DaemonConfig, RestartPolicy};
 use crate::i18n::{self, Lang, fl, fl_log};
 use crate::protocol::{ClashApi, CoreState, LogSource, Response, Status};
-use crate::util::{error_chain, now_unix, strip_ansi};
+use crate::util::{error_chain, now_unix, point_symlink, strip_ansi};
 
 /// A process still alive after this long is considered successfully started.
 const STARTUP_GRACE: Duration = Duration::from_millis(1500);
@@ -54,6 +54,15 @@ pub enum Op {
         force: bool,
         restart: bool,
         /// Core (binary, label) to return to if the new one fails to start.
+        fallback: Option<(PathBuf, CoreLabel)>,
+    },
+    /// Point the configuration file at a stored profile and restart sing-box onto it.
+    SwitchConfig {
+        target: PathBuf,
+        label: CoreLabel,
+        /// Switch even if sing-box rejects the profile.
+        force: bool,
+        /// Profile (file, label) to return to if the new one fails to start.
         fallback: Option<(PathBuf, CoreLabel)>,
     },
 }
@@ -129,6 +138,9 @@ pub struct Supervisor {
     state: CoreState,
     /// Whether the user wants sing-box running (drives automatic restarts).
     want_running: bool,
+    /// The automatic start was skipped for a missing binary or configuration;
+    /// sing-box starts once a core or profile switch provides it.
+    deferred_start: bool,
     started_at: Option<(Instant, u64)>,
     restarts: u32,
     last_exit: Option<String>,
@@ -157,6 +169,7 @@ impl Supervisor {
             pipes: Vec::new(),
             state: CoreState::Stopped,
             want_running: false,
+            deferred_start: false,
             started_at: None,
             restarts: 0,
             last_exit: None,
@@ -188,6 +201,7 @@ impl Supervisor {
                 "supervisor-not-starting",
                 reason = missing.message()
             ));
+            self.deferred_start = true;
         }
         if self.config.core.auto_start && missing.is_none() {
             if !*startup_gate.borrow() {
@@ -258,6 +272,12 @@ impl Supervisor {
                 self.activate(&target, &label, force, restart, fallback)
                     .await
             }
+            Op::SwitchConfig {
+                target,
+                label,
+                force,
+                fallback,
+            } => self.switch_config(&target, &label, force, fallback).await,
         };
         let _ = reply.send(response);
     }
@@ -297,6 +317,7 @@ impl Supervisor {
             setup_required: false,
             components: Vec::new(),
             active_core: None,
+            active_profile: None,
         });
     }
 
@@ -311,6 +332,7 @@ impl Supervisor {
         }
         self.restart_at = None;
         self.want_running = true;
+        self.deferred_start = false;
         self.reset_backoff();
         match self.launch().await {
             Ok(pid) => Response::done(fl!("supervisor-started", pid = pid.to_string())),
@@ -323,6 +345,7 @@ impl Supervisor {
 
     async fn stop(&mut self) -> Response {
         self.want_running = false;
+        self.deferred_start = false;
         let cancelled_restart = self.restart_at.take().is_some();
         match self.stop_child().await {
             Some(exit) => Response::done(fl!("supervisor-stopped", exit = exit)),
@@ -390,37 +413,7 @@ impl Supervisor {
 
     /// `sing-box check` of the configured files using a specific core build.
     async fn check_with(&self, binary: &Path) -> Result<()> {
-        let core = &self.config.core;
-        let output = timeout(
-            CHECK_TIMEOUT,
-            Command::new(binary)
-                .args(core.check_args())
-                .envs(&core.env)
-                .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow!(fl!("supervisor-check-timeout")))?
-        .with_context(|| {
-            fl!(
-                "supervisor-check-run-failed",
-                path = binary.display().to_string()
-            )
-        })?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-        let text = strip_ansi(text.trim());
-        if text.is_empty() {
-            bail!(fl!(
-                "supervisor-check-failed",
-                exit = describe(&Ok(output.status))
-            ));
-        }
-        bail!("{text}")
+        run_check(&self.config.core, binary, self.config.core.check_args()).await
     }
 
     /// Spawns sing-box and waits [`STARTUP_GRACE`] to catch immediate failures.
@@ -657,9 +650,11 @@ impl Supervisor {
             label = label.log.clone(),
             previous = previous.unwrap_or_else(|| fl_log!("none"))
         ));
-        // Also bring sing-box back when it died on the previous core.
-        let start =
-            self.child.is_some() || matches!(self.state, CoreState::Failed | CoreState::Backoff);
+        // Also bring sing-box back when it died on the previous core, and
+        // start it when it only waited for a core.
+        let start = self.child.is_some()
+            || matches!(self.state, CoreState::Failed | CoreState::Backoff)
+            || (self.deferred_start && self.missing_prerequisite().is_none());
         if !restart || !start {
             return Response::done(fl!("supervisor-switched", label = label.reply.clone()));
         }
@@ -667,6 +662,7 @@ impl Supervisor {
         self.restart_at = None;
         self.reset_backoff();
         self.want_running = true;
+        self.deferred_start = false;
         let err = match self.launch().await {
             Ok(pid) => {
                 return Response::done(fl!(
@@ -726,6 +722,156 @@ impl Supervisor {
             fl!("supervisor-switch-back-hint")
         ))
     }
+
+    /// Points the configuration file at `target` (an atomic symlink swap).
+    /// sing-box must accept the profile unless `force` is set; a running
+    /// sing-box is restarted onto it and returns to `fallback` if it fails.
+    async fn switch_config(
+        &mut self,
+        target: &Path,
+        label: &CoreLabel,
+        force: bool,
+        fallback: Option<(PathBuf, CoreLabel)>,
+    ) -> Response {
+        let Some(slot) = self.config.core.config_slot() else {
+            return Response::error(fl!("supervisor-no-config-slot"));
+        };
+        if !target.is_file() {
+            return Response::error(fl!("err-not-found", path = target.display().to_string()));
+        }
+        let binary = self.config.core.binary.clone();
+        if !force && binary.exists() {
+            let args = self.config.core.check_args_with(Some(target));
+            if let Err(err) = run_check(&self.config.core, &binary, args).await {
+                return Response::error(format!(
+                    "{}\n{}",
+                    fl!("supervisor-rejects-profile", label = label.reply.clone()),
+                    error_chain(&err)
+                ));
+            }
+        }
+        if let Err(err) = point_symlink(&slot, target) {
+            return Response::error(fl!(
+                "supervisor-switch-failed",
+                path = slot.display().to_string(),
+                error = error_chain(&err)
+            ));
+        }
+        self.clash_api = discover_clash_api(&self.config.core, &self.config.clash_api);
+        self.publish();
+        self.logs.info(fl_log!(
+            "supervisor-profile-switched-log",
+            label = label.log.clone()
+        ));
+        let start = self.child.is_some()
+            || matches!(self.state, CoreState::Failed | CoreState::Backoff)
+            || (self.deferred_start && self.missing_prerequisite().is_none());
+        if !start {
+            return Response::done(fl!(
+                "supervisor-profile-switched",
+                label = label.reply.clone()
+            ));
+        }
+        let was_running = self.child.is_some();
+        self.stop_child().await;
+        self.restart_at = None;
+        self.reset_backoff();
+        self.want_running = true;
+        self.deferred_start = false;
+        let err = match self.launch().await {
+            Ok(pid) if was_running => {
+                return Response::done(fl!(
+                    "supervisor-profile-restarted",
+                    label = label.reply.clone(),
+                    pid = pid.to_string()
+                ));
+            }
+            Ok(pid) => {
+                return Response::done(fl!(
+                    "supervisor-profile-started",
+                    label = label.reply.clone(),
+                    pid = pid.to_string()
+                ));
+            }
+            Err(err) => err,
+        };
+        if !force
+            && let Some((previous, previous_label)) = fallback
+            && point_symlink(&slot, &previous).is_ok()
+        {
+            self.clash_api = discover_clash_api(&self.config.core, &self.config.clash_api);
+            self.logs.warn(fl_log!(
+                "supervisor-profile-rolled-back-log",
+                label = label.log.clone(),
+                previous = previous_label.log.clone()
+            ));
+            self.restart_at = None;
+            self.reset_backoff();
+            let restored = match self.launch().await {
+                Ok(pid) => fl!(
+                    "supervisor-previous-profile-running",
+                    label = previous_label.reply.clone(),
+                    pid = pid.to_string()
+                ),
+                Err(_) => {
+                    self.want_running = false;
+                    fl!(
+                        "supervisor-previous-profile-failed",
+                        label = previous_label.reply.clone()
+                    )
+                }
+            };
+            return Response::error(format!(
+                "{}\n{}",
+                fl!(
+                    "supervisor-profile-rolled-back",
+                    label = label.reply.clone(),
+                    restored = restored
+                ),
+                error_chain(&err)
+            ));
+        }
+        self.want_running = false;
+        Response::error(fl!(
+            "supervisor-profile-start-failed",
+            label = label.reply.clone(),
+            error = error_chain(&err)
+        ))
+    }
+}
+
+/// Runs `sing-box check` with `args` using the given core build.
+pub async fn run_check(core: &CoreConfig, binary: &Path, args: Vec<String>) -> Result<()> {
+    let output = timeout(
+        CHECK_TIMEOUT,
+        Command::new(binary)
+            .args(args)
+            .envs(&core.env)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!(fl!("supervisor-check-timeout")))?
+    .with_context(|| {
+        fl!(
+            "supervisor-check-run-failed",
+            path = binary.display().to_string()
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    let text = strip_ansi(text.trim());
+    if text.is_empty() {
+        bail!(fl!(
+            "supervisor-check-failed",
+            exit = describe(&Ok(output.status))
+        ));
+    }
+    bail!("{text}")
 }
 
 fn placeholder_status() -> Status {
@@ -747,21 +893,6 @@ fn placeholder_status() -> Status {
         setup_required: false,
         components: Vec::new(),
         active_core: None,
+        active_profile: None,
     }
-}
-
-/// Atomically makes `link` a symlink to `target` (replacing a file or link).
-fn point_symlink(link: &Path, target: &Path) -> Result<()> {
-    if let Some(dir) = link.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut tmp = link.as_os_str().to_owned();
-    tmp.push(".switching");
-    let tmp = PathBuf::from(tmp);
-    let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(target, &tmp)?;
-    std::fs::rename(&tmp, link).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(())
 }

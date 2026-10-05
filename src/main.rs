@@ -5,6 +5,7 @@ mod config;
 mod ctl;
 mod daemon;
 mod i18n;
+mod profile;
 mod protocol;
 mod substore;
 mod tui;
@@ -157,6 +158,88 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<CoreCmd>,
     },
+    #[command(about = fl!("cli-profile"), visible_alias = "config")]
+    Profile {
+        #[command(subcommand)]
+        action: Option<ProfileCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    #[command(about = fl!("cli-profile-list"))]
+    List,
+    #[command(about = fl!("cli-profile-add"))]
+    Add {
+        #[arg(value_name = "FILE|URL", help = fl!("cli-profile-add-source"))]
+        source: String,
+        #[arg(long, help = fl!("cli-profile-name"))]
+        name: Option<String>,
+        #[arg(long, value_name = "MINUTES", help = fl!("cli-profile-interval"))]
+        interval: Option<u64>,
+        #[arg(long = "use", help = fl!("cli-profile-use-now"))]
+        activate: bool,
+    },
+    #[command(about = fl!("cli-profile-new"))]
+    New {
+        #[arg(help = fl!("cli-profile-name"))]
+        name: String,
+        #[arg(long, help = fl!("cli-profile-new-edit"))]
+        edit: bool,
+        #[arg(long = "use", help = fl!("cli-profile-use-now"))]
+        activate: bool,
+    },
+    #[command(about = fl!("cli-profile-use"))]
+    Use {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+        #[arg(long, help = fl!("cli-profile-force-use"))]
+        force: bool,
+    },
+    #[command(about = fl!("cli-profile-show"))]
+    Show {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+    },
+    #[command(about = fl!("cli-profile-edit"))]
+    Edit {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+        #[arg(long, help = fl!("cli-profile-force-save"))]
+        force: bool,
+    },
+    #[command(about = fl!("cli-profile-update"))]
+    Update {
+        #[arg(help = fl!("cli-profile-update-id"))]
+        profile: Option<String>,
+        #[arg(long, help = fl!("cli-profile-force-save"))]
+        force: bool,
+    },
+    #[command(about = fl!("cli-profile-set"))]
+    Set {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+        #[arg(long, help = fl!("cli-profile-rename"))]
+        name: Option<String>,
+        #[arg(long, value_name = "URL", help = fl!("cli-profile-url"))]
+        url: Option<String>,
+        #[arg(long, value_name = "MINUTES", help = fl!("cli-profile-interval"))]
+        interval: Option<u64>,
+        #[arg(long, conflicts_with = "url", help = fl!("cli-profile-local"))]
+        local: bool,
+    },
+    #[command(about = fl!("cli-profile-check"))]
+    Check {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+    },
+    #[command(about = fl!("cli-profile-remove"))]
+    Remove {
+        #[arg(help = fl!("cli-profile-id"))]
+        profile: String,
+    },
+    #[command(about = fl!("cli-profile-adopt"))]
+    Adopt,
 }
 
 #[derive(Subcommand)]
@@ -379,6 +462,7 @@ fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
                 ctl::component(&client, component, action).await
             }
             Cmd::Core { action } => run_core(&client, action).await,
+            Cmd::Profile { action } => run_profile(&client, action).await,
             Cmd::Daemon { .. } => unreachable!("handled in main"),
         }
     })
@@ -434,6 +518,46 @@ async fn run_core(client: &DaemonClient, action: Option<CoreCmd>) -> Result<()> 
             )
             .await
         }
+    }
+}
+
+async fn run_profile(client: &DaemonClient, action: Option<ProfileCmd>) -> Result<()> {
+    match action.unwrap_or(ProfileCmd::List) {
+        ProfileCmd::List => ctl::profile_list(client).await,
+        ProfileCmd::Add {
+            source,
+            name,
+            interval,
+            activate,
+        } => ctl::profile_add(client, &source, name, interval, activate).await,
+        ProfileCmd::New {
+            name,
+            edit,
+            activate,
+        } => ctl::profile_new(client, name, edit, activate).await,
+        ProfileCmd::Use { profile, force } => {
+            ctl::command(client, Request::ProfileActivate { id: profile, force }).await
+        }
+        ProfileCmd::Show { profile } => ctl::profile_show(client, &profile).await,
+        ProfileCmd::Edit { profile, force } => ctl::profile_edit(client, &profile, force).await,
+        ProfileCmd::Update { profile, force } => {
+            eprintln!("{}", fl!("ctl-profile-downloading"));
+            ctl::command(client, Request::ProfileUpdate { id: profile, force }).await
+        }
+        ProfileCmd::Set {
+            profile,
+            name,
+            url,
+            interval,
+            local,
+        } => ctl::profile_set(client, profile, name, url, interval, local).await,
+        ProfileCmd::Check { profile } => {
+            ctl::command(client, Request::ProfileCheck { id: profile }).await
+        }
+        ProfileCmd::Remove { profile } => {
+            ctl::command(client, Request::ProfileRemove { id: profile }).await
+        }
+        ProfileCmd::Adopt => ctl::command(client, Request::ProfileAdopt).await,
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::config::{ClashApiOverride, CoreConfig};
+use crate::profile::strip_json_comments;
 use crate::protocol::ClashApi;
 
 /// Configuration files in the order sing-box merges them.
@@ -77,89 +78,9 @@ pub fn controller_url(listen: &str) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
-/// Removes `//`, `#` and `/* */` comments plus trailing commas, which the
-/// sing-box parser accepts but strict JSON does not.
-pub fn strip_json_comments(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            out.push(c);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' => {
-                in_string = true;
-                out.push(c);
-                i += 1;
-            }
-            b'#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
-                    i += 1;
-                }
-                i += 2;
-            }
-            b']' | b'}' => {
-                // Drop a trailing comma (and the whitespace after it) before the closer.
-                let mut end = out.len();
-                while end > 0 && out[end - 1].is_ascii_whitespace() {
-                    end -= 1;
-                }
-                if end > 0 && out[end - 1] == b',' {
-                    out.remove(end - 1);
-                }
-                out.push(c);
-                i += 1;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn comments_and_trailing_commas() {
-        let input = r#"{
-            // line comment
-            "a": "http://x/#not-a-comment", # hash comment
-            /* block
-               comment */
-            "b": [1, 2,],
-        }"#;
-        let value: Value = serde_json::from_str(&strip_json_comments(input)).unwrap();
-        assert_eq!(value["a"], "http://x/#not-a-comment");
-        assert_eq!(value["b"], serde_json::json!([1, 2]));
-    }
 
     #[test]
     fn controller_urls() {

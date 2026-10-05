@@ -83,6 +83,20 @@ prerelease = false
 restart_after_update = true
 
 # ---------------------------------------------------------------------------
+# Configuration profiles: every configuration the dashboard manages is kept in
+# <components.data_dir>/profiles/, and the first `core.config` file becomes a
+# link to the active one. Profiles are imported from files or subscription
+# URLs, created from a template, edited and switched in the TUI ("Profiles")
+# or with `singbox-board profile`.
+# ---------------------------------------------------------------------------
+[profiles]
+# User-Agent for downloading remote profiles. Empty sends
+# "sing-box/<core version>", which providers use to return a sing-box config.
+user_agent = ""
+# Proxy for downloading remote profiles, e.g. "http://127.0.0.1:7890".
+# proxy = ""
+
+# ---------------------------------------------------------------------------
 # Optional components. Whether they are enabled is asked on first run (TUI or
 # `singbox-board setup`) and stored in <data_dir>/state.json; change it later
 # with `singbox-board component <sub-store|http-meta> enable|disable`.

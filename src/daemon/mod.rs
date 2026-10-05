@@ -6,6 +6,7 @@ mod cores;
 mod github;
 mod logs;
 mod process;
+mod profiles;
 mod service;
 mod singbox_config;
 mod supervisor;
@@ -27,6 +28,7 @@ use self::auth::Authorizer;
 use self::components::ComponentsHandle;
 use self::cores::CoreManager;
 use self::logs::LogHub;
+use self::profiles::ProfileManager;
 use self::supervisor::{CoreLabel, Op, Supervisor, SupervisorHandle};
 use crate::config::DaemonConfig;
 use crate::i18n::{self, Lang, fl, fl_log};
@@ -60,10 +62,13 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
     let components = components::spawn(config.clone(), logs.clone());
     let (handle, supervisor) =
         Supervisor::spawn(config.clone(), logs.clone(), components.startup_gate());
+    let profiles = ProfileManager::new(config.clone(), logs.clone(), handle.clone());
+    profiles.spawn_updater();
     let ctx = Arc::new(Ctx {
         supervisor: handle.clone(),
         components: components.clone(),
         cores: CoreManager::new(config.clone(), logs.clone()),
+        profiles,
         logs: logs.clone(),
         auth,
         config: config.clone(),
@@ -154,6 +159,7 @@ struct Ctx {
     supervisor: SupervisorHandle,
     components: ComponentsHandle,
     cores: Arc<CoreManager>,
+    profiles: Arc<ProfileManager>,
     logs: Arc<LogHub>,
     auth: Arc<Authorizer>,
     config: DaemonConfig,
@@ -226,6 +232,7 @@ where
             status.setup_required = ctx.components.setup_required();
             status.components = ctx.components.statuses();
             status.active_core = ctx.cores.active();
+            status.active_profile = ctx.profiles.active();
             status.update_in_progress = ctx.cores.busy();
             return send(&mut write, &Response::Status(Box::new(status))).await;
         }
@@ -243,6 +250,25 @@ where
         Request::Component { component, action } => {
             requested(format!("{action:?} {}", component.name()));
             let response = ctx.components.action(component, action).await;
+            return send(&mut write, &response).await;
+        }
+        profile_request @ (Request::ProfileList
+        | Request::ProfileGet { .. }
+        | Request::ProfileAdd { .. }
+        | Request::ProfileSave { .. }
+        | Request::ProfileSet { .. }
+        | Request::ProfileUpdate { .. }
+        | Request::ProfileActivate { .. }
+        | Request::ProfileRemove { .. }
+        | Request::ProfileCheck { .. }
+        | Request::ProfileAdopt) => {
+            if !matches!(
+                profile_request,
+                Request::ProfileList | Request::ProfileGet { .. }
+            ) {
+                requested(request_name(&profile_request));
+            }
+            let response = handle_profile(&ctx.profiles, profile_request).await;
             return send(&mut write, &response).await;
         }
         Request::Start => Op::Start,
@@ -359,6 +385,90 @@ async fn handle_core(ctx: &Ctx, request: Request, privileged: bool) -> Response 
         }
         Request::CheckUpdate => result(check_update(ctx).await.map(Response::UpdateInfo)),
         Request::Update { tag, force } => result(update(ctx, tag.as_deref(), force).await),
+        other => Response::error(fl!(
+            "daemon-unexpected-request",
+            name = request_name(&other)
+        )),
+    }
+}
+
+async fn handle_profile(profiles: &ProfileManager, request: Request) -> Response {
+    let saved = |(profile, message)| Response::ProfileSaved {
+        profile: Box::new(profile),
+        message,
+    };
+    match request {
+        Request::ProfileList => Response::Profiles(profiles.list()),
+        Request::ProfileGet { id } => {
+            result(
+                profiles
+                    .read(&id)
+                    .await
+                    .map(|(profile, content)| Response::ProfileContent {
+                        profile: Box::new(profile),
+                        content,
+                    }),
+            )
+        }
+        Request::ProfileAdd {
+            name,
+            content,
+            url,
+            interval,
+            activate,
+        } => {
+            let (profile, message) = match profiles.add(name, content, url, interval).await {
+                Ok(added) => added,
+                Err(err) => return Response::error(error_chain(&err)),
+            };
+            if !activate {
+                return saved((profile, message));
+            }
+            match profiles.activate(&profile.id, false).await {
+                Ok(Response::Done { message: switched }) => {
+                    let profile = profiles.resolve(&profile.id).unwrap_or(profile);
+                    saved((profile, format!("{message}\n{switched}")))
+                }
+                Ok(Response::Error { message: failed }) => {
+                    Response::error(format!("{message}\n{failed}"))
+                }
+                Ok(other) => other,
+                Err(err) => Response::error(format!("{message}\n{}", error_chain(&err))),
+            }
+        }
+        Request::ProfileSave { id, content, force } => {
+            result(profiles.save(&id, &content, force).await.map(saved))
+        }
+        Request::ProfileSet {
+            id,
+            name,
+            url,
+            interval,
+        } => result(
+            profiles
+                .set(&id, name, url, interval)
+                .await
+                .map(|p| Response::done(fl!("profiles-settings-saved", name = p.name))),
+        ),
+        Request::ProfileUpdate {
+            id: Some(id),
+            force,
+        } => result(profiles.update(&id, force).await.map(Response::done)),
+        Request::ProfileUpdate { id: None, force } => {
+            result(profiles.update_all(force).await.map(Response::done))
+        }
+        Request::ProfileActivate { id, force } => result(profiles.activate(&id, force).await),
+        Request::ProfileRemove { id } => result(
+            profiles
+                .remove(&id)
+                .await
+                .map(|p| Response::done(fl!("profiles-removed", name = p.name))),
+        ),
+        Request::ProfileCheck { id } => result(profiles.check(&id).await.map(Response::done)),
+        Request::ProfileAdopt => result(profiles.adopt().await.map(|adopted| match adopted {
+            Some(p) => Response::done(fl!("profiles-adopted", name = p.name, id = p.id)),
+            None => Response::done(fl!("profiles-nothing-to-adopt")),
+        })),
         other => Response::error(fl!(
             "daemon-unexpected-request",
             name = request_name(&other)

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::fl;
 
-/// Upper bound for a single request line.
-pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+/// Upper bound for a single request line; profile contents travel inline.
+pub const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A request line: the command plus the language the client wants replies
 /// in. Daemons that predate `lang` ignore it.
@@ -112,6 +112,69 @@ pub enum Request {
         #[serde(default)]
         activate: bool,
     },
+    /// Configuration profiles in the store.
+    ProfileList,
+    /// A profile and its content.
+    ProfileGet {
+        id: String,
+    },
+    /// Stores a new profile: `content` as given, downloaded from `url` (a
+    /// remote profile), or the built-in template when both are absent.
+    ProfileAdd {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        /// Minutes between automatic downloads of a remote profile.
+        #[serde(default)]
+        interval: Option<u64>,
+        #[serde(default)]
+        activate: bool,
+    },
+    /// Replaces a profile's content. The active profile has to pass
+    /// `sing-box check` unless `force` is set, and sing-box is reloaded.
+    ProfileSave {
+        id: String,
+        content: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Renames a profile or changes where and how often it is downloaded;
+    /// an empty `url` turns a remote profile into a local one.
+    ProfileSet {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        interval: Option<u64>,
+    },
+    /// Downloads a remote profile again; every remote profile without `id`.
+    ProfileUpdate {
+        #[serde(default)]
+        id: Option<String>,
+        /// Store the download even if sing-box rejects it.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Switches sing-box to a profile.
+    ProfileActivate {
+        id: String,
+        #[serde(default)]
+        force: bool,
+    },
+    ProfileRemove {
+        id: String,
+    },
+    /// Runs `sing-box check` against a stored profile.
+    ProfileCheck {
+        id: String,
+    },
+    /// Moves the configuration sing-box uses now into the store.
+    ProfileAdopt,
 }
 
 /// Optional services the daemon can install and supervise next to sing-box.
@@ -180,6 +243,16 @@ pub enum Response {
     CoreReleases(CoreReleasePage),
     CoreInstalled {
         cores: Vec<StoredCore>,
+    },
+    Profiles(ProfileList),
+    ProfileContent {
+        profile: Box<Profile>,
+        content: String,
+    },
+    /// A profile was created or its content replaced.
+    ProfileSaved {
+        profile: Box<Profile>,
+        message: String,
     },
     Error {
         message: String,
@@ -274,6 +347,9 @@ pub struct Status {
     /// The stored core `binary` points to; `None` for an unmanaged binary.
     #[serde(default)]
     pub active_core: Option<StoredCore>,
+    /// The profile the configuration file links to.
+    #[serde(default)]
+    pub active_profile: Option<Profile>,
 }
 
 /// Release sources everyone may install from.
@@ -416,6 +492,61 @@ impl StoredCore {
             name => name.to_owned(),
         }
     }
+}
+
+/// A sing-box configuration kept in the daemon's profile store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    /// Where a remote profile is downloaded from; `None` for local ones.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Minutes between automatic downloads; 0 downloads only on request.
+    #[serde(default)]
+    pub interval: u64,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// Unix seconds of the last content change.
+    pub updated_at: u64,
+    /// Unix seconds of the last successful download.
+    #[serde(default)]
+    pub fetched_at: Option<u64>,
+    /// Why the last download failed.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Traffic reported by the provider (`subscription-userinfo`).
+    #[serde(default)]
+    pub usage: Option<ProfileUsage>,
+    pub size: u64,
+    #[serde(default)]
+    pub active: bool,
+}
+
+impl Profile {
+    pub fn is_remote(&self) -> bool {
+        self.url.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileUsage {
+    pub upload: u64,
+    pub download: u64,
+    pub total: u64,
+    /// Unix seconds.
+    #[serde(default)]
+    pub expire: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileList {
+    pub profiles: Vec<Profile>,
+    /// The configuration file sing-box is started with, which links to the
+    /// active profile; empty when `core.config` lists no file.
+    pub slot: String,
+    /// The file holds a configuration that is not in the store yet.
+    pub unmanaged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -607,6 +738,35 @@ mod tests {
         assert!(matches!(envelope.request, Request::CoreRemove { ref id } if id == "a/b/c"));
         let envelope: Envelope = serde_json::from_str(&line).unwrap();
         assert_eq!(envelope.lang.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn profile_wire_format() {
+        let request: Request = serde_json::from_str(
+            r#"{"cmd":"profile_add","url":"https://example.com/sub","activate":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::ProfileAdd {
+                name: None,
+                content: None,
+                url: Some(_),
+                interval: None,
+                activate: true,
+            }
+        ));
+        let json = serde_json::to_string(&Request::ProfileUpdate {
+            id: None,
+            force: false,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"cmd":"profile_update","id":null,"force":false}"#);
+        let profile: Profile = serde_json::from_str(
+            r#"{"id":"a1","name":"Home","created_at":1,"updated_at":2,"size":3}"#,
+        )
+        .unwrap();
+        assert!(!profile.is_remote() && !profile.active && profile.usage.is_none());
     }
 
     #[test]

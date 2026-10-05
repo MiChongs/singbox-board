@@ -3,7 +3,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use unicode_width::UnicodeWidthStr;
 
 use crate::i18n::fl;
@@ -159,6 +159,96 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     drop(file);
     std::fs::rename(&tmp, path)
         .with_context(|| fl!("err-replace", path = path.display().to_string()))
+}
+
+/// Atomically makes `link` a symlink to `target` (replacing a file or link).
+pub fn point_symlink(link: &Path, target: &Path) -> Result<()> {
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = link.as_os_str().to_owned();
+    tmp.push(".switching");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)?;
+    std::fs::rename(&tmp, link).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
+/// A URL without its query, shortened for display; queries often carry
+/// subscription tokens.
+pub fn shorten_url(url: &str) -> String {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    let mut text: String = base.chars().take(60).collect();
+    if base.len() < url.len() || base.chars().count() > 60 {
+        text.push('…');
+    }
+    text
+}
+
+/// Opens `text` in `$VISUAL`, `$EDITOR` or the first of nano, vim and vi
+/// found in `PATH`, and returns what was saved. Blocks until the editor
+/// exits; the temporary file is readable by the current user only.
+pub fn edit_text(text: &str, name: &str) -> Result<String> {
+    let (program, args) = editor_command()?;
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    let path = std::env::temp_dir().join(format!("singbox-board-{}-{name}.json", random_token(6)));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| fl!("err-create", path = path.display().to_string()))?;
+    file.write_all(text.as_bytes())?;
+    drop(file);
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .arg(&path)
+        .status()
+        .with_context(|| fl!("editor-start-failed", editor = program.clone()));
+    let result = match status {
+        Ok(status) if status.success() => std::fs::read_to_string(&path)
+            .with_context(|| fl!("err-read", path = path.display().to_string())),
+        Ok(status) => Err(anyhow::anyhow!(fl!(
+            "editor-failed",
+            editor = program.clone(),
+            status = status.to_string()
+        ))),
+        Err(err) => Err(err),
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// The editor program and its arguments.
+fn editor_command() -> Result<(String, Vec<String>)> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(var) {
+            let mut parts = value.split_whitespace().map(str::to_owned);
+            if let Some(program) = parts.next() {
+                return Ok((program, parts.collect()));
+            }
+        }
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for candidate in ["nano", "vim", "vi"] {
+        if std::env::split_paths(&path).any(|dir| dir.join(candidate).is_file()) {
+            return Ok((candidate.to_owned(), Vec::new()));
+        }
+    }
+    bail!(fl!("editor-none"))
 }
 
 /// Alphanumeric token from the kernel CSPRNG.

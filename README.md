@@ -4,9 +4,10 @@
 
 - **root daemon**：以 root 运行并托管 `sing-box run` 子进程（TUN、`auto_route`、tproxy、eBPF 入站都需要 root），负责启停、崩溃后指数退避重启、配置校验与热重载，并从 GitHub Releases 安装或更新内核。
 - **核心版本管理**：内置 MiChongs（xiaobaf14g）与 SagerNet 官方两个发布源，可添加任意 GitHub 源或导入自编译核心。可列出某个源的全部版本及本机可用的构建变体（ebpf、easytier、glibc、musl 等），一键下载、校验、切换或回退，多个版本并存，切换瞬间完成，启动失败会自动回滚。
+- **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；在 TUI 中可用树形编辑器可视化修改，或交给 `$EDITOR` 编辑原文。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
-- **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接。
-- **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component`，便于脚本调用。
+- **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置。
+- **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component / core / profile`，便于脚本调用。
 
 ```
             ┌──────────────── singbox-board daemon (root) ─────────────────┐
@@ -97,6 +98,8 @@ sing-box 配置默认读取 `/etc/sing-box/config.json`，工作目录为 `/var/
 
 守护进程会自动从配置（包括 `-C` 目录中合并的文件，支持注释）中读取地址和 secret，并转交给已授权的客户端。
 
+配置不必手写：可以在 TUI 的「配置」页或用 `singbox-board profile` 导入文件、订阅地址，或用内置模板新建，详见[配置管理](#配置管理)。
+
 ## 使用
 
 ```bash
@@ -109,6 +112,12 @@ singbox-board update --tag v1.14.1-xiaobaf14g.1 --force
 singbox-board core                          # 当前核心与已安装版本
 singbox-board core list --source SagerNet/sing-box
 singbox-board core install v1.14.2 --source SagerNet/sing-box --variant glibc
+singbox-board profile                       # 列出配置（别名 config）
+singbox-board profile add https://example.com/sub --use   # 导入订阅配置并切换
+singbox-board profile add ./config.json --name 家里       # 导入文件（- 表示标准输入）
+singbox-board profile new 测试 --edit         # 用模板新建并在编辑器中打开
+singbox-board profile use 家里                # 校验、切换并重启 sing-box
+singbox-board profile edit 家里               # 用 $EDITOR 编辑，正在使用的配置保存后自动重载
 singbox-board setup                         # 选择可选组件
 singbox-board component sub-store           # 状态、Web 地址、订阅的 sing-box 链接
 singbox-board component http-meta update    # start|stop|restart|enable|disable|update
@@ -135,7 +144,7 @@ SINGBOX_BOARD_LANG=en singbox-board
 
 | 按键 | 功能 |
 |---|---|
-| `1`-`6` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store / Core |
+| `1`-`7` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store / Core / 配置 |
 | `s` `x` `r` | 启动 / 停止 / 重启 sing-box（停止和重启需要确认） |
 | `R` | 校验配置并热重载 |
 | `c` | 运行 `sing-box check` |
@@ -149,6 +158,9 @@ SINGBOX_BOARD_LANG=en singbox-board
 | Sub-Store 页 `y` `w` `p` | 复制 sing-box 订阅链接 / 复制 Web 界面地址 / 显示 provider 配置片段 |
 | Core 页 `←→` `Enter` `v` `i` `d` | 在来源、版本、已安装之间切换焦点 / 下载并切换 / 切换变体 / 仅下载 / 删除 |
 | Core 页 `p` `n` `f` `a` `I` | 只看正式版 / 下一页 / 刷新 / 添加源 / 导入核心 |
+| 配置页 `Enter` | 操作菜单：使用、编辑、更新、重命名、订阅地址与更新间隔、复制、校验、导出、删除 |
+| 配置页 `e` `E` `n` `i` | 树形编辑 / 用 `$EDITOR` 编辑 / 用模板新建 / 导入文件或订阅地址（支持粘贴） |
+| 配置页 `f` `F` `d` `A` | 更新所选订阅 / 更新全部订阅 / 删除 / 将当前配置文件收入配置库 |
 | `?` / `q` | 帮助 / 退出 |
 
 ## 核心版本管理
@@ -174,6 +186,47 @@ SINGBOX_BOARD_LANG=en singbox-board
 - **切换后**：如果新核心启动失败（有些问题只在运行时才出现，例如新版本把弃用提示改成了致命错误），会自动回滚到之前的核心并重新启动。
 - **`update` 的规则**：沿用当前核心的来源和变体，`daemon.toml` 的 `[update]` 只在还没有托管核心时生效。
 - **权限**：添加自定义源和导入二进制只允许 root。核心以 root 身份运行，这两个操作等同于决定以 root 执行什么程序；`singbox-board` 组的成员只能在内置源和 root 添加的源之间安装、切换。
+
+## 配置管理
+
+所有配置都保存在配置库 `/var/lib/singbox-board/profiles/<id>.json` 中（目录仅 root 可读写，文件权限 `0600`），`index.json` 记录名称、来源和更新时间。`core.config` 的第一个文件（默认 `/etc/sing-box/config.json`）是指向当前配置的软链接，sing-box 始终读取同一路径，切换只是一次原子替换。`-C` 目录（`core.config_dir`）中的文件仍会在当前配置之上合并，适合放各配置共用的覆盖项。
+
+| 操作 | TUI（第 7 页 配置） | 命令行 |
+|---|---|---|
+| 列出配置 | 上栏列表，下栏显示所选配置的概要（入站、出站、代理组、DNS、路由、Clash API）与详情 | `singbox-board profile` |
+| 导入文件 | `i`，输入或粘贴路径 | `singbox-board profile add ./config.json` |
+| 导入订阅 | `i`，输入或粘贴 http(s) 地址 | `singbox-board profile add <url> [--interval 分钟]` |
+| 用模板新建 | `n` | `singbox-board profile new <名称> [--edit]` |
+| 切换 | `Enter` → 使用此配置 | `singbox-board profile use <名称或 ID>` |
+| 可视化编辑 | `e` | 无 |
+| 编辑原文 | `E` | `singbox-board profile edit <名称>` |
+| 更新订阅 | `f`（全部为 `F`） | `singbox-board profile update [<名称>]` |
+| 改名、订阅地址、更新间隔 | `Enter` 菜单 | `singbox-board profile set <名称> --name … --url … --interval …`，`--local` 转为本地配置 |
+| 校验 | `Enter` → 用 sing-box 校验 | `singbox-board profile check <名称>` |
+| 导出 | `Enter` → 导出到文件 | `singbox-board profile show <名称> > file.json` |
+| 删除 | `d` | `singbox-board profile remove <名称>` |
+| 收入原有配置 | `A` | `singbox-board profile adopt` |
+
+- **切换**：先用当前内核对新配置执行 `sing-box check`，不通过就不切换（`--force` 可强制）。切换后重启 sing-box；若新配置启动失败（例如端口被占用这类 check 发现不了的问题），会自动切回之前的配置并重新启动。全新安装时 sing-box 因缺少配置而未启动，切换到第一个配置后会自动启动。
+- **原有配置**：`/etc/sing-box/config.json` 若是手写的普通文件，第一次切换前会先作为「原有配置」收入配置库，不会丢失；也可以随时用 `A` / `profile adopt` 收入，内容不变，sing-box 无需重启。
+- **订阅配置**：从提供 sing-box 完整配置的地址下载，默认 User-Agent 为 `sing-box/<内核版本>`（`profiles.user_agent` 可改），服务商据此返回 sing-box 格式；如果返回的是节点列表，会提示改用 sing-box 格式或用 Sub-Store 转换。会读取 `subscription-userinfo`（流量与到期时间）、`profile-update-interval`（建议的更新间隔）和 `content-disposition`（默认名称）。之后按间隔自动更新（默认 24 小时，0 表示仅手动），正在使用的订阅配置只有在新内容通过校验后才会替换并重载，否则保留原配置并在列表中显示错误。日志与错误信息只显示订阅地址的主机名，不会泄露其中的令牌。
+- **保存**：正在使用的配置保存前会先校验，通过后写入并重载 sing-box；未使用的配置直接保存，并附带校验结果供参考。
+
+### 可视化编辑
+
+在配置页按 `e` 打开树形编辑器，左侧为 JSON 树，右侧显示所选项的完整内容。编辑器打开时，`s`、`r` 等键只作用于编辑器，不会误操作 sing-box；`Tab` 和数字键仍可切换标签页，编辑状态会保留。
+
+| 按键 | 功能 |
+|---|---|
+| `↑↓` `←→` `Space` `*` `-` | 移动 / 折叠或展开 / 切换 / 全部展开 / 全部折叠 |
+| `Enter` / `e` | 编辑值：开关直接切换；`outbound`、`detour`、`final`、DNS `server`、规则中的 `rule_set` 等引用字段从现有标签中选择 |
+| `:` / `E` | 以 JSON 编辑所选项 / 在 `$EDITOR` 中编辑所选项 |
+| `a` / `A` | 在之后添加（所选为展开的容器时添加到其中）/ 在所选容器内添加：在 `inbounds`、`outbounds`、`endpoints`、`route.rules`、`route.rule_set`、`dns.servers`、`dns.rules`、`providers` 中提供常用模板（mixed、tun、selector、urltest、VLESS REALITY、Hysteria2、规则集、DoH 等，均已用 sing-box 校验），`providers` 中还会列出 Sub-Store 的订阅；向分组成员列表添加时列出现有出站 |
+| `r` `d` `c` `K` `J` | 重命名键 / 删除 / 复制一份（自动避开重复的 tag）/ 上移 / 下移 |
+| `u` `U` `/` `n` `N` `y` | 撤销 / 重做 / 搜索 / 下一个 / 上一个 / 复制为 JSON |
+| `s` / `q` | 校验并保存 / 关闭（有未保存修改时会确认） |
+
+树形编辑器保存时会按标准 JSON 重新排版（保留键的顺序），文件中的注释会被移除；需要保留注释时请用 `E` 编辑原文。
 
 ## Sub-Store 与 http-meta
 
@@ -240,7 +293,8 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 | `update.repo` / `update.variant` | 尚未有托管核心时的默认来源和变体；之后 `update` 沿用当前核心的设置 |
 | `core.env` | 传给 sing-box 的环境变量，例如 `ENABLE_DEPRECATED_IMPLICIT_DEFAULT_HTTP_CLIENT = "true"` |
 | `update.proxy` / `update.mirror` | 访问 GitHub 时使用的代理 / 下载镜像前缀（组件下载同样使用） |
-| `components.data_dir` / `components.run_as` | 组件安装目录（含 `state.json`）/ 组件运行用户 |
+| `profiles.user_agent` / `profiles.proxy` | 下载订阅配置时使用的 User-Agent（默认 `sing-box/<内核版本>`）/ 代理 |
+| `components.data_dir` / `components.run_as` | 组件安装目录（含 `state.json`、`profiles/`、`cores/`）/ 组件运行用户 |
 | `components.node` / `components.node_mirror` | 指定 Node.js 路径 / Node.js 下载源（国内可用 `https://npmmirror.com/mirrors/node`） |
 | `sub_store.host` / `sub_store.port` | Sub-Store 监听地址，默认 `127.0.0.1:3001` |
 | `sub_store.sync_cron` / `produce_cron` / `default_proxy` / `env` | 对应 `SUB_STORE_*` 环境变量 |
@@ -254,6 +308,8 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 - 每个连接都会通过 `SO_PEERCRED` 校验对端：仅允许 root、守护进程自身的 uid、`allowed_uids` 中的用户以及 `socket_group` 组成员。socket 文件权限另外受内核约束。
 - 更新时必须用 Release 自带的 `SHA256SUMS` 校验通过，并且新二进制 `version` 能正常执行，才会通过原子 `rename` 替换旧文件，旧版本保留为 `<binary>.bak`。
 - sing-box 子进程运行在独立的进程组，并设置了 `PR_SET_PDEATHSIG`，守护进程退出后不会留下无人托管的 sing-box。
+- **`singbox-board` 组等同于 root**：组成员可以导入和编辑配置，而 sing-box 以 root 运行，配置能决定它读写哪些文件（例如 `log.output`、`external_ui`、本地规则集路径）。请只把可信用户加入该组。导入本地文件时由客户端以调用者自身的权限读取，守护进程不会替客户端读取任意路径。
+- 配置库目录仅 root 可访问，配置文件权限为 `0600`；订阅地址中的令牌不会写入日志。
 
 ## 发布
 
@@ -288,4 +344,4 @@ singbox-board daemon -c ./dev.toml --allow-non-root
 SINGBOX_BOARD_SOCKET=/path/to/daemon.sock singbox-board
 ```
 
-控制协议为单连接单请求的 NDJSON，例如 `{"cmd":"status"}`、`{"cmd":"logs","tail":100,"follow":true}`，定义见 `src/protocol.rs`。
+控制协议为单连接单请求的 NDJSON，例如 `{"cmd":"status"}`、`{"cmd":"logs","tail":100,"follow":true}`、`{"cmd":"profile_list"}`，单行请求上限 16 MiB（配置内容随请求传输），定义见 `src/protocol.rs`。

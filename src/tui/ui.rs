@@ -7,7 +7,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, Wrap};
 
 use super::app::{App, Focus, Popup, StoreFocus, Tab};
-use super::core::{self as core_view, InputPurpose};
+use super::core as core_view;
+use super::popup::{Input, Menu};
+use super::profiles as profiles_view;
 use super::theme::{
     ACCENT, BLUE, CRUST, DIM, DOWN, GREEN, MARK, RED, SKY, SPINNER, SUBTEXT, SURFACE, TEXT, UP,
     YELLOW, chip, delay_color, dim, field, header_row, key, label, panel, pill, selected,
@@ -15,8 +17,7 @@ use super::theme::{
 };
 use crate::i18n::fl;
 use crate::protocol::{
-    Component, ComponentAction, ComponentStatus, CoreState, LogEntry, LogSource, variant_label,
-    version_label,
+    Component, ComponentStatus, CoreState, LogEntry, LogSource, variant_label, version_label,
 };
 use crate::util::{fmt_bytes, fmt_clock, fmt_duration, fmt_speed, join_list, now_unix, text_width};
 
@@ -38,6 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Logs => draw_logs(frame, body, app),
         Tab::SubStore => draw_sub_store(frame, body, app),
         Tab::Core => core_view::draw(frame, body, app),
+        Tab::Profiles => profiles_view::draw(frame, body, app),
     }
     draw_footer(frame, footer, app);
 
@@ -51,17 +53,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             copy,
         }) => draw_message(frame, title, body, *error, copy.is_some()),
         Some(Popup::Setup { sub_store }) => draw_setup(frame, *sub_store),
-        Some(Popup::Menu {
-            component,
-            actions,
-            selected,
-        }) => draw_menu(frame, *component, actions, *selected),
-        Some(Popup::Input {
-            title,
-            hint,
-            value,
-            purpose,
-        }) => draw_input(frame, title, hint, value, *purpose),
+        Some(Popup::Menu(menu)) => draw_menu(frame, menu),
+        Some(Popup::Input(input)) => draw_input(frame, input),
+        Some(Popup::EditorHelp) => draw_editor_help(frame),
         None => {}
     }
 }
@@ -95,6 +89,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                     variant_label(&core.variant),
                     Style::new().fg(BLUE),
                 ));
+            }
+            if let Some(profile) = &status.active_profile {
+                left.push(Span::raw("  "));
+                left.push(chip(profile.name.clone(), GREEN));
             }
             if let Some(started) = status.started_at {
                 left.push(dim("  "));
@@ -184,17 +182,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("w", fl!("key-web-ui")),
         ],
         Tab::Core => core_view::hints(app),
+        Tab::Profiles => profiles_view::hints(app),
         Tab::Overview => Vec::new(),
     };
-    let global = [
-        ("s", fl!("key-start")),
-        ("x", fl!("key-stop")),
-        ("r", fl!("key-restart")),
-        ("R", fl!("key-reload")),
-        ("u", fl!("key-update")),
-        ("m", fl!("key-mode")),
-        ("?", fl!("key-help")),
-    ];
+    // The editor takes these keys itself.
+    let global = if app.tab == Tab::Profiles && app.profiles.editor.is_some() {
+        Vec::new()
+    } else {
+        vec![
+            ("s", fl!("key-start")),
+            ("x", fl!("key-stop")),
+            ("r", fl!("key-restart")),
+            ("R", fl!("key-reload")),
+            ("u", fl!("key-update")),
+            ("m", fl!("key-mode")),
+            ("?", fl!("key-help")),
+        ]
+    };
     let mut spans = vec![Span::raw(" ")];
     for (i, (k, label)) in keys.iter().chain(global.iter()).enumerate() {
         if i == keys.len() && !keys.is_empty() {
@@ -312,6 +316,14 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
                     line.extend(core);
                     line
                 }),
+                field(
+                    &fl!("field-profile"),
+                    FIELD,
+                    match &status.active_profile {
+                        Some(profile) => Span::styled(profile.name.clone(), Style::new().fg(GREEN)),
+                        None => Span::styled(fl!("tui-profile-unmanaged"), Style::new().fg(YELLOW)),
+                    },
+                ),
                 field(
                     &fl!("field-binary"),
                     FIELD,
@@ -974,7 +986,7 @@ fn draw_help(frame: &mut Frame) {
     let blank = || ("", String::new());
     let left = help_lines(&[
         ("", fl!("help-global")),
-        ("1-6 / Tab", fl!("help-switch-tab")),
+        ("1-7 / Tab", fl!("help-switch-tab")),
         ("s / x / r", fl!("help-start-stop-restart")),
         ("R", fl!("help-reload")),
         ("c", fl!("help-check")),
@@ -1006,6 +1018,13 @@ fn draw_help(frame: &mut Frame) {
         ("p / n / f", fl!("help-core-list")),
         ("a", fl!("help-core-add-source")),
         ("I", fl!("help-core-import")),
+        blank(),
+        ("", fl!("help-profiles")),
+        ("Enter", fl!("help-profiles-menu")),
+        ("e / E", fl!("help-profiles-edit")),
+        ("n / i", fl!("help-profiles-new")),
+        ("f / F", fl!("help-profiles-update")),
+        ("d / A", fl!("help-profiles-delete")),
     ]);
     let height = left.len().max(right.len()) as u16 + 2;
     let area = popup_area(frame, 104, height);
@@ -1079,46 +1098,54 @@ fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool, copyabl
     );
 }
 
-fn draw_input(frame: &mut Frame, title: &str, hint: &str, value: &str, purpose: InputPurpose) {
-    let placeholder = match purpose {
-        InputPurpose::AddSource => "owner/repo",
-        InputPurpose::ImportCore => "/path/to/sing-box  [sha256]",
-    };
-    let input = if value.is_empty() {
-        Line::from(vec![
-            Span::styled("❯ ", Style::new().fg(ACCENT)),
-            Span::styled("█", Style::new().fg(ACCENT)),
-            dim(format!(" {placeholder}")),
-        ])
+fn draw_input(frame: &mut Frame, input: &Input) {
+    let (before, after) = input.split();
+    let mut field = vec![Span::styled("❯ ", Style::new().fg(ACCENT))];
+    if input.value.is_empty() {
+        field.push(Span::styled("█", Style::new().fg(ACCENT)));
+        field.push(dim(format!(" {}", input.placeholder)));
     } else {
-        Line::from(vec![
-            Span::styled("❯ ", Style::new().fg(ACCENT)),
-            Span::styled(value.to_owned(), Style::new().fg(TEXT).bg(SURFACE)),
-            Span::styled("█", Style::new().fg(ACCENT)),
-        ])
-    };
-    let lines = vec![
-        Line::from(dim(hint.to_owned())),
-        Line::raw(""),
-        input,
-        Line::raw(""),
-        Line::from(vec![
-            key("⏎"),
-            dim(format!(" {}    ", fl!("key-submit"))),
-            key("Esc"),
-            dim(format!(" {}    ", fl!("key-cancel"))),
-            key("^U"),
-            dim(format!(" {}", fl!("key-clear"))),
-        ]),
-    ];
-    let width: u16 = 80;
+        let mut after = after.chars();
+        let under = after.next();
+        field.push(Span::styled(
+            before.to_owned(),
+            Style::new().fg(TEXT).bg(SURFACE),
+        ));
+        field.push(match under {
+            Some(c) => Span::styled(c.to_string(), Style::new().fg(CRUST).bg(ACCENT)),
+            None => Span::styled("█", Style::new().fg(ACCENT)),
+        });
+        field.push(Span::styled(
+            after.as_str().to_owned(),
+            Style::new().fg(TEXT).bg(SURFACE),
+        ));
+    }
+    let mut lines = Vec::new();
+    if !input.hint.is_empty() {
+        lines.push(Line::from(dim(input.hint.clone())));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(field));
+    if let Some(err) = &input.error {
+        lines.push(Line::from(Span::styled(err.clone(), Style::new().fg(RED))));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        key("⏎"),
+        dim(format!(" {}    ", fl!("key-submit"))),
+        key("Esc"),
+        dim(format!(" {}    ", fl!("key-cancel"))),
+        key("^U"),
+        dim(format!(" {}", fl!("key-clear"))),
+    ]));
+    let width: u16 = 84;
     let height = wrapped_rows(&lines, width) + 2;
     let area = popup_area(frame, width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel(title, true)),
+            .block(panel(&input.title, true)),
         area,
     );
 }
@@ -1177,37 +1204,107 @@ fn draw_setup(frame: &mut Frame, sub_store: Option<bool>) {
     );
 }
 
-fn draw_menu(
-    frame: &mut Frame,
-    component: Component,
-    actions: &[ComponentAction],
-    selected_index: usize,
-) {
-    let items: Vec<ListItem> = actions
+fn draw_menu(frame: &mut Frame, menu: &Menu) {
+    let label_width = menu
+        .items
         .iter()
-        .map(|action| {
-            let label = match action {
-                ComponentAction::Start => fl!("menu-start"),
-                ComponentAction::Stop => fl!("menu-stop"),
-                ComponentAction::Restart => fl!("menu-restart"),
-                ComponentAction::Enable => fl!("menu-enable"),
-                ComponentAction::Disable => fl!("menu-disable"),
-                ComponentAction::Update => fl!("menu-update"),
-            };
-            ListItem::new(format!(" {label}"))
+        .map(|item| text_width(&item.label))
+        .max()
+        .unwrap_or(0);
+    let detail_width = menu
+        .items
+        .iter()
+        .map(|item| text_width(&item.detail))
+        .max()
+        .unwrap_or(0);
+    let screen = frame.area();
+    let width = ((label_width + detail_width + 10) as u16)
+        .max(text_width(&menu.title) as u16 + 8)
+        .clamp(40, screen.width.saturating_sub(4).max(40));
+    let body: Vec<Line> = menu
+        .body
+        .as_deref()
+        .map(|text| {
+            text.lines()
+                .take(12)
+                .map(|line| Line::from(Span::styled(line.to_owned(), Style::new().fg(SUBTEXT))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let body_rows = if body.is_empty() {
+        0
+    } else {
+        wrapped_rows(&body, width) + 1
+    };
+    let height = (menu.items.len() as u16 + body_rows + 2).min(screen.height.saturating_sub(2));
+    let area = popup_area(frame, width, height);
+    frame.render_widget(Clear, area);
+    let block = panel(&menu.title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [body_area, list_area] =
+        Layout::vertical([Constraint::Length(body_rows), Constraint::Min(1)]).areas(inner);
+    if !body.is_empty() {
+        frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), body_area);
+    }
+    let items: Vec<ListItem> = menu
+        .items
+        .iter()
+        .map(|item| {
+            let pad = label_width.saturating_sub(text_width(&item.label));
+            ListItem::new(Line::from(vec![
+                Span::raw(format!(" {}{}  ", item.label, " ".repeat(pad))),
+                dim(item.detail.clone()),
+            ]))
         })
         .collect();
-    let area = popup_area(frame, 48, actions.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let mut state = ratatui::widgets::ListState::default().with_selected(Some(selected_index));
+    let mut state = ratatui::widgets::ListState::default().with_selected(Some(menu.selected));
     frame.render_stateful_widget(
         List::new(items)
-            .block(panel(component.title(), true))
             .highlight_style(selected(true))
             .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT))),
-        area,
+        list_area,
         &mut state,
     );
+}
+
+fn draw_editor_help(frame: &mut Frame) {
+    let blank = || ("", String::new());
+    let left = help_lines(&[
+        ("", fl!("help-editor-move")),
+        ("↑↓ PgUp/PgDn", fl!("help-editor-cursor")),
+        ("← →", fl!("help-editor-fold")),
+        ("Space * -", fl!("help-editor-toggle")),
+        ("/ n N", fl!("help-editor-search")),
+        blank(),
+        ("", fl!("help-editor-file")),
+        ("s", fl!("help-editor-save")),
+        ("u / U", fl!("help-editor-undo")),
+        ("q / Esc", fl!("help-editor-close")),
+    ]);
+    let right = help_lines(&[
+        ("", fl!("help-editor-change")),
+        ("Enter / e", fl!("help-editor-edit")),
+        (":", fl!("help-editor-json")),
+        ("E", fl!("help-editor-external")),
+        ("a / A", fl!("help-editor-add")),
+        ("r", fl!("help-editor-rename")),
+        ("d", fl!("help-editor-delete")),
+        ("c", fl!("help-editor-duplicate")),
+        ("K / J", fl!("help-editor-reorder")),
+        ("y", fl!("help-editor-copy")),
+    ]);
+    let height = left.len().max(right.len()) as u16 + 2;
+    let area = popup_area(frame, 104, height);
+    frame.render_widget(Clear, area);
+    let block = panel(&fl!("help-editor-title"), true)
+        .title_top(Line::from(dim(format!(" {} ", fl!("help-close-hint")))).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [l, r] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
+    frame.render_widget(Paragraph::new(left), l);
+    frame.render_widget(Paragraph::new(right), r);
 }
 
 fn first_line(text: &str) -> String {

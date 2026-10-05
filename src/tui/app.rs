@@ -11,7 +11,11 @@ use ratatui::widgets::{ListState, TableState};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
-use super::core::{CoreView, InputPurpose};
+use super::core::CoreView;
+use super::popup::{
+    ExternalEdit, Input, InputOutcome, InputPurpose, Menu, MenuAction, MenuItem, MenuOutcome,
+};
+use super::profiles::{ContentPurpose, ProfilesView, SavePurpose};
 use super::tasks::{self, EventTx};
 use crate::clash::{
     ClashClient, Configs, Connection, Connections, DEFAULT_TEST_URL, Proxies, Proxy,
@@ -20,7 +24,7 @@ use crate::client::DaemonClient;
 use crate::i18n::fl;
 use crate::protocol::{
     ClashApi, Component, ComponentAction, ComponentStatus, CoreReleasePage, CoreSource, CoreState,
-    LogEntry, Request, Status, StoredCore, UpdateInfo,
+    LogEntry, Profile, ProfileList, Request, Status, StoredCore, UpdateInfo,
 };
 use crate::substore::{Entry, Overview, provider_snippet};
 use crate::util::{error_chain, text_width};
@@ -48,6 +52,16 @@ pub enum AppEvent {
         result: Result<CoreReleasePage, String>,
     },
     CoreInstalled(Result<Vec<StoredCore>, String>),
+    Profiles(Result<ProfileList, String>),
+    ProfileContent {
+        purpose: ContentPurpose,
+        result: Result<(Profile, String), String>,
+    },
+    ProfileSaved {
+        id: u64,
+        purpose: SavePurpose,
+        result: Result<(Profile, String), String>,
+    },
     Delay {
         name: String,
         result: Result<u32, String>,
@@ -70,16 +84,18 @@ pub enum Tab {
     Logs,
     SubStore,
     Core,
+    Profiles,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Proxies,
         Tab::Connections,
         Tab::Logs,
         Tab::SubStore,
         Tab::Core,
+        Tab::Profiles,
     ];
 
     pub fn title(self) -> String {
@@ -90,6 +106,7 @@ impl Tab {
             Tab::Logs => fl!("tab-logs"),
             Tab::SubStore => "Sub-Store".to_owned(),
             Tab::Core => fl!("tab-core"),
+            Tab::Profiles => fl!("tab-profiles"),
         }
     }
 
@@ -132,6 +149,15 @@ pub enum PendingAction {
     CoreSourceRemove {
         id: String,
     },
+    ProfileUse {
+        id: String,
+    },
+    ProfileDelete {
+        id: String,
+    },
+    ProfileAdopt,
+    /// Close the editor without saving.
+    DiscardEditor,
 }
 
 pub enum Popup {
@@ -151,19 +177,11 @@ pub enum Popup {
     Setup {
         sub_store: Option<bool>,
     },
-    /// Actions for one component.
-    Menu {
-        component: Component,
-        actions: Vec<ComponentAction>,
-        selected: usize,
-    },
+    Menu(Menu),
     /// Single-line text input.
-    Input {
-        title: String,
-        hint: String,
-        value: String,
-        purpose: InputPurpose,
-    },
+    Input(Input),
+    /// Keys of the profile editor.
+    EditorHelp,
 }
 
 pub struct Toast {
@@ -251,6 +269,9 @@ pub struct App {
     clipboard: Option<String>,
 
     pub core: CoreView,
+    pub profiles: ProfilesView,
+    /// Text waiting to be opened in `$EDITOR` by the event loop.
+    pub(super) external: Option<ExternalEdit>,
 
     pub toast: Option<Toast>,
     pub busy: Vec<(u64, String)>,
@@ -308,6 +329,8 @@ impl App {
             wizard_shown: false,
             clipboard: None,
             core: CoreView::default(),
+            profiles: ProfilesView::default(),
+            external: None,
             toast: None,
             busy: Vec::new(),
             next_action: 0,
@@ -324,6 +347,7 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.profiles_tick();
         if self
             .toast
             .as_ref()
@@ -408,6 +432,15 @@ impl App {
                 result,
             } => self.core_releases_loaded(source, page, result),
             AppEvent::CoreInstalled(result) => self.core_installed_loaded(result),
+            AppEvent::Profiles(result) => self.profiles_loaded(result),
+            AppEvent::ProfileContent { purpose, result } => {
+                self.profile_content_loaded(purpose, result)
+            }
+            AppEvent::ProfileSaved {
+                id,
+                purpose,
+                result,
+            } => self.profile_saved(id, purpose, result),
             AppEvent::Delay { name, result } => {
                 self.testing.remove(&name);
                 self.delays.insert(name, result);
@@ -417,6 +450,7 @@ impl App {
                 self.refresh.notify_one();
                 self.store_refresh.notify_one();
                 self.core_refresh_after_action();
+                self.profiles_refresh_after_action();
                 match result {
                     Ok(message) => self.notify(message, false),
                     Err(err) => self.notify(err, true),
@@ -451,7 +485,20 @@ impl App {
     }
 
     /// Short messages go to the footer, long or multi-line ones to a popup.
+    /// A short success of a few lines (e.g. "saved" plus "check passed")
+    /// still fits the footer on one line.
     pub(super) fn notify(&mut self, text: String, error: bool) {
+        let joined = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("  ");
+        let text = if !error && text_width(&joined) <= 90 {
+            joined
+        } else {
+            text
+        };
         if text.contains('\n') || text_width(&text) > 90 {
             let title = if error {
                 fl!("tui-title-error")
@@ -581,6 +628,14 @@ impl App {
             self.on_popup_key(popup, key);
             return;
         }
+        // The editor takes every key but tab switching, so letters there
+        // never start or stop sing-box.
+        let switches_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            || matches!(key.code, KeyCode::Char(c) if tab_number(c).is_some());
+        if self.tab == Tab::Profiles && self.profiles.editor.is_some() && !switches_tab {
+            self.editor_on_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
@@ -588,7 +643,9 @@ impl App {
             KeyCode::BackTab => {
                 self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
             }
-            KeyCode::Char(c @ '1'..='6') => self.tab = Tab::ALL[c as usize - '1' as usize],
+            KeyCode::Char(c) if tab_number(c).is_some() => {
+                self.tab = Tab::ALL[tab_number(c).unwrap_or(0)]
+            }
             KeyCode::Char('s') => self.daemon_action(&fl!("busy-starting"), Request::Start),
             KeyCode::Char('x') => self.confirm(fl!("tui-confirm-stop"), PendingAction::Stop),
             KeyCode::Char('r') => self.confirm(fl!("tui-confirm-restart"), PendingAction::Restart),
@@ -603,11 +660,25 @@ impl App {
                 Tab::Logs => self.on_logs_key(key),
                 Tab::SubStore => self.on_store_key(key),
                 Tab::Core => self.core_on_key(key),
+                Tab::Profiles => self.profiles_on_key(key),
             },
         }
-        if self.tab == Tab::Core {
-            self.core_tab_opened();
+        match self.tab {
+            Tab::Core => self.core_tab_opened(),
+            Tab::Profiles => self.profiles_tab_opened(),
+            _ => {}
         }
+    }
+
+    /// Pasted text goes into an open text field.
+    pub fn on_paste(&mut self, text: &str) {
+        if let Some(Popup::Input(input)) = &mut self.popup {
+            input.paste(text);
+        }
+    }
+
+    pub fn take_external_edit(&mut self) -> Option<ExternalEdit> {
+        self.external.take()
     }
 
     fn on_popup_key(&mut self, popup: Popup, key: KeyEvent) {
@@ -623,31 +694,23 @@ impl App {
                     self.popup = Some(popup);
                 }
             }
-            Popup::Input {
-                title,
-                hint,
-                mut value,
-                purpose,
-            } => match key.code {
-                KeyCode::Enter => self.core_submit_input(purpose, value),
-                KeyCode::Esc => {}
-                code => {
-                    match code {
-                        KeyCode::Backspace => {
-                            value.pop();
+            Popup::EditorHelp => {}
+            Popup::Input(mut input) => match input.on_key(key) {
+                InputOutcome::Editing => self.popup = Some(Popup::Input(input)),
+                InputOutcome::Cancel => {}
+                InputOutcome::Submit => {
+                    let value = input.value.clone();
+                    let result = match &input.purpose {
+                        InputPurpose::AddSource | InputPurpose::ImportCore => {
+                            self.core_submit_input(input.purpose.clone(), value);
+                            Ok(())
                         }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            value.clear()
-                        }
-                        KeyCode::Char(c) => value.push(c),
-                        _ => {}
+                        purpose => self.profiles_submit_input(purpose.clone(), value),
+                    };
+                    if let Err(err) = result {
+                        input.error = Some(err);
+                        self.popup = Some(Popup::Input(input));
                     }
-                    self.popup = Some(Popup::Input {
-                        title,
-                        hint,
-                        value,
-                        purpose,
-                    });
                 }
             },
             Popup::Setup { sub_store } => {
@@ -676,38 +739,13 @@ impl App {
                     ),
                 }
             }
-            Popup::Menu {
-                component,
-                actions,
-                selected,
-            } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.popup = Some(Popup::Menu {
-                        component,
-                        selected: selected.saturating_sub(1),
-                        actions,
-                    })
+            Popup::Menu(mut menu) => match menu.on_key(key) {
+                MenuOutcome::Open => self.popup = Some(Popup::Menu(menu)),
+                MenuOutcome::Cancel => {}
+                MenuOutcome::Chosen(MenuAction::Component(component, action)) => {
+                    self.component_action(component, action)
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.popup = Some(Popup::Menu {
-                        component,
-                        selected: (selected + 1).min(actions.len().saturating_sub(1)),
-                        actions,
-                    })
-                }
-                KeyCode::Enter => {
-                    if let Some(action) = actions.get(selected) {
-                        self.component_action(component, *action);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('q') => {}
-                _ => {
-                    self.popup = Some(Popup::Menu {
-                        component,
-                        actions,
-                        selected,
-                    })
-                }
+                MenuOutcome::Chosen(action) => self.profiles_menu_action(action),
             },
             Popup::Confirm { action, .. }
                 if matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter) =>
@@ -864,7 +902,7 @@ impl App {
             self.notify(fl!("tui-status-unavailable"), true);
             return;
         };
-        let actions = if !status.enabled {
+        let actions: Vec<ComponentAction> = if !status.enabled {
             vec![ComponentAction::Enable]
         } else if status.pid.is_some() {
             vec![
@@ -880,11 +918,21 @@ impl App {
                 ComponentAction::Disable,
             ]
         };
-        self.popup = Some(Popup::Menu {
-            component,
-            actions,
-            selected: 0,
-        });
+        let items = actions
+            .into_iter()
+            .map(|action| {
+                let label = match action {
+                    ComponentAction::Start => fl!("menu-start"),
+                    ComponentAction::Stop => fl!("menu-stop"),
+                    ComponentAction::Restart => fl!("menu-restart"),
+                    ComponentAction::Enable => fl!("menu-enable"),
+                    ComponentAction::Disable => fl!("menu-disable"),
+                    ComponentAction::Update => fl!("menu-update"),
+                };
+                MenuItem::new(label, "", MenuAction::Component(component, action))
+            })
+            .collect();
+        self.popup = Some(Popup::Menu(Menu::new(component.title().to_owned(), items)));
     }
 
     fn component_action(&mut self, component: Component, action: ComponentAction) {
@@ -921,7 +969,7 @@ impl App {
     }
 
     /// Queues `text` for the terminal clipboard (OSC 52) and confirms with `message`.
-    fn copy(&mut self, text: String, message: String) {
+    pub(super) fn copy(&mut self, text: String, message: String) {
         self.clipboard = Some(text);
         self.notify(message, false);
     }
@@ -987,6 +1035,10 @@ impl App {
             | PendingAction::CoreActivate { .. }
             | PendingAction::CoreRemove { .. }
             | PendingAction::CoreSourceRemove { .. }) => self.core_run_pending(core),
+            profile @ (PendingAction::ProfileUse { .. }
+            | PendingAction::ProfileDelete { .. }
+            | PendingAction::ProfileAdopt
+            | PendingAction::DiscardEditor) => self.profiles_run_pending(profile),
             PendingAction::CloseAllConnections => {
                 self.clash_action(&fl!("busy-closing-connections"), |clash| async move {
                     clash.close_all_connections().await?;
@@ -996,7 +1048,7 @@ impl App {
         }
     }
 
-    fn begin(&mut self, label: &str) -> u64 {
+    pub(super) fn begin(&mut self, label: &str) -> u64 {
         self.next_action += 1;
         self.busy.push((self.next_action, label.to_owned()));
         self.next_action
@@ -1134,6 +1186,12 @@ impl App {
             Ok(fl!("tui-connection-closed", target = target))
         });
     }
+}
+
+/// Index of the tab a digit key selects.
+fn tab_number(c: char) -> Option<usize> {
+    let index = c.to_digit(10)?.checked_sub(1)? as usize;
+    (index < Tab::ALL.len()).then_some(index)
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {

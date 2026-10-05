@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 
 use crate::client::DaemonClient;
 use crate::i18n::fl;
+use crate::profile::{self, interval_label, local_time, usage_label};
 use crate::protocol::{
     Checksum, Component, ComponentAction, ComponentStatus, CoreState, LogSource, Request, Status,
     StoredCore, core_store_id, variant_label, version_label,
@@ -77,6 +78,13 @@ fn print_status(status: &Status) {
             .unwrap_or_else(|| fl!("not-installed")),
     ));
     rows.push((fl!("ctl-label-binary"), status.binary.clone()));
+    rows.push((
+        fl!("ctl-label-profile"),
+        match &status.active_profile {
+            Some(profile) => format!("{} ({})", profile.name, profile.id),
+            None => fl!("ctl-profile-unmanaged-short"),
+        },
+    ));
     rows.push((fl!("ctl-label-args"), status.args.join(" ")));
     rows.push((
         "Clash API".to_owned(),
@@ -591,4 +599,212 @@ pub async fn core_use(client: &DaemonClient, query: &str, force: bool) -> Result
 pub async fn core_remove(client: &DaemonClient, query: &str) -> Result<()> {
     let id = resolve_core(client, query).await?;
     command(client, Request::CoreRemove { id }).await
+}
+
+// ----- configuration profiles -------------------------------------------------
+
+pub async fn profile_list(client: &DaemonClient) -> Result<()> {
+    let list = client.profiles().await?;
+    if list.unmanaged {
+        println!(
+            "{}\n",
+            paint(
+                &fl!("ctl-profile-unmanaged", path = list.slot.clone()),
+                "33"
+            )
+        );
+    }
+    if list.profiles.is_empty() {
+        println!("{}", fl!("ctl-profiles-empty"));
+    }
+    for profile in &list.profiles {
+        let marker = if profile.active {
+            paint("●", "32")
+        } else {
+            " ".to_owned()
+        };
+        let kind = if profile.is_remote() {
+            fl!("profile-kind-remote")
+        } else {
+            fl!("profile-kind-local")
+        };
+        println!(
+            "{marker} {} {} {}  {}",
+            paint(&pad(&profile.name, 28), "1"),
+            pad(&kind, 6),
+            local_time(profile.updated_at, "%Y-%m-%d %H:%M"),
+            fmt_bytes(profile.size)
+        );
+        let mut details = vec![profile.id.clone()];
+        if let Some(url) = &profile.url {
+            details.push(url.clone());
+            details.push(interval_label(profile.interval));
+        }
+        if let Some(usage) = &profile.usage {
+            details.push(usage_label(usage));
+        }
+        println!("    {}", paint(&details.join("  "), "2"));
+        if let Some(error) = &profile.last_error {
+            println!(
+                "    {}",
+                paint(&fl!("ctl-profile-last-error", error = error.clone()), "33")
+            );
+        }
+    }
+    println!(
+        "\n{}\n{}",
+        paint(&fl!("ctl-profile-hint-add"), "2"),
+        paint(&fl!("ctl-profile-hint-use"), "2")
+    );
+    Ok(())
+}
+
+pub async fn profile_add(
+    client: &DaemonClient,
+    source: &str,
+    name: Option<String>,
+    interval: Option<u64>,
+    activate: bool,
+) -> Result<()> {
+    let request = if source.starts_with("http://") || source.starts_with("https://") {
+        eprintln!("{}", fl!("ctl-profile-downloading"));
+        Request::ProfileAdd {
+            name,
+            content: None,
+            url: Some(source.to_owned()),
+            interval,
+            activate,
+        }
+    } else {
+        if interval.is_some() {
+            bail!(fl!("ctl-profile-interval-local"));
+        }
+        // Read with the caller's permissions, not the daemon's.
+        let content = if source == "-" {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+            text
+        } else {
+            std::fs::read_to_string(source)
+                .map_err(|err| anyhow::anyhow!(fl!("err-read", path = source)).context(err))?
+        };
+        let name = name.or_else(|| {
+            std::path::Path::new(source)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|_| source != "-")
+                .map(str::to_owned)
+        });
+        Request::ProfileAdd {
+            name,
+            content: Some(content),
+            url: None,
+            interval: None,
+            activate,
+        }
+    };
+    let (_, message) = client.profile_saved(request).await?;
+    println!("{message}");
+    Ok(())
+}
+
+pub async fn profile_new(
+    client: &DaemonClient,
+    name: String,
+    edit: bool,
+    activate: bool,
+) -> Result<()> {
+    let request = Request::ProfileAdd {
+        name: Some(name),
+        content: None,
+        url: None,
+        interval: None,
+        activate: activate && !edit,
+    };
+    let (profile, message) = client.profile_saved(request).await?;
+    println!("{message}");
+    if edit {
+        profile_edit(client, &profile.id, false).await?;
+        if activate {
+            let request = Request::ProfileActivate {
+                id: profile.id,
+                force: false,
+            };
+            command(client, request).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn profile_show(client: &DaemonClient, query: &str) -> Result<()> {
+    let (_, content) = client.profile(query).await?;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(content.as_bytes())?;
+    if !content.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Opens a profile in the user's editor until it is saved or given up.
+pub async fn profile_edit(client: &DaemonClient, query: &str, force: bool) -> Result<()> {
+    let (profile, original) = client.profile(query).await?;
+    let mut text = original.clone();
+    loop {
+        text = crate::util::edit_text(&text, &profile.name)?;
+        if text == original {
+            println!("{}", fl!("ctl-profile-no-changes"));
+            return Ok(());
+        }
+        let problem = match profile::parse(&text) {
+            Err(err) => Some(error_chain(&err)),
+            Ok(_) => {
+                let request = Request::ProfileSave {
+                    id: profile.id.clone(),
+                    content: text.clone(),
+                    force,
+                };
+                match client.profile_saved(request).await {
+                    Ok((_, message)) => {
+                        println!("{message}");
+                        return Ok(());
+                    }
+                    Err(err) => Some(error_chain(&err)),
+                }
+            }
+        };
+        if let Some(problem) = problem {
+            if !std::io::stdin().is_terminal() {
+                bail!(problem);
+            }
+            eprintln!("{}", fl!("error-line", message = problem));
+            if !ask(&fl!("ctl-profile-edit-again"))? {
+                bail!(fl!("ctl-profile-discarded"));
+            }
+        }
+    }
+}
+
+pub async fn profile_set(
+    client: &DaemonClient,
+    id: String,
+    name: Option<String>,
+    url: Option<String>,
+    interval: Option<u64>,
+    local: bool,
+) -> Result<()> {
+    if name.is_none() && url.is_none() && interval.is_none() && !local {
+        bail!(fl!("ctl-profile-nothing-to-set"));
+    }
+    let url = if local { Some(String::new()) } else { url };
+    command(
+        client,
+        Request::ProfileSet {
+            id,
+            name,
+            url,
+            interval,
+        },
+    )
+    .await
 }

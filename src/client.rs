@@ -10,8 +10,8 @@ use tokio::net::UnixStream;
 
 use crate::i18n::{self, fl};
 use crate::protocol::{
-    CoreReleasePage, CoreSource, Envelope, LogEntry, Request, Response, Status, StoredCore,
-    UpdateInfo,
+    CoreReleasePage, CoreSource, Envelope, LogEntry, Profile, ProfileList, Request, Response,
+    Status, StoredCore, UpdateInfo,
 };
 
 #[derive(Debug, Clone)]
@@ -138,6 +138,30 @@ impl DaemonClient {
         }
     }
 
+    pub async fn profiles(&self) -> Result<ProfileList> {
+        match self.call(Request::ProfileList).await? {
+            Response::Profiles(list) => Ok(list),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// A profile and its content.
+    pub async fn profile(&self, id: &str) -> Result<(Profile, String)> {
+        let request = Request::ProfileGet { id: id.to_owned() };
+        match self.call(request).await? {
+            Response::ProfileContent { profile, content } => Ok((*profile, content)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// `profile_add` or `profile_save`: the stored profile and a message.
+    pub async fn profile_saved(&self, request: Request) -> Result<(Profile, String)> {
+        match self.call(request).await? {
+            Response::ProfileSaved { profile, message } => Ok((*profile, message)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     pub async fn logs(&self, tail: usize, follow: bool) -> Result<LogStream> {
         Ok(LogStream {
             reader: self.open(&Request::Logs { tail, follow }).await?,
@@ -195,7 +219,9 @@ fn timeout_for(request: &Request) -> Duration {
         | Request::CoreInstall { .. }
         | Request::CoreImport { .. } => 30 * 60,
         Request::CoreReleases { .. } | Request::CoreSourceAdd { .. } => 90,
-        Request::CoreActivate { .. } => 180,
+        Request::CoreActivate { .. } | Request::ProfileActivate { .. } => 180,
+        Request::ProfileAdd { .. } | Request::ProfileSave { .. } => 180,
+        Request::ProfileUpdate { .. } => 15 * 60,
         Request::Start | Request::Restart | Request::Stop => 120,
         _ => 60,
     })
