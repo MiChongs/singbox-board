@@ -646,9 +646,8 @@ const SUB_STORE_DEFAULT_ORIGINS: [&str; 3] = [
 fn sub_store_origins(host: &str, port: u16) -> String {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let wildcard = matches!(bare, "" | "0.0.0.0" | "::");
-    let loopback = wildcard
-        || bare == "localhost"
-        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let loopback =
+        wildcard || bare == "localhost" || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
     let mut hosts = Vec::new();
     if loopback {
         hosts.extend(["127.0.0.1", "localhost", "[::1]"].map(str::to_owned));
