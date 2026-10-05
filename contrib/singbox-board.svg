@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- The cube of the tray icon (src/tray/icon.rs) in the application colour. -->
+  <path fill="#6cbdf7" d="M32 1.28 57.164 15.809 32 30.337 6.836 15.809z"/>
+  <path fill="#1d99f3" d="M5.396 18.303 30.56 32.831V61.889L5.396 47.36z"/>
+  <path fill="#1673b6" d="M58.604 18.303 33.44 32.831V61.889L58.604 47.36z"/>
+</svg>

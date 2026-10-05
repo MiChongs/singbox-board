@@ -125,6 +125,7 @@ cli-socket = Control socket of the daemon. Default: the socket set in daemon.tom
 cli-lang = Interface language: en or zh-CN. Default: the system locale. The SINGBOX_BOARD_LANG environment variable has the same effect.
 cli-lang-invalid = unsupported language { $value }; supported languages: en, zh-CN
 cli-tui = Open the terminal dashboard (default)
+cli-tray = Show sing-box in the system tray (KDE Plasma, GNOME with the AppIndicator extension, Waybar and other StatusNotifierItem hosts, on Wayland and X11)
 cli-daemon = Run the root daemon that supervises sing-box
 cli-daemon-config = Daemon configuration file
 cli-daemon-allow-non-root = Allow running without root privileges (for development only)
@@ -1029,3 +1030,50 @@ tpl-switch = switch
 tpl-object = object
 tpl-list = list
 tpl-null = empty
+
+## System tray
+
+tray-no-session-bus = cannot connect to the D-Bus session bus ({ $error }); the tray needs a graphical desktop session
+tray-already-running = the tray is already running in this desktop session
+tray-no-executable = cannot find the path of the singbox-board executable
+tray-waiting-host = No system tray is available yet ({ $reason }). The icon appears as soon as one starts; on GNOME, enable the AppIndicator extension.
+tray-start-failed = cannot show the tray icon: { $error }
+tray-notify-failed = cannot show a notification: { $error }
+tray-daemon-down = Cannot reach the daemon
+tray-core-state = { $state ->
+    [running] sing-box is running
+    [starting] sing-box is starting
+    [stopping] sing-box is stopping
+    [backoff] sing-box will restart shortly
+    [failed] sing-box has failed
+   *[stopped] sing-box is stopped
+    }
+tray-core-exited = sing-box exited unexpectedly
+tray-detail = { $label }: { $value }
+tray-label-core = Core
+tray-label-mode = Mode
+tray-start = Start sing-box
+tray-stop = Stop sing-box
+tray-restart = Restart sing-box
+tray-no-profiles = No profiles yet
+tray-update-profiles = Update the remote profiles
+tray-open-dashboard = Open the dashboard
+tray-open-sub-store = Open Sub-Store
+tray-autostart = Start on login
+tray-quit = Quit
+tray-failed = { $op ->
+    [start] Could not start sing-box
+    [stop] Could not stop sing-box
+    [restart] Could not restart sing-box
+    [profile] Could not switch the profile
+    [update] Could not update the remote profiles
+    [mode] Could not switch the mode
+    [dashboard] Could not open the dashboard
+    [browser] Could not open the web page
+    [autostart] Could not change the login item
+   *[other] The action failed
+    }
+tray-no-terminal = no terminal emulator found; install one such as Konsole or GNOME Console, or set the TERMINAL environment variable
+tray-open-failed = xdg-open could not open { $url } ({ $status })
+tray-no-home = neither XDG_CONFIG_HOME nor HOME is set
+tray-desktop-comment = sing-box status and controls in the system tray

@@ -104,6 +104,8 @@ jobs:
           sh install.sh --local "$RUNNER_TEMP/singbox-board-linux-amd64" --root "$RUNNER_TEMP/stage"
           test -x "$RUNNER_TEMP/stage/usr/local/bin/singbox-board"
           test -f "$RUNNER_TEMP/stage/etc/singbox-board/daemon.toml"
+          grep -qx "Exec=/usr/local/bin/singbox-board tray" "$RUNNER_TEMP/stage/usr/local/share/applications/singbox-board.desktop"
+          test -f "$RUNNER_TEMP/stage/usr/local/share/icons/hicolor/scalable/apps/singbox-board.svg"
           sudo dpkg -i dist/singbox-board_*_amd64.deb
           singbox-board --version
           systemctl is-active singbox-board

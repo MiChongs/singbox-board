@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=singbox-board
+GenericName=sing-box Tray
+GenericName[zh_CN]=sing-box 托盘
+Comment=sing-box status and controls in the system tray
+Comment[zh_CN]=在系统托盘中查看并控制 sing-box
+Exec=/usr/bin/singbox-board tray
+Icon=singbox-board
+Terminal=false
+StartupNotify=false
+Categories=Network;
+Keywords=sing-box;proxy;tray;

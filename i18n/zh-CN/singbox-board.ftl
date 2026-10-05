@@ -129,6 +129,7 @@ cli-socket = 守护进程的控制套接字。默认使用 daemon.toml 中的设
 cli-lang = 界面语言，可选 en 或 zh-CN，默认跟随系统区域设置。也可通过环境变量 SINGBOX_BOARD_LANG 指定。
 cli-lang-invalid = 不支持语言 { $value }，可选语言为 en、zh-CN
 cli-tui = 打开终端管理面板（默认）
+cli-tray = 在系统托盘中显示 sing-box（支持 KDE Plasma、启用 AppIndicator 扩展的 GNOME、Waybar 等 StatusNotifierItem 托盘，Wayland 与 X11 均可）
 cli-daemon = 运行托管 sing-box 的 root 守护进程
 cli-daemon-config = 守护进程配置文件
 cli-daemon-allow-non-root = 允许以非 root 身份运行（仅用于开发）
@@ -1016,3 +1017,50 @@ tpl-switch = 开关
 tpl-object = 对象
 tpl-list = 列表
 tpl-null = 空值
+
+## 系统托盘
+
+tray-no-session-bus = 无法连接 D-Bus 会话总线（{ $error }），托盘需要在图形桌面会话中运行
+tray-already-running = 托盘已在当前桌面会话中运行
+tray-no-executable = 无法确定 singbox-board 程序的路径
+tray-waiting-host = 系统托盘尚未就绪（{ $reason }），托盘启动后图标会自动出现。GNOME 用户请启用 AppIndicator 扩展。
+tray-start-failed = 无法显示托盘图标：{ $error }
+tray-notify-failed = 无法显示通知：{ $error }
+tray-daemon-down = 无法连接守护进程
+tray-core-state = { $state ->
+    [running] sing-box 运行中
+    [starting] sing-box 正在启动
+    [stopping] sing-box 正在停止
+    [backoff] sing-box 即将重启
+    [failed] sing-box 运行失败
+   *[stopped] sing-box 已停止
+    }
+tray-core-exited = sing-box 意外退出
+tray-detail = { $label }：{ $value }
+tray-label-core = 内核
+tray-label-mode = 模式
+tray-start = 启动 sing-box
+tray-stop = 停止 sing-box
+tray-restart = 重启 sing-box
+tray-no-profiles = 暂无配置
+tray-update-profiles = 更新全部订阅配置
+tray-open-dashboard = 打开终端管理面板
+tray-open-sub-store = 打开 Sub-Store
+tray-autostart = 登录时启动
+tray-quit = 退出
+tray-failed = { $op ->
+    [start] 无法启动 sing-box
+    [stop] 无法停止 sing-box
+    [restart] 无法重启 sing-box
+    [profile] 无法切换配置
+    [update] 无法更新订阅配置
+    [mode] 无法切换模式
+    [dashboard] 无法打开终端管理面板
+    [browser] 无法打开网页
+    [autostart] 无法修改登录启动项
+   *[other] 操作失败
+    }
+tray-no-terminal = 未找到终端模拟器，请安装一个（例如 Konsole 或 GNOME 控制台），或设置 TERMINAL 环境变量
+tray-open-failed = xdg-open 无法打开 { $url }（{ $status }）
+tray-no-home = 未设置 XDG_CONFIG_HOME 或 HOME
+tray-desktop-comment = 在系统托盘中查看并控制 sing-box

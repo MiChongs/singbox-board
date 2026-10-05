@@ -251,6 +251,23 @@ fn editor_command() -> Result<(String, Vec<String>)> {
     bail!(fl!("editor-none"))
 }
 
+/// An executable named `name` in `PATH`; a name with a slash is a path.
+pub fn find_program(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &Path| {
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return executable(&path).then_some(path);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| executable(candidate))
+}
+
 /// Alphanumeric token from the kernel CSPRNG.
 pub fn random_token(len: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";

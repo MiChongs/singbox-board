@@ -7,7 +7,8 @@
 #   sudo sh install.sh --uninstall [--purge]
 #
 # Installs the static binary from the latest GitHub release (verified against
-# SHA256SUMS), the systemd unit or OpenRC script and /etc/singbox-board/daemon.toml,
+# SHA256SUMS), the systemd unit or OpenRC script, /etc/singbox-board/daemon.toml
+# and the desktop entry of the system tray,
 # starts the daemon, installs the sing-box core and asks whether to enable the
 # optional components (Sub-Store, http-meta). Re-running it upgrades in place.
 set -eu
@@ -92,6 +93,8 @@ BIN=$ROOT$PREFIX/bin/singbox-board
 CONF=$ROOT/etc/singbox-board/daemon.toml
 UNIT=$ROOT/etc/systemd/system/singbox-board.service
 OPENRC=$ROOT/etc/init.d/singbox-board
+APPS=$ROOT$PREFIX/share/applications
+ICONS=$ROOT$PREFIX/share/icons/hicolor/scalable/apps
 SOCKET=/run/singbox-board/daemon.sock
 
 if [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
@@ -233,6 +236,16 @@ install_service() { # release-dir
 	esac
 }
 
+# Desktop entry and icon of `singbox-board tray`; release archives before
+# v0.1.7 do not have them.
+install_desktop() { # release-dir
+	[ -f "$1/contrib/singbox-board.desktop" ] || return 0
+	mkdir -p "$APPS" "$ICONS"
+	sed "s|/usr/bin/singbox-board|$PREFIX/bin/singbox-board|" "$1/contrib/singbox-board.desktop" >"$APPS/singbox-board.desktop"
+	cp "$1/contrib/singbox-board.svg" "$ICONS/singbox-board.svg"
+	chmod 644 "$APPS/singbox-board.desktop" "$ICONS/singbox-board.svg"
+}
+
 wait_for_daemon() {
 	i=0
 	while [ $i -lt 20 ]; do
@@ -307,6 +320,7 @@ do_install() {
 		add_invoking_user
 	fi
 	install_service "$release"
+	install_desktop "$release"
 	[ "$START" = 1 ] && post_start
 
 	cat <<EOF
@@ -315,6 +329,7 @@ ${BOLD}singbox-board is installed.${RESET}
   sing-box config     /etc/sing-box/config.json  (then: sudo singbox-board start)
   daemon config       /etc/singbox-board/daemon.toml
   dashboard           singbox-board
+  system tray         singbox-board tray  (or "singbox-board" in the application menu)
   status / logs       singbox-board status | singbox-board logs -f
   uninstall           sudo sh install.sh --uninstall   (add --purge to remove data)
 EOF
@@ -343,7 +358,7 @@ do_uninstall() {
 		fi
 		say "removed configuration, components and $core (kept /etc/sing-box and /var/lib/sing-box)"
 	fi
-	rm -f "$BIN"
+	rm -f "$BIN" "$APPS/singbox-board.desktop" "$ICONS/singbox-board.svg"
 	say "singbox-board uninstalled"
 }
 

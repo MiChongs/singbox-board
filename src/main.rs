@@ -8,6 +8,7 @@ mod i18n;
 mod profile;
 mod protocol;
 mod substore;
+mod tray;
 mod tui;
 mod util;
 
@@ -83,6 +84,8 @@ struct Cli {
 enum Cmd {
     #[command(about = fl!("cli-tui"))]
     Tui,
+    #[command(about = fl!("cli-tray"))]
+    Tray,
     #[command(about = fl!("cli-daemon"))]
     Daemon {
         #[arg(short, long, value_name = "FILE", help = fl!("cli-daemon-config"))]
@@ -376,7 +379,7 @@ fn main() -> ExitCode {
             }
             run_daemon(cli.socket, config, allow_non_root, explicit_lang)
         }
-        command => run_client(cli.socket, command),
+        command => run_client(cli.socket, cli.lang, command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -427,8 +430,8 @@ fn run_daemon(
         .block_on(daemon::run(config, allow_non_root))
 }
 
-fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
-    if !matches!(command, Cmd::Tui) {
+fn run_client(socket: Option<PathBuf>, lang: Option<String>, command: Cmd) -> Result<()> {
+    if !matches!(command, Cmd::Tui | Cmd::Tray) {
         // Behave like other CLI tools in pipes (`singbox-board core | head`):
         // exit quietly on a closed stdout instead of panicking. The daemon
         // keeps ignoring SIGPIPE so a vanished client cannot kill it.
@@ -440,12 +443,17 @@ fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
             );
         }
     }
+    let options = tray::Options {
+        socket: socket.clone(),
+        lang,
+    };
     let socket = socket.unwrap_or_else(default_socket);
     let client = DaemonClient::new(socket);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         match command {
             Cmd::Tui => tui::run(client).await,
+            Cmd::Tray => tray::run(client, options).await,
             Cmd::Status { json } => ctl::status(&client, json).await,
             Cmd::Start => ctl::command(&client, Request::Start).await,
             Cmd::Stop => ctl::command(&client, Request::Stop).await,

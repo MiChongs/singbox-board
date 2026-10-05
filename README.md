@@ -6,6 +6,7 @@
 - **核心版本管理**：内置 MiChongs（xiaobaf14g）与 SagerNet 官方两个发布源，可添加任意 GitHub 源或导入自编译核心。可列出某个源的全部版本及本机可用的构建变体（ebpf、easytier、glibc、musl 等），一键下载、校验、切换或回退，多个版本并存，切换瞬间完成，启动失败会自动回滚。
 - **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；在 TUI 中可用树形编辑器可视化修改，或交给 `$EDITOR` 编辑原文。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
+- **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，Wayland 与 X11 下均可使用。
 - **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置。
 - **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component / core / profile`，便于脚本调用。
 
@@ -104,6 +105,7 @@ sing-box 配置默认读取 `/etc/sing-box/config.json`，工作目录为 `/var/
 
 ```bash
 singbox-board                 # 打开 TUI（默认）
+singbox-board tray            # 系统托盘图标（也可从应用菜单启动）
 singbox-board status          # 状态；--json 输出原始 JSON
 singbox-board reload          # 先 sing-box check，再发送 SIGHUP
 singbox-board logs -f -n 100  # 跟随日志
@@ -162,6 +164,25 @@ SINGBOX_BOARD_LANG=en singbox-board
 | 配置页 `e` `E` `n` `i` | 树形编辑 / 用 `$EDITOR` 编辑 / 用模板新建 / 导入文件或订阅地址（支持粘贴） |
 | 配置页 `f` `F` `d` `A` | 更新所选订阅 / 更新全部订阅 / 删除 / 将当前配置文件收入配置库 |
 | `?` / `q` | 帮助 / 退出 |
+
+### 系统托盘
+
+`singbox-board tray` 在桌面的系统托盘中显示 sing-box 状态并提供常用操作。托盘实现 freedesktop StatusNotifierItem 协议，通过 D-Bus 与桌面通信（使用纯 Rust 的 [ksni](https://github.com/iovxw/ksni) 与 [zbus](https://github.com/dbus2/zbus)，不依赖 GTK 或 libdbus，静态 musl 程序同样可用），与显示服务器无关，Wayland 与 X11 下均可使用：
+
+| 桌面 | 支持情况 |
+|---|---|
+| KDE Plasma 5 / 6 | 原生支持 |
+| GNOME | 需要启用 AppIndicator 扩展（Ubuntu 默认已启用） |
+| Cinnamon、XFCE、LXQt | 面板托盘原生支持 |
+| Sway、Hyprland、niri 等 | 使用带托盘模块的状态栏，例如 Waybar |
+
+- **图标**：绿色表示运行中，橙色表示正在启动、停止或有操作在进行，灰色表示已停止，红色表示运行失败或无法连接守护进程。悬停提示显示当前配置、内核版本、Clash 模式与失败原因。
+- **菜单**：启动、停止、重启 sing-box；切换配置、更新全部订阅配置；切换 Clash 模式（需启用 Clash API）；打开终端管理面板（左键单击图标效果相同）；打开 Sub-Store Web 界面；登录时启动；退出。
+- **通知**：操作结果、失败原因以及 sing-box 意外退出会以桌面通知提示。
+- **终端**：打开管理面板时依次尝试 `xdg-terminal-exec`、`$TERMINAL`、当前桌面自带的终端（Konsole、Ptyxis、GNOME 控制台等）及其他常见终端。
+- **登录启动**：勾选「登录时启动」会写入 `~/.config/autostart/singbox-board.desktop`。安装包与一键安装脚本还会在应用菜单中添加「singbox-board」入口。
+
+托盘以普通用户身份运行，与 TUI 一样需要是套接字用户组成员；同一桌面会话中只运行一个托盘。登录时若面板尚未就绪，托盘会等待其出现后再显示图标。
 
 ## 核心版本管理
 

@@ -31,7 +31,8 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name/contrib"
 cp "$binary" "$stage/$name/singbox-board"
 cp README.md install.sh "$stage/$name/"
-cp contrib/daemon.toml contrib/singbox-board.service contrib/singbox-board.openrc "$stage/$name/contrib/"
+cp contrib/daemon.toml contrib/singbox-board.service contrib/singbox-board.openrc \
+	contrib/singbox-board.desktop contrib/singbox-board.svg "$stage/$name/contrib/"
 printf '%s\n' "$version" >"$stage/$name/VERSION"
 chmod -R u=rwX,go=rX "$stage/$name"
 chmod 755 "$stage/$name/singbox-board" "$stage/$name/install.sh"
