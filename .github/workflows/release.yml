@@ -1,0 +1,156 @@
+name: Release
+
+# Push a tag matching the version in Cargo.toml to publish a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Manual runs and pull requests touching packaging build everything but publish nothing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - install.sh
+      - contrib/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.16.0
+  CARGO_ZIGBUILD_VERSION: 0.23.4
+  NFPM_VERSION: 2.47.0
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, arch: amd64, nfpm: amd64, qemu: "" }
+          - { target: aarch64-unknown-linux-musl, arch: arm64, nfpm: arm64, qemu: aarch64 }
+          - { target: armv7-unknown-linux-musleabihf, arch: armv7, nfpm: arm7, qemu: arm }
+          - { target: i686-unknown-linux-musl, arch: "386", nfpm: "386", qemu: "" }
+          - { target: riscv64gc-unknown-linux-musl, arch: riscv64, nfpm: riscv64, qemu: riscv64 }
+          - { target: loongarch64-unknown-linux-musl, arch: loong64, nfpm: loong64, qemu: loongarch64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF#refs/tags/v} != "$version" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild and nfpm
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          zigbuild=cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz
+          curl -fsSLO "https://github.com/rust-cross/cargo-zigbuild/releases/download/v$CARGO_ZIGBUILD_VERSION/$zigbuild"
+          curl -fsSLO "https://github.com/rust-cross/cargo-zigbuild/releases/download/v$CARGO_ZIGBUILD_VERSION/$zigbuild.sha256"
+          sha256sum -c "$zigbuild.sha256"
+          tar -xJf "$zigbuild"
+          find . -name cargo-zigbuild -type f -exec install -m 0755 {} bin/ \;
+          nfpm=nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz
+          curl -fsSLO "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/$nfpm"
+          curl -fsSL -o nfpm-checksums.txt "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/checksums.txt"
+          grep " $nfpm\$" nfpm-checksums.txt | sha256sum -c
+          tar -xzf "$nfpm" -C bin nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: packaging/package.sh ${{ matrix.target }} ${{ matrix.arch }} ${{ matrix.nfpm }} ${{ steps.version.outputs.version }} dist
+
+      - name: Run the binary (qemu-user for foreign architectures)
+        run: |
+          binary=target/${{ matrix.target }}/release/singbox-board
+          if [[ -n "${{ matrix.qemu }}" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq qemu-user-static || sudo apt-get install -y -qq qemu-user
+            qemu=$(command -v qemu-${{ matrix.qemu }}-static || command -v qemu-${{ matrix.qemu }})
+            "$qemu" "$binary" --version
+            "$qemu" "$binary" daemon --print-default-config | head -n 3
+          else
+            "$binary" --version
+            "$binary" daemon --print-default-config | head -n 3
+          fi
+
+      - name: Install test (archive and .deb)
+        if: matrix.arch == 'amd64'
+        run: |
+          tar -xzf dist/singbox-board-linux-amd64.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/singbox-board-linux-amd64/singbox-board" --version
+          sh install.sh --local "$RUNNER_TEMP/singbox-board-linux-amd64" --root "$RUNNER_TEMP/stage"
+          test -x "$RUNNER_TEMP/stage/usr/local/bin/singbox-board"
+          test -f "$RUNNER_TEMP/stage/etc/singbox-board/daemon.toml"
+          sudo dpkg -i dist/singbox-board_*_amd64.deb
+          singbox-board --version
+          systemctl is-active singbox-board
+          sudo dpkg --purge singbox-board
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Checksums and notes
+        run: |
+          cp install.sh dist/
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          cat > notes.md <<EOF
+          ## Install
+
+          One-click (systemd or OpenRC, amd64 / arm64 / armv7 / 386 / riscv64 / loong64):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sudo sh -s -- --version ${GITHUB_REF_NAME}
+          \`\`\`
+
+          Or a package: \`sudo apt install ./singbox-board_*.deb\`, \`sudo dnf install ./singbox-board-*.rpm\`,
+          \`sudo apk add --allow-untrusted ./singbox-board_*.apk\`, \`sudo pacman -U ./singbox-board-*.pkg.tar.zst\`.
+          Every file is listed in \`SHA256SUMS\`.
+          EOF
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          body_path: notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

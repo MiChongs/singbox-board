@@ -7,45 +7,14 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use futures::StreamExt;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
+use super::github::{GitHub, Release, verify_sha256};
 use crate::config::UpdateConfig;
 use crate::protocol::UpdateInfo;
 
-const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Release {
-    pub tag_name: String,
-    #[serde(default)]
-    pub prerelease: bool,
-    #[serde(default)]
-    pub draft: bool,
-    pub published_at: Option<String>,
-    #[serde(default)]
-    pub assets: Vec<Asset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Asset {
-    pub name: String,
-    pub browser_download_url: String,
-}
-
-impl Release {
-    pub fn version(&self) -> &str {
-        self.tag_name.strip_prefix('v').unwrap_or(&self.tag_name)
-    }
-
-    fn asset(&self, name: &str) -> Option<&Asset> {
-        self.assets.iter().find(|asset| asset.name == name)
-    }
-}
+pub const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A verified binary written next to its final location, ready to be renamed.
 #[derive(Debug)]
@@ -100,25 +69,14 @@ pub fn parse_sha256sums(content: &str) -> HashMap<String, String> {
 
 pub struct Updater {
     config: UpdateConfig,
-    http: reqwest::Client,
+    github: GitHub,
 }
 
 impl Updater {
     pub fn new(config: UpdateConfig) -> Result<Self> {
-        crate::util::init_tls();
-        let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("singbox-board/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(60));
-        builder = match config.proxy.as_deref().filter(|p| !p.is_empty()) {
-            Some(proxy) => {
-                builder.proxy(reqwest::Proxy::all(proxy).context("invalid update.proxy")?)
-            }
-            None => builder.no_proxy(),
-        };
         Ok(Self {
+            github: GitHub::new(&config)?,
             config,
-            http: builder.build()?,
         })
     }
 
@@ -129,68 +87,18 @@ impl Updater {
         }
     }
 
-    fn download_url(&self, asset: &Asset) -> String {
-        match self.config.mirror.as_deref().filter(|m| !m.is_empty()) {
-            Some(mirror) => format!(
-                "{}/{}",
-                mirror.trim_end_matches('/'),
-                asset.browser_download_url
-            ),
-            None => asset.browser_download_url.clone(),
-        }
-    }
-
-    async fn api_get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!(
-            "{}/repos/{}{path}",
-            self.config.api_url.trim_end_matches('/'),
-            self.config.repo
-        );
-        let mut request = self
-            .http
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .timeout(Duration::from_secs(30));
-        if let Some(token) = self
-            .config
-            .github_token
-            .as_deref()
-            .filter(|t| !t.is_empty())
-        {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.with_context(|| format!("GET {url}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "GET {url}: HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            );
-        }
-        response
-            .json()
-            .await
-            .with_context(|| format!("decode {url}"))
-    }
-
     pub async fn fetch_release(&self, tag: Option<&str>) -> Result<Release> {
-        if let Some(tag) = tag.filter(|t| !t.is_empty()) {
-            let tag = if tag.starts_with('v') {
-                tag.to_owned()
+        // sing-box tags always carry the `v` prefix.
+        let tag = tag.filter(|t| !t.is_empty()).map(|t| {
+            if t.starts_with('v') {
+                t.to_owned()
             } else {
-                format!("v{tag}")
-            };
-            return self.api_get(&format!("/releases/tags/{tag}")).await;
-        }
-        if !self.config.prerelease {
-            return self.api_get("/releases/latest").await;
-        }
-        let releases: Vec<Release> = self.api_get("/releases?per_page=20").await?;
-        releases
-            .into_iter()
-            .find(|release| !release.draft)
-            .ok_or_else(|| anyhow!("{} has no releases", self.config.repo))
+                format!("v{t}")
+            }
+        });
+        self.github
+            .release(&self.config.repo, tag.as_deref(), self.config.prerelease)
+            .await
     }
 
     pub async fn check(
@@ -217,30 +125,6 @@ impl Updater {
         Ok((release, info))
     }
 
-    async fn download(&self, asset: &Asset, limit: usize) -> Result<Vec<u8>> {
-        let url = self.download_url(asset);
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url}"))?;
-        let mut data = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("download {}", asset.name))?;
-            ensure!(
-                data.len() + chunk.len() <= limit,
-                "{} is larger than {limit} bytes",
-                asset.name
-            );
-            data.extend_from_slice(&chunk);
-        }
-        Ok(data)
-    }
-
     /// Downloads, verifies and extracts the release next to `binary` as
     /// `<binary>.new`. The caller renames it into place.
     pub async fn stage(
@@ -249,27 +133,21 @@ impl Updater {
         asset_name: &str,
         binary: &Path,
     ) -> Result<StagedBinary> {
-        let asset = release
-            .asset(asset_name)
-            .ok_or_else(|| anyhow!("release {} has no asset {asset_name}", release.tag_name))?;
+        let asset = release.require(asset_name)?;
         let sums_asset = release.asset("SHA256SUMS").ok_or_else(|| {
             anyhow!(
                 "release {} has no SHA256SUMS; refusing to install unverified binary",
                 release.tag_name
             )
         })?;
-        let sums = String::from_utf8(self.download(sums_asset, 1024 * 1024).await?)
+        let sums = String::from_utf8(self.github.download(sums_asset, 1024 * 1024).await?)
             .context("SHA256SUMS is not UTF-8")?;
         let expected = parse_sha256sums(&sums)
             .remove(asset_name)
             .ok_or_else(|| anyhow!("SHA256SUMS has no entry for {asset_name}"))?;
 
-        let archive = self.download(asset, MAX_ARCHIVE_BYTES).await?;
-        let actual = hex::encode(Sha256::digest(&archive));
-        ensure!(
-            actual == expected,
-            "checksum mismatch for {asset_name}: expected {expected}, got {actual}"
-        );
+        let archive = self.github.download(asset, MAX_ARCHIVE_BYTES).await?;
+        verify_sha256(&archive, &expected, asset_name)?;
 
         let dir = binary
             .parent()
@@ -337,7 +215,7 @@ fn extract_binary(archive: &[u8], dest: &Path) -> Result<()> {
 
 /// `/usr/bin/sing-box` + `.new` -> `/usr/bin/sing-box.new` (unlike `with_extension`,
 /// dots already in the file name are kept).
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
     os.push(suffix);
     PathBuf::from(os)

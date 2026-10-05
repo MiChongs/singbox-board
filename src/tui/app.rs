@@ -16,7 +16,11 @@ use crate::clash::{
     ClashClient, Configs, Connection, Connections, DEFAULT_TEST_URL, Proxies, Proxy,
 };
 use crate::client::DaemonClient;
-use crate::protocol::{ClashApi, LogEntry, Request, Status, UpdateInfo};
+use crate::protocol::{
+    ClashApi, Component, ComponentAction, ComponentStatus, CoreState, LogEntry, Request, Status,
+    UpdateInfo,
+};
+use crate::substore::{Entry, Overview, provider_snippet};
 
 const MAX_LOG_LINES: usize = 5000;
 const HISTORY_POINTS: usize = 300;
@@ -33,6 +37,7 @@ pub enum AppEvent {
     Proxies(Proxies),
     Configs(Configs),
     ClashError(String),
+    SubStore(Result<Overview, String>),
     Delay {
         name: String,
         result: Result<u32, String>,
@@ -53,10 +58,17 @@ pub enum Tab {
     Proxies,
     Connections,
     Logs,
+    SubStore,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Proxies, Tab::Connections, Tab::Logs];
+    pub const ALL: [Tab; 5] = [
+        Tab::Overview,
+        Tab::Proxies,
+        Tab::Connections,
+        Tab::Logs,
+        Tab::SubStore,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -64,6 +76,7 @@ impl Tab {
             Tab::Proxies => "Proxies",
             Tab::Connections => "Connections",
             Tab::Logs => "Logs",
+            Tab::SubStore => "Sub-Store",
         }
     }
 
@@ -76,6 +89,13 @@ impl Tab {
 pub enum Focus {
     Groups,
     Members,
+}
+
+/// Which pane of the Sub-Store tab has the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFocus {
+    Components,
+    Entries,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +116,18 @@ pub enum Popup {
         title: String,
         body: String,
         error: bool,
+        /// Text `y` copies to the clipboard.
+        copy: Option<String>,
+    },
+    /// First-run question; `sub_store` holds the first answer once given.
+    Setup {
+        sub_store: Option<bool>,
+    },
+    /// Actions for one component.
+    Menu {
+        component: Component,
+        actions: Vec<ComponentAction>,
+        selected: usize,
     },
 }
 
@@ -173,6 +205,16 @@ pub struct App {
     pub conn_state: TableState,
     pub traffic: Traffic,
 
+    pub sub_store: Option<Overview>,
+    pub sub_store_error: Option<String>,
+    sub_store_api_tx: watch::Sender<Option<String>>,
+    store_refresh: Arc<Notify>,
+    pub store_focus: StoreFocus,
+    pub comp_state: TableState,
+    pub entry_state: TableState,
+    wizard_shown: bool,
+    clipboard: Option<String>,
+
     pub toast: Option<Toast>,
     pub busy: Vec<(u64, String)>,
     next_action: u64,
@@ -182,9 +224,17 @@ pub struct App {
 impl App {
     pub fn new(client: DaemonClient, tx: EventTx) -> (Self, JoinSet<()>) {
         let (clash_api_tx, clash_api_rx) = watch::channel(None);
+        let (sub_store_api_tx, sub_store_api_rx) = watch::channel(None);
         let refresh = Arc::new(Notify::new());
-        let background =
-            tasks::spawn_all(client.clone(), tx.clone(), clash_api_rx, refresh.clone());
+        let store_refresh = Arc::new(Notify::new());
+        let background = tasks::spawn_all(
+            client.clone(),
+            tx.clone(),
+            clash_api_rx,
+            refresh.clone(),
+            sub_store_api_rx,
+            store_refresh.clone(),
+        );
         let app = Self {
             should_quit: false,
             tab: Tab::Overview,
@@ -211,6 +261,15 @@ impl App {
             connections: Vec::new(),
             conn_state: TableState::default(),
             traffic: Traffic::default(),
+            sub_store: None,
+            sub_store_error: None,
+            sub_store_api_tx,
+            store_refresh,
+            store_focus: StoreFocus::Components,
+            comp_state: TableState::default().with_selected(Some(0)),
+            entry_state: TableState::default(),
+            wizard_shown: false,
+            clipboard: None,
             toast: None,
             busy: Vec::new(),
             next_action: 0,
@@ -246,6 +305,21 @@ impl App {
                         .and_then(|api| ClashClient::new(api).ok());
                     self.clash_api_tx.send_replace(status.clash_api.clone());
                 }
+                let api = status
+                    .components
+                    .iter()
+                    .find(|c| c.component == Component::SubStore && c.state == CoreState::Running)
+                    .and_then(|c| c.api.clone());
+                if *self.sub_store_api_tx.borrow() != api {
+                    if api.is_none() {
+                        self.sub_store = None;
+                    }
+                    self.sub_store_api_tx.send_replace(api);
+                }
+                if status.setup_required && !self.wizard_shown && self.popup.is_none() {
+                    self.wizard_shown = true;
+                    self.popup = Some(Popup::Setup { sub_store: None });
+                }
                 self.status = Some(status);
                 self.status_error = None;
             }
@@ -277,6 +351,18 @@ impl App {
                 self.connections.clear();
                 self.traffic.reset();
             }
+            AppEvent::SubStore(Ok(overview)) => {
+                self.sub_store_error = None;
+                let len = overview.entries.len();
+                self.sub_store = Some(overview);
+                let index = self
+                    .entry_state
+                    .selected()
+                    .map(|i| i.min(len.saturating_sub(1)));
+                self.entry_state
+                    .select(if len == 0 { None } else { index.or(Some(0)) });
+            }
+            AppEvent::SubStore(Err(err)) => self.sub_store_error = Some(err),
             AppEvent::Delay { name, result } => {
                 self.testing.remove(&name);
                 self.delays.insert(name, result);
@@ -284,6 +370,7 @@ impl App {
             AppEvent::ActionDone { id, result } => {
                 self.busy.retain(|(busy, _)| *busy != id);
                 self.refresh.notify_one();
+                self.store_refresh.notify_one();
                 match result {
                     Ok(message) => self.notify(message, false),
                     Err(err) => self.notify(err, true),
@@ -324,6 +411,7 @@ impl App {
                 title: title.to_owned(),
                 body: text,
                 error,
+                copy: None,
             });
         } else {
             self.toast = Some(Toast {
@@ -449,7 +537,7 @@ impl App {
             KeyCode::BackTab => {
                 self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
             }
-            KeyCode::Char(c @ '1'..='4') => self.tab = Tab::ALL[c as usize - '1' as usize],
+            KeyCode::Char(c @ '1'..='5') => self.tab = Tab::ALL[c as usize - '1' as usize],
             KeyCode::Char('s') => self.daemon_action("starting sing-box", Request::Start),
             KeyCode::Char('x') => self.confirm("Stop sing-box?", PendingAction::Stop),
             KeyCode::Char('r') => self.confirm("Restart sing-box?", PendingAction::Restart),
@@ -462,6 +550,7 @@ impl App {
                 Tab::Proxies => self.on_proxies_key(key),
                 Tab::Connections => self.on_connections_key(key),
                 Tab::Logs => self.on_logs_key(key),
+                Tab::SubStore => self.on_store_key(key),
             },
         }
     }
@@ -469,11 +558,75 @@ impl App {
     fn on_popup_key(&mut self, popup: Popup, key: KeyEvent) {
         match popup {
             Popup::Help => {}
+            Popup::Message {
+                copy: Some(text), ..
+            } if key.code == KeyCode::Char('y') => {
+                self.copy(text, "snippet");
+            }
             Popup::Message { .. } => {
                 if !matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.popup = Some(popup);
                 }
             }
+            Popup::Setup { sub_store } => {
+                let answer = match key.code {
+                    KeyCode::Char('y' | 'Y') => true,
+                    KeyCode::Char('n' | 'N') => false,
+                    // Skip for now; the question comes back on the next launch.
+                    KeyCode::Esc => return,
+                    _ => {
+                        self.popup = Some(popup);
+                        return;
+                    }
+                };
+                match sub_store {
+                    None => {
+                        self.popup = Some(Popup::Setup {
+                            sub_store: Some(answer),
+                        })
+                    }
+                    Some(sub_store) => self.daemon_action(
+                        "setting up components",
+                        Request::Setup {
+                            sub_store,
+                            http_meta: answer,
+                        },
+                    ),
+                }
+            }
+            Popup::Menu {
+                component,
+                actions,
+                selected,
+            } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.popup = Some(Popup::Menu {
+                        component,
+                        selected: selected.saturating_sub(1),
+                        actions,
+                    })
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.popup = Some(Popup::Menu {
+                        component,
+                        selected: (selected + 1).min(actions.len().saturating_sub(1)),
+                        actions,
+                    })
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = actions.get(selected) {
+                        self.component_action(component, *action);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                _ => {
+                    self.popup = Some(Popup::Menu {
+                        component,
+                        actions,
+                        selected,
+                    })
+                }
+            },
             Popup::Confirm { action, .. }
                 if matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter) =>
             {
@@ -544,6 +697,152 @@ impl App {
             _ => self.log_scroll,
         }
         .min(max);
+    }
+
+    fn on_store_key(&mut self, key: KeyEvent) {
+        let entries = self.sub_store.as_ref().map_or(0, |o| o.entries.len());
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => match self.store_focus {
+                StoreFocus::Components => {
+                    move_table(&mut self.comp_state, Component::ALL.len(), -1)
+                }
+                StoreFocus::Entries => move_table(&mut self.entry_state, entries, -1),
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.store_focus {
+                StoreFocus::Components => move_table(&mut self.comp_state, Component::ALL.len(), 1),
+                StoreFocus::Entries => move_table(&mut self.entry_state, entries, 1),
+            },
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => {
+                self.store_focus = StoreFocus::Components
+            }
+            KeyCode::Right | KeyCode::Char('l') if entries > 0 => {
+                self.store_focus = StoreFocus::Entries
+            }
+            KeyCode::Enter => match self.store_focus {
+                StoreFocus::Components => self.open_component_menu(),
+                StoreFocus::Entries => self.show_snippet(),
+            },
+            KeyCode::Char('p') => self.show_snippet(),
+            KeyCode::Char('y') => match self.store_focus {
+                StoreFocus::Entries => {
+                    if let Some(url) = self.selected_entry().map(|e| e.singbox_url.clone()) {
+                        self.copy(url, "sing-box subscription URL");
+                    }
+                }
+                StoreFocus::Components => {
+                    let url = self
+                        .component(self.selected_component())
+                        .and_then(|c| c.url.clone());
+                    match url {
+                        Some(url) => self.copy(url, "URL"),
+                        None => {
+                            self.notify("no URL yet; enable the component first".to_owned(), true)
+                        }
+                    }
+                }
+            },
+            KeyCode::Char('w') => {
+                match self
+                    .component(Component::SubStore)
+                    .and_then(|c| c.url.clone())
+                {
+                    Some(url) => self.copy(url, "Sub-Store web UI URL"),
+                    None => self.notify("Sub-Store is not set up".to_owned(), true),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn component(&self, component: Component) -> Option<&ComponentStatus> {
+        self.status
+            .as_ref()?
+            .components
+            .iter()
+            .find(|c| c.component == component)
+    }
+
+    pub fn selected_component(&self) -> Component {
+        Component::ALL[self
+            .comp_state
+            .selected()
+            .unwrap_or(0)
+            .min(Component::ALL.len() - 1)]
+    }
+
+    pub fn selected_entry(&self) -> Option<&Entry> {
+        self.sub_store
+            .as_ref()?
+            .entries
+            .get(self.entry_state.selected()?)
+    }
+
+    fn open_component_menu(&mut self) {
+        let component = self.selected_component();
+        let Some(status) = self.component(component) else {
+            self.notify("daemon status is not available".to_owned(), true);
+            return;
+        };
+        let actions = if !status.enabled {
+            vec![ComponentAction::Enable]
+        } else if status.pid.is_some() {
+            vec![
+                ComponentAction::Restart,
+                ComponentAction::Stop,
+                ComponentAction::Update,
+                ComponentAction::Disable,
+            ]
+        } else {
+            vec![
+                ComponentAction::Start,
+                ComponentAction::Update,
+                ComponentAction::Disable,
+            ]
+        };
+        self.popup = Some(Popup::Menu {
+            component,
+            actions,
+            selected: 0,
+        });
+    }
+
+    fn component_action(&mut self, component: Component, action: ComponentAction) {
+        let verb = match action {
+            ComponentAction::Start => "starting",
+            ComponentAction::Stop => "stopping",
+            ComponentAction::Restart => "restarting",
+            ComponentAction::Enable => "installing",
+            ComponentAction::Disable => "disabling",
+            ComponentAction::Update => "updating",
+        };
+        self.daemon_action(
+            &format!("{verb} {}", component.title()),
+            Request::Component { component, action },
+        );
+    }
+
+    fn show_snippet(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            self.notify("no subscription selected".to_owned(), true);
+            return;
+        };
+        let snippet = provider_snippet(&entry.name, &entry.singbox_url);
+        self.popup = Some(Popup::Message {
+            title: format!("sing-box provider for {} · y copy", entry.name),
+            body: snippet.clone(),
+            error: false,
+            copy: Some(snippet),
+        });
+    }
+
+    /// Queues `text` for the terminal clipboard (OSC 52).
+    fn copy(&mut self, text: String, what: &str) {
+        self.clipboard = Some(text);
+        self.notify(format!("copied {what}"), false);
+    }
+
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     fn move_proxy_cursor(&mut self, delta: isize) {

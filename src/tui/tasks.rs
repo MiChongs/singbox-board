@@ -10,6 +10,7 @@ use super::app::AppEvent;
 use crate::clash::ClashClient;
 use crate::client::DaemonClient;
 use crate::protocol::ClashApi;
+use crate::substore::SubStoreClient;
 
 pub type EventTx = mpsc::UnboundedSender<AppEvent>;
 
@@ -18,12 +19,57 @@ pub fn spawn_all(
     tx: EventTx,
     clash_api: watch::Receiver<Option<ClashApi>>,
     refresh: Arc<Notify>,
+    sub_store_api: watch::Receiver<Option<String>>,
+    store_refresh: Arc<Notify>,
 ) -> JoinSet<()> {
     let mut set = JoinSet::new();
     set.spawn(poll_status(client.clone(), tx.clone()));
     set.spawn(follow_logs(client, tx.clone()));
-    set.spawn(poll_clash(tx, clash_api, refresh));
+    set.spawn(poll_clash(tx.clone(), clash_api, refresh));
+    set.spawn(poll_sub_store(tx, sub_store_api, store_refresh));
     set
+}
+
+/// Lists Sub-Store subscriptions every 5s while Sub-Store is running.
+async fn poll_sub_store(
+    tx: EventTx,
+    mut api: watch::Receiver<Option<String>>,
+    refresh: Arc<Notify>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut current: Option<(String, SubStoreClient)> = None;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = refresh.notified() => {}
+            changed = api.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        let wanted = api.borrow().clone();
+        let Some(wanted) = wanted else {
+            current = None;
+            continue;
+        };
+        if current.as_ref().is_none_or(|(have, _)| *have != wanted) {
+            match SubStoreClient::new(&wanted) {
+                Ok(client) => current = Some((wanted, client)),
+                Err(err) => {
+                    let _ = tx.send(AppEvent::SubStore(Err(format!("{err:#}"))));
+                    continue;
+                }
+            }
+        }
+        let Some((_, client)) = &current else {
+            continue;
+        };
+        let result = client.overview().await.map_err(|err| format!("{err:#}"));
+        if tx.send(AppEvent::SubStore(result)).is_err() {
+            return;
+        }
+    }
 }
 
 async fn poll_status(client: DaemonClient, tx: EventTx) {

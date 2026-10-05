@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034  # variables are read by openrc-run
+# OpenRC service for singbox-board (Alpine, Gentoo, ...).
+
+name="singbox-board"
+description="singbox-board root daemon (sing-box supervisor)"
+command="/usr/bin/singbox-board"
+command_args="daemon --config /etc/singbox-board/daemon.toml"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/singbox-board.log"
+error_log="/var/log/singbox-board.log"
+# The daemon stops sing-box and the components itself on SIGTERM.
+retry="TERM/30/KILL/5"
+extra_started_commands="reload"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/singbox-board /var/lib/singbox-board /var/lib/sing-box
+}
+
+reload() {
+	ebegin "Validating and reloading the sing-box configuration"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}

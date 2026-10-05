@@ -122,7 +122,7 @@ fn timeout_for(request: &Request) -> Duration {
     Duration::from_secs(match request {
         Request::Status => 5,
         Request::CheckUpdate => 90,
-        Request::Update { .. } => 30 * 60,
+        Request::Update { .. } | Request::Setup { .. } | Request::Component { .. } => 30 * 60,
         Request::Start | Request::Restart | Request::Stop => 120,
         _ => 60,
     })

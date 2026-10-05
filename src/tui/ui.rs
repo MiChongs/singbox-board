@@ -8,8 +8,10 @@ use ratatui::widgets::{
     Block, BorderType, Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
 };
 
-use super::app::{App, Focus, Popup, Tab};
-use crate::protocol::{CoreState, LogEntry, LogSource};
+use super::app::{App, Focus, Popup, StoreFocus, Tab};
+use crate::protocol::{
+    Component, ComponentAction, ComponentStatus, CoreState, LogEntry, LogSource,
+};
 use crate::util::{fmt_bytes, fmt_clock, fmt_duration, fmt_speed, now_unix};
 
 const ACCENT: Color = Color::Cyan;
@@ -34,13 +36,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Proxies => draw_proxies(frame, body, app),
         Tab::Connections => draw_connections(frame, body, app),
         Tab::Logs => draw_logs(frame, body, app),
+        Tab::SubStore => draw_sub_store(frame, body, app),
     }
     draw_footer(frame, footer, app);
 
     match &app.popup {
         Some(Popup::Help) => draw_help(frame),
         Some(Popup::Confirm { message, .. }) => draw_confirm(frame, message),
-        Some(Popup::Message { title, body, error }) => draw_message(frame, title, body, *error),
+        Some(Popup::Message {
+            title, body, error, ..
+        }) => draw_message(frame, title, body, *error),
+        Some(Popup::Setup { sub_store }) => draw_setup(frame, *sub_store),
+        Some(Popup::Menu {
+            component,
+            actions,
+            selected,
+        }) => draw_menu(frame, *component, actions, *selected),
         None => {}
     }
 }
@@ -242,6 +253,9 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
                 ),
             ));
             lines.push(kv("Socket", app.socket()));
+            for component in &status.components {
+                lines.push(kv(component.component.title(), component_badge(component)));
+            }
             lines
         }
     };
@@ -591,6 +605,14 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
             Span::styled(" daemon ", Style::new().fg(ACCENT).bold()),
             Span::raw(line.clone()),
         ]),
+        LogSource::SubStore | LogSource::HttpMeta => Line::from(vec![
+            Span::styled(fmt_clock(entry.ts), Style::new().fg(DIM)),
+            Span::styled(
+                format!(" {} ", entry.source.tag()),
+                Style::new().fg(Color::LightBlue).bold(),
+            ),
+            Span::raw(line.clone()),
+        ]),
         LogSource::Core => match find_level(line) {
             Some((start, end, color)) => Line::from(vec![
                 Span::styled(line[..start].to_owned(), Style::new().fg(DIM)),
@@ -635,6 +657,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         Tab::Connections => &[("↑↓", "move"), ("d", "close"), ("D", "close all")],
         Tab::Logs => &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("End", "follow")],
+        Tab::SubStore => &[
+            ("←→", "focus"),
+            ("⏎", "actions/snippet"),
+            ("y", "copy URL"),
+            ("w", "web UI"),
+        ],
         Tab::Overview => &[],
     };
     let global: [(&str, &str); 8] = [
@@ -697,7 +725,7 @@ fn popup_area(frame: &Frame, width: u16, height: u16) -> Rect {
 fn draw_help(frame: &mut Frame) {
     let rows = [
         ("Global", ""),
-        ("1-4 / Tab", "switch tab"),
+        ("1-5 / Tab", "switch tab"),
         ("s / x / r", "start / stop / restart sing-box"),
         ("R", "check config and hot-reload (SIGHUP)"),
         ("c", "run sing-box check"),
@@ -713,6 +741,11 @@ fn draw_help(frame: &mut Frame) {
         ("d / D", "close selected / all"),
         ("Logs", ""),
         ("↑↓ PgUp PgDn", "scroll, End follows"),
+        ("Sub-Store", ""),
+        ("←→ / h l", "components ↔ subscriptions"),
+        ("Enter", "component actions / provider snippet"),
+        ("y", "copy selected URL (OSC 52)"),
+        ("w / p", "copy web UI URL / provider snippet"),
     ];
     let lines: Vec<Line> = rows
         .iter()
@@ -770,6 +803,239 @@ fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool) {
             .wrap(Wrap { trim: false })
             .block(panel(&format!("{title} · Esc to close")).border_style(Style::new().fg(color))),
         rect,
+    );
+}
+
+// ----- Sub-Store ---------------------------------------------------------------
+
+fn component_badge(c: &ComponentStatus) -> Span<'static> {
+    let (label, color) = if let Some(busy) = &c.busy {
+        (format!("{}…", busy.to_uppercase()), Color::Yellow)
+    } else if !c.enabled {
+        ("DISABLED".to_owned(), Color::DarkGray)
+    } else {
+        (c.state.label().to_owned(), state_color(c.state))
+    };
+    Span::styled(
+        format!(" {label} "),
+        Style::new().fg(Color::Black).bg(color).bold(),
+    )
+}
+
+fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
+    let [components_area, entries_area] =
+        Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).areas(area);
+    let now = now_unix();
+
+    let rows: Vec<Row> = Component::ALL
+        .iter()
+        .map(|component| match app.component(*component) {
+            None => Row::new(vec![
+                Cell::from(component.title()),
+                Cell::from(Span::styled("unknown", Style::new().fg(DIM))),
+            ]),
+            Some(c) => {
+                let uptime = c
+                    .started_at
+                    .filter(|_| c.pid.is_some())
+                    .map(|s| format!("up {}", fmt_duration(now.saturating_sub(s))))
+                    .unwrap_or_else(|| c.last_exit.clone().unwrap_or_default());
+                let versions = c
+                    .versions
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                Row::new(vec![
+                    Cell::from(Span::styled(component.title(), Style::new().bold())),
+                    Cell::from(component_badge(c)),
+                    Cell::from(Span::styled(uptime, Style::new().fg(DIM))),
+                    Cell::from(Span::styled(versions, Style::new().fg(DIM))),
+                    Cell::from(c.url.clone().unwrap_or_default()),
+                ])
+            }
+        })
+        .collect();
+    let focused = app.store_focus == StoreFocus::Components;
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(16),
+            Constraint::Fill(2),
+            Constraint::Fill(3),
+        ],
+    )
+    .header(Row::new(["Component", "State", "", "Versions", "URL"]).style(Style::new().fg(DIM)))
+    .block(panel("Components · Enter actions").border_style(focus_border(focused)))
+    .row_highlight_style(highlight(focused))
+    .highlight_symbol("▌");
+    frame.render_stateful_widget(table, components_area, &mut app.comp_state);
+
+    let focused = app.store_focus == StoreFocus::Entries;
+    let running = app
+        .component(Component::SubStore)
+        .is_some_and(|c| c.state == CoreState::Running);
+    let version = app
+        .sub_store
+        .as_ref()
+        .map(|o| format!(" · Sub-Store {}", o.version))
+        .unwrap_or_default();
+    let block = panel(&format!(
+        "Subscriptions → sing-box{version} · y copy URL · p provider snippet"
+    ))
+    .border_style(focus_border(focused));
+    let message = if !app
+        .component(Component::SubStore)
+        .is_some_and(|c| c.enabled)
+    {
+        Some("Sub-Store is disabled. Select it above and press Enter → enable.".to_owned())
+    } else if !running {
+        Some("Sub-Store is not running.".to_owned())
+    } else if let Some(err) = &app.sub_store_error {
+        Some(first_line(err))
+    } else if app.sub_store.as_ref().is_some_and(|o| o.entries.is_empty()) {
+        Some("No subscriptions yet. Add them in the web UI (press w to copy its URL).".to_owned())
+    } else if app.sub_store.is_none() {
+        Some("loading…".to_owned())
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        frame.render_widget(
+            Paragraph::new(message)
+                .fg(DIM)
+                .wrap(Wrap { trim: true })
+                .block(block),
+            entries_area,
+        );
+        return;
+    }
+    let rows: Vec<Row> = app
+        .sub_store
+        .as_ref()
+        .map(|o| o.entries.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|e| {
+            let name = if e.display_name.is_empty() || e.display_name == e.name {
+                e.name.clone()
+            } else {
+                format!("{} ({})", e.name, e.display_name)
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(e.kind.label(), Style::new().fg(ACCENT))),
+                Cell::from(name),
+                Cell::from(Span::styled(e.detail.clone(), Style::new().fg(DIM))),
+                Cell::from(e.singbox_url.clone()),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Fill(1),
+            Constraint::Fill(2),
+            Constraint::Fill(3),
+        ],
+    )
+    .header(Row::new(["Type", "Name", "Source", "sing-box URL"]).style(Style::new().fg(DIM)))
+    .block(block)
+    .row_highlight_style(highlight(focused))
+    .highlight_symbol("▌");
+    frame.render_stateful_widget(table, entries_area, &mut app.entry_state);
+}
+
+fn draw_setup(frame: &mut Frame, sub_store: Option<bool>) {
+    let (name, about, question) = match sub_store {
+        None => (
+            "Sub-Store",
+            vec![
+                "Subscription manager with a web UI (sub-store-org/Sub-Store).",
+                "Converts and merges subscriptions and serves them in sing-box",
+                "format, so sing-box `providers` can import the nodes.",
+            ],
+            "Enable Sub-Store?",
+        ),
+        Some(_) => (
+            "http-meta",
+            vec![
+                "Starts mihomo on demand so Sub-Store scripts can test whether",
+                "nodes are reachable (xream/http-meta + MetaCubeX/mihomo).",
+                "Only useful together with Sub-Store node-check scripts.",
+            ],
+            "Enable http-meta?",
+        ),
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "singbox-board can install and supervise optional components.",
+            Style::new().fg(DIM),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(name, Style::new().fg(ACCENT).bold())),
+    ];
+    lines.extend(about.into_iter().map(Line::raw));
+    if let Some(answer) = sub_store {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("Sub-Store: {}", if answer { "yes" } else { "no" }),
+            Style::new().fg(DIM),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(question, Style::new().bold()),
+        Span::raw("   "),
+        Span::styled("y", Style::new().fg(Color::Green).bold()),
+        Span::raw(" yes   "),
+        Span::styled("n", Style::new().fg(Color::Red).bold()),
+        Span::raw(" no   "),
+        Span::styled("Esc", Style::new().fg(DIM).bold()),
+        Span::styled(" ask later", Style::new().fg(DIM)),
+    ]));
+    let area = popup_area(frame, 70, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("First run · optional components").border_style(Style::new().fg(ACCENT))),
+        area,
+    );
+}
+
+fn draw_menu(
+    frame: &mut Frame,
+    component: Component,
+    actions: &[ComponentAction],
+    selected: usize,
+) {
+    let items: Vec<ListItem> = actions
+        .iter()
+        .map(|action| {
+            let label = match action {
+                ComponentAction::Start => "Start",
+                ComponentAction::Stop => "Stop",
+                ComponentAction::Restart => "Restart",
+                ComponentAction::Enable => "Enable (download, install and start)",
+                ComponentAction::Disable => "Disable (stop and keep stopped)",
+                ComponentAction::Update => "Update to the latest release",
+            };
+            ListItem::new(format!(" {label}"))
+        })
+        .collect();
+    let area = popup_area(frame, 46, actions.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let mut state = ratatui::widgets::ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(component.title()).border_style(Style::new().fg(ACCENT)))
+            .highlight_style(highlight(true))
+            .highlight_symbol("▌"),
+        area,
+        &mut state,
     );
 }
 

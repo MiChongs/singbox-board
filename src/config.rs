@@ -22,6 +22,9 @@ pub struct DaemonConfig {
     pub restart: RestartConfig,
     pub clash_api: ClashApiOverride,
     pub update: UpdateConfig,
+    pub components: ComponentsConfig,
+    pub sub_store: SubStoreConfig,
+    pub http_meta: HttpMetaConfig,
 }
 
 impl Default for DaemonConfig {
@@ -36,6 +39,9 @@ impl Default for DaemonConfig {
             restart: RestartConfig::default(),
             clash_api: ClashApiOverride::default(),
             update: UpdateConfig::default(),
+            components: ComponentsConfig::default(),
+            sub_store: SubStoreConfig::default(),
+            http_meta: HttpMetaConfig::default(),
         }
     }
 }
@@ -173,6 +179,90 @@ impl Default for UpdateConfig {
             mirror: None,
             github_token: None,
             restart_after_update: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComponentsConfig {
+    /// Install root of the optional components; also holds `state.json`.
+    pub data_dir: PathBuf,
+    /// Node.js executable. Unset: `node` from PATH when new enough, else an
+    /// LTS build is downloaded into `data_dir`.
+    pub node: Option<PathBuf>,
+    /// Where Node.js builds are downloaded from (`index.json` + `SHASUMS256.txt`).
+    pub node_mirror: String,
+    /// Unprivileged user the components run as when the daemon is root.
+    pub run_as: String,
+}
+
+impl Default for ComponentsConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("/var/lib/singbox-board"),
+            node: None,
+            node_mirror: "https://nodejs.org/dist".to_owned(),
+            run_as: "nobody".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubStoreConfig {
+    pub host: String,
+    pub port: u16,
+    pub backend_repo: String,
+    pub frontend_repo: String,
+    /// `SUB_STORE_BACKEND_SYNC_CRON`, e.g. "55 23 * * *".
+    pub sync_cron: Option<String>,
+    /// `SUB_STORE_PRODUCE_CRON`.
+    pub produce_cron: Option<String>,
+    /// `SUB_STORE_BACKEND_DEFAULT_PROXY` for fetching remote subscriptions.
+    pub default_proxy: Option<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for SubStoreConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port: 3001,
+            backend_repo: "sub-store-org/Sub-Store".to_owned(),
+            frontend_repo: "sub-store-org/Sub-Store-Front-End".to_owned(),
+            sync_cron: None,
+            produce_cron: None,
+            default_proxy: None,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpMetaConfig {
+    pub host: String,
+    pub port: u16,
+    /// `AUTHORIZATION` header value required by http-meta when set.
+    pub authorization: Option<String>,
+    pub repo: String,
+    pub mihomo_repo: String,
+    /// mihomo release architecture, e.g. "amd64-v3"; detected when unset.
+    pub mihomo_arch: Option<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for HttpMetaConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port: 9876,
+            authorization: None,
+            repo: "xream/http-meta".to_owned(),
+            mihomo_repo: "MetaCubeX/mihomo".to_owned(),
+            mihomo_arch: None,
+            env: BTreeMap::new(),
         }
     }
 }

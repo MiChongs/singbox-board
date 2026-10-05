@@ -4,6 +4,7 @@ mod config;
 mod ctl;
 mod daemon;
 mod protocol;
+mod substore;
 mod tui;
 mod util;
 
@@ -15,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 use crate::client::DaemonClient;
 use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_SOCKET, DaemonConfig};
-use crate::protocol::Request;
+use crate::protocol::{Component, ComponentAction, Request};
 
 #[derive(Parser)]
 #[command(
@@ -88,6 +89,22 @@ enum Cmd {
         /// Reinstall even if the version is unchanged
         #[arg(long)]
         force: bool,
+    },
+    /// Choose the optional components (Sub-Store, http-meta); asked on first run
+    Setup {
+        /// Enable Sub-Store (yes/no); asked interactively when omitted
+        #[arg(long, value_name = "BOOL", value_parser = clap::builder::BoolishValueParser::new())]
+        sub_store: Option<bool>,
+        /// Enable http-meta (yes/no); asked interactively when omitted
+        #[arg(long, value_name = "BOOL", value_parser = clap::builder::BoolishValueParser::new())]
+        http_meta: Option<bool>,
+    },
+    /// Manage an optional component; shows its details and URLs without an action
+    Component {
+        #[arg(value_enum)]
+        component: Component,
+        #[arg(value_enum)]
+        action: Option<ComponentAction>,
     },
 }
 
@@ -162,6 +179,13 @@ fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
             Cmd::Check => ctl::command(&client, Request::Check).await,
             Cmd::Logs { tail, follow } => ctl::logs(&client, tail, follow).await,
             Cmd::Update { check, tag, force } => ctl::update(&client, check, tag, force).await,
+            Cmd::Setup {
+                sub_store,
+                http_meta,
+            } => ctl::setup(&client, sub_store, http_meta).await,
+            Cmd::Component { component, action } => {
+                ctl::component(&client, component, action).await
+            }
             Cmd::Daemon { .. } => unreachable!("handled in main"),
         }
     })

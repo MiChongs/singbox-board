@@ -1,7 +1,11 @@
 //! The root daemon: supervises sing-box and serves the control socket.
 
 mod auth;
+mod components;
+mod github;
 mod logs;
+mod process;
+mod service;
 mod singbox_config;
 mod supervisor;
 mod updater;
@@ -20,6 +24,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast::error::RecvError;
 
 use self::auth::Authorizer;
+use self::components::ComponentsHandle;
 use self::logs::LogHub;
 use self::supervisor::{Op, Supervisor, SupervisorHandle};
 use crate::config::DaemonConfig;
@@ -50,7 +55,15 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
         config.socket.display()
     ));
 
-    let (handle, supervisor) = Supervisor::spawn(config.clone(), logs.clone());
+    let components = components::spawn(config.clone(), logs.clone());
+    let (handle, supervisor) =
+        Supervisor::spawn(config.clone(), logs.clone(), components.startup_gate());
+    let ctx = Arc::new(Ctx {
+        supervisor: handle.clone(),
+        components: components.clone(),
+        logs: logs.clone(),
+        auth,
+    });
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -59,7 +72,7 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(serve(stream, handle.clone(), logs.clone(), auth.clone()));
+                    tokio::spawn(serve(stream, ctx.clone()));
                 }
                 Err(err) => {
                     tracing::warn!("accept failed: {err}");
@@ -87,6 +100,7 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
         }
     }
 
+    components.shutdown().await;
     handle.shutdown().await;
     let _ = supervisor.await;
     let _ = std::fs::remove_file(&config.socket);
@@ -120,26 +134,24 @@ fn bind_socket(path: &Path, group: Option<Gid>) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn serve(
-    stream: UnixStream,
-    handle: SupervisorHandle,
+/// Everything a client connection may talk to.
+struct Ctx {
+    supervisor: SupervisorHandle,
+    components: ComponentsHandle,
     logs: Arc<LogHub>,
     auth: Arc<Authorizer>,
-) {
-    if let Err(err) = serve_client(stream, handle, logs, auth).await {
+}
+
+async fn serve(stream: UnixStream, ctx: Arc<Ctx>) {
+    if let Err(err) = serve_client(stream, &ctx).await {
         tracing::debug!("client connection: {err:#}");
     }
 }
 
-async fn serve_client(
-    stream: UnixStream,
-    handle: SupervisorHandle,
-    logs: Arc<LogHub>,
-    auth: Arc<Authorizer>,
-) -> Result<()> {
+async fn serve_client(stream: UnixStream, ctx: &Ctx) -> Result<()> {
     let cred = stream.peer_cred()?;
     let (read, mut write) = stream.into_split();
-    if !auth.is_allowed(cred.uid(), cred.gid()) {
+    if !ctx.auth.is_allowed(cred.uid(), cred.gid()) {
         tracing::warn!(
             "rejected client uid={} gid={} pid={:?}",
             cred.uid(),
@@ -159,9 +171,31 @@ async fn serve_client(
     };
 
     let op = match request {
-        Request::Status => return send(&mut write, &Response::Status(handle.status())).await,
+        Request::Status => {
+            let mut status = ctx.supervisor.status();
+            status.setup_required = ctx.components.setup_required();
+            status.components = ctx.components.statuses();
+            return send(&mut write, &Response::Status(status)).await;
+        }
         Request::Logs { tail, follow } => {
-            return stream_logs(reader, write, &logs, tail, follow).await;
+            return stream_logs(reader, write, &ctx.logs, tail, follow).await;
+        }
+        Request::Setup {
+            sub_store,
+            http_meta,
+        } => {
+            tracing::info!("uid {} requested setup", cred.uid());
+            let response = ctx.components.setup(sub_store, http_meta).await;
+            return send(&mut write, &response).await;
+        }
+        Request::Component { component, action } => {
+            tracing::info!(
+                "uid {} requested {action:?} {}",
+                cred.uid(),
+                component.name()
+            );
+            let response = ctx.components.action(component, action).await;
+            return send(&mut write, &response).await;
         }
         Request::Start => Op::Start,
         Request::Stop => Op::Stop,
@@ -172,7 +206,7 @@ async fn serve_client(
         Request::Update { tag, force } => Op::Update { tag, force },
     };
     tracing::info!("uid {} requested {op:?}", cred.uid());
-    let response = handle.request(op).await;
+    let response = ctx.supervisor.request(op).await;
     send(&mut write, &response).await
 }
 

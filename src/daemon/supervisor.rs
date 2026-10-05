@@ -5,7 +5,6 @@
 //! slow operation (stop timeout, config check) never blocks `status`.
 
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,13 +12,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant as Deadline, sleep_until, timeout};
+use tokio::time::{Instant as Deadline, timeout};
 
 use super::logs::LogHub;
+use super::process::{self, describe, first_line, pipe_to_logs, sleep_until_opt, wait_child};
 use super::singbox_config::discover_clash_api;
 use super::updater::{self, StagedBinary, Updater};
 use crate::config::{DaemonConfig, RestartPolicy};
@@ -104,7 +103,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn spawn(config: DaemonConfig, logs: Arc<LogHub>) -> (SupervisorHandle, JoinHandle<()>) {
+    /// `startup_gate` delays the automatic start until it turns true (or 90s pass).
+    pub fn spawn(
+        config: DaemonConfig,
+        logs: Arc<LogHub>,
+        startup_gate: watch::Receiver<bool>,
+    ) -> (SupervisorHandle, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(32);
         let backoff = Duration::from_millis(config.restart.initial_backoff_ms.max(100));
         let mut supervisor = Supervisor {
@@ -134,16 +138,43 @@ impl Supervisor {
             tx,
             status: supervisor.status_tx.subscribe(),
         };
-        (handle, tokio::spawn(supervisor.run()))
+        (handle, tokio::spawn(supervisor.run(startup_gate)))
     }
 
-    async fn run(mut self) {
+    async fn run(mut self, mut startup_gate: watch::Receiver<bool>) {
         self.core_version = self.probe_version().await;
         self.publish();
-        if self.config.core.auto_start
-            && let Response::Error { message } = self.start().await
+        let missing = self.missing_prerequisite();
+        if let Some(reason) = &missing
+            && self.config.core.auto_start
         {
-            self.logs.warn(format!("auto start failed: {message}"));
+            // Fresh installs: nothing to retry until the user acts.
+            self.logs.info(format!("not starting sing-box: {reason}"));
+        }
+        if self.config.core.auto_start && missing.is_none() {
+            if !*startup_gate.borrow() {
+                self.logs
+                    .info("waiting for components before starting sing-box");
+                let _ = timeout(
+                    Duration::from_secs(90),
+                    startup_gate.wait_for(|ready| *ready),
+                )
+                .await;
+            }
+            // Unlike an explicit `start`, a failed boot start is retried with
+            // backoff (e.g. network or a provider not reachable yet).
+            self.want_running = true;
+            if let Err(err) = self.launch().await {
+                self.logs.warn(format!(
+                    "auto start failed: {}",
+                    first_line(&format!("{err:#}"))
+                ));
+                if self.config.restart.policy != RestartPolicy::Never {
+                    self.schedule_restart();
+                } else {
+                    self.want_running = false;
+                }
+            }
         }
         loop {
             let restart_at = self.restart_at;
@@ -188,6 +219,23 @@ impl Supervisor {
         let _ = reply.send(response);
     }
 
+    /// Why sing-box cannot start at all (binary or configuration absent).
+    fn missing_prerequisite(&self) -> Option<String> {
+        let core = &self.config.core;
+        if !core.binary.exists() {
+            return Some(format!(
+                "{} is not installed; run `singbox-board update`",
+                core.binary.display()
+            ));
+        }
+        let missing = core
+            .config
+            .iter()
+            .map(|path| core.resolve(path))
+            .find(|path| !path.exists());
+        missing.map(|path| format!("configuration {} does not exist", path.display()))
+    }
+
     fn publish(&self) {
         let now = Deadline::now();
         self.status_tx.send_replace(Status {
@@ -207,6 +255,8 @@ impl Supervisor {
             args: self.config.core.run_args(),
             clash_api: self.clash_api.clone(),
             update_in_progress: self.updating,
+            setup_required: false,
+            components: Vec::new(),
         });
     }
 
@@ -347,35 +397,27 @@ impl Supervisor {
             .envs(&core.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            // Keep terminal signals (Ctrl-C on a foreground daemon) away from
-            // sing-box; the daemon stops it in an orderly way instead.
-            .process_group(0);
-        // SAFETY: prctl is async-signal-safe and touches no shared state.
-        unsafe {
-            command.pre_exec(|| {
-                // Do not leave an unmanaged sing-box behind if the daemon dies.
-                nix::sys::prctl::set_pdeathsig(Signal::SIGTERM).map_err(io::Error::from)
-            });
-        }
+            .stderr(Stdio::piped());
+        process::isolate(&mut command);
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", core.binary.display()))?;
         let pid = child.id().unwrap_or_default();
         self.pipes.clear();
         if let Some(stdout) = child.stdout.take() {
-            self.pipes.push(pipe_to_logs(stdout, self.logs.clone()));
+            self.pipes
+                .push(pipe_to_logs(stdout, self.logs.clone(), LogSource::Core));
         }
         if let Some(stderr) = child.stderr.take() {
-            self.pipes.push(pipe_to_logs(stderr, self.logs.clone()));
+            self.pipes
+                .push(pipe_to_logs(stderr, self.logs.clone(), LogSource::Core));
         }
         self.logs.info(format!("sing-box started (pid {pid})"));
 
         if let Ok(status) = timeout(STARTUP_GRACE, child.wait()).await {
             let exit = describe(&status);
             self.drain_pipes().await;
-            let recent = self.logs.recent_core_lines(8).join("\n");
+            let recent = self.logs.recent_lines(LogSource::Core, 8).join("\n");
             self.logs
                 .warn(format!("sing-box exited during startup: {exit}"));
             bail!("sing-box exited during startup ({exit})\n{recent}");
@@ -607,59 +649,6 @@ impl Supervisor {
     }
 }
 
-async fn wait_child(child: &mut Option<Child>) -> io::Result<ExitStatus> {
-    match child {
-        Some(child) => child.wait().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn sleep_until_opt(deadline: Option<Deadline>) {
-    match deadline {
-        Some(deadline) => sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
-}
-
-fn pipe_to_logs<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    logs: Arc<LogHub>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(reader);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => logs.push(LogSource::Core, &strip_ansi(&String::from_utf8_lossy(&buf))),
-            }
-        }
-    })
-}
-
-fn describe(status: &io::Result<ExitStatus>) -> String {
-    match status {
-        Ok(status) => match (status.code(), status.signal()) {
-            (Some(code), _) => format!("exit code {code}"),
-            (None, Some(signal)) => match Signal::try_from(signal) {
-                Ok(signal) => format!("killed by {}", signal.as_str()),
-                Err(_) => format!("killed by signal {signal}"),
-            },
-            _ => "unknown exit status".to_owned(),
-        },
-        Err(err) => format!("wait failed: {err}"),
-    }
-}
-
-fn first_line(text: &str) -> String {
-    text.lines()
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(':')
-        .to_owned()
-}
-
 fn placeholder_status() -> Status {
     Status {
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -676,5 +665,7 @@ fn placeholder_status() -> Status {
         args: Vec::new(),
         clash_api: None,
         update_in_progress: false,
+        setup_required: false,
+        components: Vec::new(),
     }
 }

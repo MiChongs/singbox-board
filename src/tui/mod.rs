@@ -4,6 +4,7 @@ mod app;
 mod tasks;
 mod ui;
 
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -45,7 +46,21 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: DaemonClien
             }
             _ = tick.tick() => app.on_tick(),
         }
+        if let Some(text) = app.take_clipboard() {
+            copy_to_clipboard(&text)?;
+        }
     }
     background.abort_all();
+    Ok(())
+}
+
+/// Sets the system clipboard through the terminal (OSC 52); supported by most
+/// modern terminals, including over SSH and inside tmux with `set-clipboard on`.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()?;
     Ok(())
 }

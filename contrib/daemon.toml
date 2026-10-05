@@ -73,3 +73,42 @@ prerelease = false
 # github_token = ""
 # Restart sing-box after a successful update when it is running.
 restart_after_update = true
+
+# ---------------------------------------------------------------------------
+# Optional components. Whether they are enabled is asked on first run (TUI or
+# `singbox-board setup`) and stored in <data_dir>/state.json; change it later
+# with `singbox-board component <sub-store|http-meta> enable|disable`.
+# ---------------------------------------------------------------------------
+[components]
+data_dir = "/var/lib/singbox-board"
+# Node.js used by Sub-Store and http-meta. Unset: `node` from PATH when it is
+# v22 or newer, otherwise an LTS build is downloaded into data_dir.
+# node = "/usr/bin/node"
+node_mirror = "https://nodejs.org/dist"
+# Components run as this unprivileged user when the daemon is root.
+run_as = "nobody"
+
+[sub_store]
+# Frontend and backend share one port; the backend lives under a random secret
+# path generated on first enable (see `singbox-board component sub-store`).
+host = "127.0.0.1"
+port = 3001
+backend_repo = "sub-store-org/Sub-Store"
+frontend_repo = "sub-store-org/Sub-Store-Front-End"
+# sync_cron = "55 23 * * *"
+# produce_cron = "0 */2 * * *,sub,a"
+# default_proxy = "http://127.0.0.1:7890"
+
+# Extra SUB_STORE_* environment variables.
+[sub_store.env]
+
+[http_meta]
+host = "127.0.0.1"
+port = 9876
+# authorization = ""
+repo = "xream/http-meta"
+mihomo_repo = "MetaCubeX/mihomo"
+# mihomo_arch = "amd64-v3"
+
+# Extra environment variables (META_MAX_AVAILABLE_PORT, BODY_JSON_LIMIT ...).
+[http_meta.env]

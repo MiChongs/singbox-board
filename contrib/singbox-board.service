@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/singbox-board daemon --config /etc/singbox-board/daemon.toml
+ExecStart=/usr/bin/singbox-board daemon --config /etc/singbox-board/daemon.toml
 # Validates the sing-box configuration, then hot-reloads it (SIGHUP).
 ExecReload=/bin/kill -HUP $MAINPID
 # The daemon stops sing-box itself on SIGTERM; anything left gets SIGKILL.
@@ -16,7 +16,8 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=infinity
 RuntimeDirectory=singbox-board
-StateDirectory=sing-box
+# /var/lib/sing-box (sing-box -D) and /var/lib/singbox-board (components)
+StateDirectory=sing-box singbox-board
 
 [Install]
 WantedBy=multi-user.target

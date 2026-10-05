@@ -43,7 +43,7 @@ impl LogHub {
             line.truncate(index);
             line.push('…');
         }
-        if source == LogSource::Core && self.forward_core {
+        if source != LogSource::Daemon && self.forward_core {
             eprintln!("{line}");
         }
         let mut inner = self.inner.lock().unwrap();
@@ -82,14 +82,14 @@ impl LogHub {
         (backlog, rx)
     }
 
-    /// The most recent core lines, used to explain an immediate exit.
-    pub fn recent_core_lines(&self, count: usize) -> Vec<String> {
+    /// The most recent lines of one source, used to explain an immediate exit.
+    pub fn recent_lines(&self, source: LogSource, count: usize) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         let mut lines: Vec<String> = inner
             .ring
             .iter()
             .rev()
-            .filter(|entry| entry.source == LogSource::Core)
+            .filter(|entry| entry.source == source)
             .take(count)
             .map(|entry| entry.line.clone())
             .collect();
@@ -115,6 +115,6 @@ mod tests {
         let entry = rx.try_recv().unwrap();
         assert_eq!(entry.line, "next");
         assert_eq!(entry.seq, 6);
-        assert_eq!(hub.recent_core_lines(10), ["line 3", "line 4"]);
+        assert_eq!(hub.recent_lines(LogSource::Core, 10), ["line 3", "line 4"]);
     }
 }

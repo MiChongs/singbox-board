@@ -5,6 +5,8 @@
 //! the only streaming request; the daemon keeps writing `log` lines until the
 //! client disconnects.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Upper bound for a single request line.
@@ -36,6 +38,65 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// First-run answer: which optional components to install and enable.
+    Setup {
+        sub_store: bool,
+        http_meta: bool,
+    },
+    /// Manage an optional component.
+    Component {
+        component: Component,
+        action: ComponentAction,
+    },
+}
+
+/// Optional services the daemon can install and supervise next to sing-box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Component {
+    /// Subscription manager with web UI (sub-store-org/Sub-Store)
+    SubStore,
+    /// mihomo-based node checker used by Sub-Store scripts (xream/http-meta)
+    HttpMeta,
+}
+
+impl Component {
+    pub const ALL: [Component; 2] = [Component::SubStore, Component::HttpMeta];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Component::SubStore => "sub-store",
+            Component::HttpMeta => "http-meta",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Component::SubStore => "Sub-Store",
+            Component::HttpMeta => "http-meta",
+        }
+    }
+
+    pub fn log_source(self) -> LogSource {
+        match self {
+            Component::SubStore => LogSource::SubStore,
+            Component::HttpMeta => LogSource::HttpMeta,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentAction {
+    Start,
+    Stop,
+    Restart,
+    /// Install if needed, start now and on every daemon start
+    Enable,
+    /// Stop and keep stopped
+    Disable,
+    /// Download the latest releases and restart
+    Update,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +176,32 @@ pub struct Status {
     pub args: Vec<String>,
     pub clash_api: Option<ClashApi>,
     pub update_in_progress: bool,
+    /// The first-run question about optional components is still open.
+    #[serde(default)]
+    pub setup_required: bool,
+    #[serde(default)]
+    pub components: Vec<ComponentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentStatus {
+    pub component: Component,
+    pub enabled: bool,
+    pub installed: bool,
+    /// A long operation in progress, e.g. "installing".
+    pub busy: Option<String>,
+    pub state: CoreState,
+    pub pid: Option<u32>,
+    pub started_at: Option<u64>,
+    pub restarts: u32,
+    pub last_exit: Option<String>,
+    pub next_restart_at: Option<u64>,
+    /// e.g. {"backend": "2.42.2", "frontend": "2.34.0", "node": "v24.21.0"}
+    pub versions: BTreeMap<String, String>,
+    /// Web UI (Sub-Store) or service endpoint (http-meta).
+    pub url: Option<String>,
+    /// Sub-Store backend base URL, including the secret path.
+    pub api: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +209,19 @@ pub struct Status {
 pub enum LogSource {
     Core,
     Daemon,
+    SubStore,
+    HttpMeta,
+}
+
+impl LogSource {
+    pub fn tag(self) -> &'static str {
+        match self {
+            LogSource::Core => "sing-box",
+            LogSource::Daemon => "daemon",
+            LogSource::SubStore => "sub-store",
+            LogSource::HttpMeta => "http-meta",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +262,28 @@ mod tests {
             Request::Update {
                 tag: None,
                 force: false
+            }
+        ));
+    }
+
+    #[test]
+    fn component_wire_format() {
+        let json = serde_json::to_string(&Request::Component {
+            component: Component::SubStore,
+            action: ComponentAction::Enable,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"component","component":"sub-store","action":"enable"}"#
+        );
+        let setup: Request =
+            serde_json::from_str(r#"{"cmd":"setup","sub_store":true,"http_meta":false}"#).unwrap();
+        assert!(matches!(
+            setup,
+            Request::Setup {
+                sub_store: true,
+                http_meta: false
             }
         ));
     }
