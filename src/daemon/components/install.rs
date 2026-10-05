@@ -19,9 +19,8 @@ use tokio::process::Command;
 
 use super::state::{Layout, State, write_atomic};
 use crate::config::DaemonConfig;
-use crate::daemon::github::{GitHub, verify_sha256};
+use crate::daemon::github::{GitHub, parse_sha256sums, verify_sha256};
 use crate::daemon::logs::LogHub;
-use crate::daemon::updater::parse_sha256sums;
 
 /// Oldest Node.js major accepted from PATH; older ones trigger a download.
 pub const MIN_NODE_MAJOR: u32 = 22;

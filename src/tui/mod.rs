@@ -1,7 +1,9 @@
 //! Terminal dashboard built on ratatui.
 
 mod app;
+mod core;
 mod tasks;
+mod theme;
 mod ui;
 
 use std::io::Write;

@@ -8,7 +8,9 @@ use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::protocol::{LogEntry, Request, Response, Status, UpdateInfo};
+use crate::protocol::{
+    CoreReleasePage, CoreSource, LogEntry, Request, Response, Status, StoredCore, UpdateInfo,
+};
 
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -77,7 +79,7 @@ impl DaemonClient {
 
     pub async fn status(&self) -> Result<Status> {
         match self.call(Request::Status).await? {
-            Response::Status(status) => Ok(status),
+            Response::Status(status) => Ok(*status),
             other => Err(unexpected(&other)),
         }
     }
@@ -93,6 +95,38 @@ impl DaemonClient {
     pub async fn check_update(&self) -> Result<UpdateInfo> {
         match self.call(Request::CheckUpdate).await? {
             Response::UpdateInfo(info) => Ok(info),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Sources and the one `update` follows.
+    pub async fn core_sources(&self) -> Result<(Vec<CoreSource>, String)> {
+        match self.call(Request::CoreSources).await? {
+            Response::CoreSources { sources, default } => Ok((sources, default)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn core_releases(
+        &self,
+        source: &str,
+        page: u32,
+        refresh: bool,
+    ) -> Result<CoreReleasePage> {
+        let request = Request::CoreReleases {
+            source: source.to_owned(),
+            page,
+            refresh,
+        };
+        match self.call(request).await? {
+            Response::CoreReleases(page) => Ok(page),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn core_installed(&self) -> Result<Vec<StoredCore>> {
+        match self.call(Request::CoreInstalled).await? {
+            Response::CoreInstalled { cores } => Ok(cores),
             other => Err(unexpected(&other)),
         }
     }
@@ -148,7 +182,13 @@ fn timeout_for(request: &Request) -> Duration {
     Duration::from_secs(match request {
         Request::Status => 5,
         Request::CheckUpdate => 90,
-        Request::Update { .. } | Request::Setup { .. } | Request::Component { .. } => 30 * 60,
+        Request::Update { .. }
+        | Request::Setup { .. }
+        | Request::Component { .. }
+        | Request::CoreInstall { .. }
+        | Request::CoreImport { .. } => 30 * 60,
+        Request::CoreReleases { .. } | Request::CoreSourceAdd { .. } => 90,
+        Request::CoreActivate { .. } => 180,
         Request::Start | Request::Restart | Request::Stop => 120,
         _ => 60,
     })

@@ -1,4 +1,9 @@
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
 
 /// Installs the process-wide rustls crypto provider (idempotent).
 pub fn init_tls() {
@@ -97,6 +102,40 @@ pub fn strip_ansi(input: &str) -> String {
         }
     }
     out
+}
+
+/// Writes `data` to a temporary sibling and renames it over `path`.
+pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("move {} into place", path.display()))
+}
+
+/// Alphanumeric token from the kernel CSPRNG.
+pub fn random_token(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bytes = vec![0u8; len * 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("read /dev/urandom");
+    // Rejection sampling keeps the distribution uniform (248 = 4 * 62).
+    bytes
+        .into_iter()
+        .filter(|b| *b < 248)
+        .take(len)
+        .map(|b| ALPHABET[(b % 62) as usize] as char)
+        .collect()
 }
 
 #[cfg(test)]

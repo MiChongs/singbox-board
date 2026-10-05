@@ -54,14 +54,17 @@ stable_after_secs = 60
 # url = "http://127.0.0.1:9090"
 # secret = ""
 
+# Core downloads. Installed cores are kept in <components.data_dir>/cores and
+# core.binary becomes a symlink to the active one (`singbox-board core`, TUI
+# tab 6). `update` follows the active core's source and variant; repo and
+# variant below only apply while no stored core is active.
 [update]
-# GitHub repository that publishes the sing-box release archives.
 repo = "MiChongs/sing-box"
 api_url = "https://api.github.com"
-# Release asset variant suffix, e.g. "ebpf", "v3-ebpf", "easytier".
+# Build variant, e.g. "ebpf", "v3-glibc", "easytier" (MiChongs) or "glibc", "musl" (SagerNet).
 variant = ""
-# Override the detected architecture (amd64, arm64, 386, arm-v7, riscv64,
-# loong64, mipsle-softfloat, mips64le-softfloat ...).
+# Override the detected architecture name used in asset names
+# (amd64, arm64, armv7 / arm-v7, 386, riscv64, loong64, ...).
 # arch = "amd64"
 # Include pre-releases (-alpha / -beta / -rc) when looking for the latest one.
 prerelease = false

@@ -76,7 +76,11 @@ async fn poll_status(client: DaemonClient, tx: EventTx) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let result = client.status().await.map_err(|err| format!("{err:#}"));
+        let result = client
+            .status()
+            .await
+            .map(Box::new)
+            .map_err(|err| format!("{err:#}"));
         if tx.send(AppEvent::Status(result)).is_err() {
             return;
         }

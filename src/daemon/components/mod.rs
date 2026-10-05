@@ -7,6 +7,8 @@
 mod install;
 mod state;
 
+pub use state::{random_token, write_atomic};
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;

@@ -5,6 +5,7 @@
 //! slow operation (stop timeout, config check) never blocks `status`.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,10 +18,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as Deadline, timeout};
 
+use super::github::parse_version_output;
 use super::logs::LogHub;
 use super::process::{self, describe, first_line, pipe_to_logs, sleep_until_opt, wait_child};
 use super::singbox_config::discover_clash_api;
-use super::updater::{self, StagedBinary, Updater};
 use crate::config::{DaemonConfig, RestartPolicy};
 use crate::protocol::{ClashApi, CoreState, LogSource, Response, Status};
 use crate::util::{now_unix, strip_ansi};
@@ -36,18 +37,20 @@ pub enum Op {
     Restart,
     Reload,
     Check,
-    CheckUpdate,
-    Update { tag: Option<String>, force: bool },
-}
-
-enum UpdateOutcome {
-    UpToDate(String),
-    Staged(StagedBinary),
+    /// Point `core.binary` at another core build and restart sing-box onto it.
+    Activate {
+        target: PathBuf,
+        label: String,
+        /// Switch even if the new core rejects the configuration.
+        force: bool,
+        restart: bool,
+        /// Core (binary, label) to return to if the new one fails to start.
+        fallback: Option<(PathBuf, String)>,
+    },
 }
 
 enum Message {
     Op(Op, oneshot::Sender<Response>),
-    UpdateFinished(Result<UpdateOutcome>, oneshot::Sender<Response>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -84,7 +87,6 @@ pub struct Supervisor {
     config: DaemonConfig,
     logs: Arc<LogHub>,
     rx: mpsc::Receiver<Message>,
-    tx: mpsc::Sender<Message>,
     status_tx: watch::Sender<Status>,
     child: Option<Child>,
     pipes: Vec<JoinHandle<()>>,
@@ -98,7 +100,6 @@ pub struct Supervisor {
     restart_at: Option<Deadline>,
     core_version: Option<String>,
     clash_api: Option<ClashApi>,
-    updating: bool,
     daemon_started_at: u64,
 }
 
@@ -115,7 +116,6 @@ impl Supervisor {
             config,
             logs,
             rx,
-            tx: tx.clone(),
             status_tx: watch::Sender::new(placeholder_status()),
             child: None,
             pipes: Vec::new(),
@@ -128,7 +128,6 @@ impl Supervisor {
             restart_at: None,
             core_version: None,
             clash_api: None,
-            updating: false,
             daemon_started_at: now_unix(),
         };
         supervisor.clash_api =
@@ -181,10 +180,6 @@ impl Supervisor {
             tokio::select! {
                 message = self.rx.recv() => match message {
                     Some(Message::Op(op, reply)) => self.handle(op, reply).await,
-                    Some(Message::UpdateFinished(result, reply)) => {
-                        let response = self.finish_update(result).await;
-                        let _ = reply.send(response);
-                    }
                     Some(Message::Shutdown(done)) => {
                         self.want_running = false;
                         self.restart_at = None;
@@ -213,8 +208,16 @@ impl Supervisor {
                 Ok(()) => Response::done("configuration is valid"),
                 Err(err) => Response::error(format!("{err:#}")),
             },
-            Op::CheckUpdate => return self.spawn_check_update(reply),
-            Op::Update { tag, force } => return self.spawn_update(tag, force, reply),
+            Op::Activate {
+                target,
+                label,
+                force,
+                restart,
+                fallback,
+            } => {
+                self.activate(&target, &label, force, restart, fallback)
+                    .await
+            }
         };
         let _ = reply.send(response);
     }
@@ -254,9 +257,10 @@ impl Supervisor {
             binary: self.config.core.binary.display().to_string(),
             args: self.config.core.run_args(),
             clash_api: self.clash_api.clone(),
-            update_in_progress: self.updating,
+            update_in_progress: false,
             setup_required: false,
             components: Vec::new(),
+            active_core: None,
         });
     }
 
@@ -330,16 +334,22 @@ impl Supervisor {
 
     /// Runs `sing-box check` with the same flags as `run`.
     async fn check(&self) -> Result<()> {
-        let core = &self.config.core;
-        if !core.binary.exists() {
+        let binary = self.config.core.binary.clone();
+        if !binary.exists() {
             bail!(
                 "{} not found; install it with `singbox-board update`",
-                core.binary.display()
+                binary.display()
             );
         }
+        self.check_with(&binary).await
+    }
+
+    /// `sing-box check` of the configured files using a specific core build.
+    async fn check_with(&self, binary: &Path) -> Result<()> {
+        let core = &self.config.core;
         let output = timeout(
             CHECK_TIMEOUT,
-            Command::new(&core.binary)
+            Command::new(binary)
                 .args(core.check_args())
                 .envs(&core.env)
                 .stdin(Stdio::null())
@@ -348,7 +358,7 @@ impl Supervisor {
         )
         .await
         .map_err(|_| anyhow!("sing-box check timed out"))?
-        .with_context(|| format!("run {} check", core.binary.display()))?;
+        .with_context(|| format!("run {} check", binary.display()))?;
         if output.status.success() {
             return Ok(());
         }
@@ -542,110 +552,90 @@ impl Supervisor {
         .await
         .ok()?
         .ok()?;
-        updater::parse_version_output(&String::from_utf8_lossy(&output.stdout))
+        parse_version_output(&String::from_utf8_lossy(&output.stdout))
     }
 
-    fn spawn_check_update(&self, reply: oneshot::Sender<Response>) {
-        let config = self.config.update.clone();
-        let current = self.core_version.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let updater = Updater::new(config)?;
-                let (_, info) = updater.check(None, current.as_deref()).await?;
-                anyhow::Ok(info)
-            }
-            .await;
-            let _ = reply.send(match result {
-                Ok(info) => Response::UpdateInfo(info),
-                Err(err) => Response::error(format!("{err:#}")),
-            });
-        });
-    }
-
-    fn spawn_update(&mut self, tag: Option<String>, force: bool, reply: oneshot::Sender<Response>) {
-        if self.updating {
-            let _ = reply.send(Response::error("an update is already in progress"));
-            return;
+    /// Switches `core.binary` to `target` (an atomic symlink swap). The new
+    /// build must accept the configuration unless `force` is set; a running
+    /// sing-box is restarted onto it when `restart` is set.
+    async fn activate(
+        &mut self,
+        target: &Path,
+        label: &str,
+        force: bool,
+        restart: bool,
+        fallback: Option<(PathBuf, String)>,
+    ) -> Response {
+        if !target.is_file() {
+            return Response::error(format!("{} does not exist", target.display()));
         }
-        let updater = match Updater::new(self.config.update.clone()) {
-            Ok(updater) => updater,
-            Err(err) => {
-                let _ = reply.send(Response::error(format!("{err:#}")));
-                return;
-            }
-        };
-        self.updating = true;
-        self.publish();
-        let current = self.core_version.clone();
-        let binary = self.config.core.binary.clone();
-        let logs = self.logs.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let (release, info) = updater.check(tag.as_deref(), current.as_deref()).await?;
-                if !info.update_available && !force {
-                    return Ok(UpdateOutcome::UpToDate(info.latest));
-                }
-                logs.info(format!(
-                    "downloading {} from {}",
-                    info.asset, release.tag_name
-                ));
-                let staged = updater.stage(&release, &info.asset, &binary).await?;
-                logs.info(format!("verified sing-box {} (sha256 ok)", staged.version));
-                Ok(UpdateOutcome::Staged(staged))
-            }
-            .await;
-            let _ = tx.send(Message::UpdateFinished(result, reply)).await;
-        });
-    }
-
-    async fn finish_update(&mut self, result: Result<UpdateOutcome>) -> Response {
-        self.updating = false;
-        let response = match result {
-            Err(err) => {
-                self.logs.warn(format!("update failed: {err:#}"));
-                Response::error(format!("update failed: {err:#}"))
-            }
-            Ok(UpdateOutcome::UpToDate(version)) => {
-                Response::done(format!("sing-box {version} is already up to date"))
-            }
-            Ok(UpdateOutcome::Staged(staged)) => self.install(staged).await,
-        };
-        self.publish();
-        response
-    }
-
-    async fn install(&mut self, staged: StagedBinary) -> Response {
-        let binary = self.config.core.binary.clone();
-        if let Err(err) = updater::install(&staged, &binary) {
-            let _ = std::fs::remove_file(&staged.path);
-            return Response::error(format!("install failed: {err:#}"));
+        let has_config = self
+            .missing_prerequisite()
+            .is_none_or(|m| !m.starts_with("configuration"));
+        if !force
+            && has_config
+            && let Err(err) = self.check_with(target).await
+        {
+            return Response::error(format!(
+                "{label} rejects the current configuration, not switching (force to switch anyway):\n{err:#}"
+            ));
         }
-        let previous = self.core_version.replace(staged.version.clone());
+        let binary = self.config.core.binary.clone();
+        if let Err(err) = point_symlink(&binary, target) {
+            return Response::error(format!("switch {}: {err:#}", binary.display()));
+        }
+        let previous = self.core_version.take();
+        self.core_version = self.probe_version().await;
+        self.publish();
         self.logs.info(format!(
-            "installed sing-box {} (was {})",
-            staged.version,
-            previous.as_deref().unwrap_or("not installed")
+            "core switched to {label} (was {})",
+            previous.as_deref().unwrap_or("none")
         ));
-        if self.child.is_none() || !self.config.update.restart_after_update {
-            return Response::done(format!("installed sing-box {}", staged.version));
+        // Also bring sing-box back when it died on the previous core.
+        let start =
+            self.child.is_some() || matches!(self.state, CoreState::Failed | CoreState::Backoff);
+        if !restart || !start {
+            return Response::done(format!("switched to {label}"));
         }
         self.stop_child().await;
+        self.restart_at = None;
+        self.reset_backoff();
         self.want_running = true;
-        match self.launch().await {
-            Ok(pid) => Response::done(format!(
-                "installed sing-box {} and restarted it (pid {pid})",
-                staged.version
-            )),
-            Err(err) => {
-                self.want_running = false;
-                Response::error(format!(
-                    "installed sing-box {} but it failed to start: {err:#}\nthe previous binary is kept as {}.bak",
-                    staged.version,
-                    binary.display()
-                ))
+        let err = match self.launch().await {
+            Ok(pid) => {
+                return Response::done(format!(
+                    "switched to {label} and restarted sing-box (pid {pid})"
+                ));
             }
+            Err(err) => err,
+        };
+        // `check` cannot catch everything (e.g. deprecations that only fail at
+        // run time), so return to the core that was working.
+        if !force
+            && let Some((previous, previous_label)) = fallback
+            && point_symlink(&binary, &previous).is_ok()
+        {
+            self.core_version = self.probe_version().await;
+            self.logs.warn(format!(
+                "{label} failed to start; rolled back to {previous_label}"
+            ));
+            self.restart_at = None;
+            self.reset_backoff();
+            let restored = match self.launch().await {
+                Ok(pid) => format!("{previous_label} is running again (pid {pid})"),
+                Err(_) => {
+                    self.want_running = false;
+                    format!("{previous_label} did not start either")
+                }
+            };
+            return Response::error(format!(
+                "{label} failed to start, rolled back: {restored}\n{err:#}"
+            ));
         }
+        self.want_running = false;
+        Response::error(format!(
+            "switched to {label}, but sing-box failed to start: {err:#}\nswitch back with `singbox-board core use <id>`"
+        ))
     }
 }
 
@@ -667,5 +657,22 @@ fn placeholder_status() -> Status {
         update_in_progress: false,
         setup_required: false,
         components: Vec::new(),
+        active_core: None,
     }
+}
+
+/// Atomically makes `link` a symlink to `target` (replacing a file or link).
+fn point_symlink(link: &Path, target: &Path) -> Result<()> {
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = link.as_os_str().to_owned();
+    tmp.push(".switching");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)?;
+    std::fs::rename(&tmp, link).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }

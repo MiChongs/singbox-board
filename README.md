@@ -3,6 +3,7 @@
 为 [MiChongs/sing-box](https://github.com/MiChongs/sing-box)（xiaobaf14g 分支）实现的 root 守护进程与终端面板，使用 Rust + [ratatui](https://ratatui.rs) 编写。
 
 - **root daemon**：以 root 运行并托管 `sing-box run` 子进程（TUN、`auto_route`、tproxy、eBPF 入站都需要 root），负责启停、崩溃后指数退避重启、配置校验与热重载，并从 GitHub Releases 安装或更新内核。
+- **核心版本管理**：内置 MiChongs（xiaobaf14g）与 SagerNet 官方两个发布源，可添加任意 GitHub 源或导入自编译核心。可列出某个源的全部版本及本机可用的构建变体（ebpf、easytier、glibc、musl 等），一键下载、校验、切换或回退，多个版本并存，切换瞬间完成，启动失败会自动回滚。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
 - **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接。
 - **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component`，便于脚本调用。
@@ -105,6 +106,9 @@ singbox-board reload          # 先 sing-box check，再发送 SIGHUP
 singbox-board logs -f -n 100  # 跟随日志
 singbox-board update --check  # 只检查是否有新版本
 singbox-board update --tag v1.14.1-xiaobaf14g.1 --force
+singbox-board core                          # 当前核心与已安装版本
+singbox-board core list --source SagerNet/sing-box
+singbox-board core install v1.14.2 --source SagerNet/sing-box --variant glibc
 singbox-board setup                         # 选择可选组件
 singbox-board component sub-store           # 状态、Web 地址、订阅的 sing-box 链接
 singbox-board component http-meta update    # start|stop|restart|enable|disable|update
@@ -116,7 +120,7 @@ singbox-board component http-meta update    # start|stop|restart|enable|disable|
 
 | 按键 | 功能 |
 |---|---|
-| `1`-`5` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store |
+| `1`-`6` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store / Core |
 | `s` `x` `r` | 启动 / 停止 / 重启 sing-box（停止和重启需要确认） |
 | `R` | 校验配置并热重载 |
 | `c` | 运行 `sing-box check` |
@@ -128,7 +132,33 @@ singbox-board component http-meta update    # start|stop|restart|enable|disable|
 | 日志页 `↑↓` `PgUp/PgDn` `End` | 滚动；按 `End` 恢复跟随 |
 | Sub-Store 页 `←→` `Enter` | 在组件与订阅间切换焦点 / 组件操作菜单（启动、停止、更新、启用、禁用）或 provider 配置片段 |
 | Sub-Store 页 `y` `w` `p` | 复制 sing-box 订阅链接 / 复制 Web 界面地址 / 显示 provider 配置片段 |
+| Core 页 `←→` `Enter` `v` `i` `d` | 在来源、版本、已安装之间切换焦点 / 下载并切换 / 切换变体 / 仅下载 / 删除 |
+| Core 页 `p` `n` `f` `a` `I` | 只看正式版 / 下一页 / 刷新 / 添加源 / 导入核心 |
 | `?` / `q` | 帮助 / 退出 |
+
+## 核心版本管理
+
+所有安装过的核心都保存在版本仓库 `/var/lib/singbox-board/cores/<来源>/<版本>/<变体>/` 中，包括发布包附带的全部文件（例如官方构建的 `libcronet.so`）。`/usr/local/bin/sing-box` 是指向当前核心的软链接，因此切换只是一次原子替换；sing-box 按真实路径查找附带库，也能正常找到。
+
+| 操作 | TUI（第 6 页 Core） | 命令行 |
+|---|---|---|
+| 查看来源 | 左栏 Sources | `singbox-board core sources` |
+| 列出全部版本 | 中栏 Releases，`n` 加载下一页，`p` 只看正式版，`f` 刷新 | `singbox-board core list [--source SagerNet/sing-box] [--page 2] [--stable]` |
+| 选择变体 | `v` / `V` 切换（底部显示可选变体） | `--variant ebpf` |
+| 下载并切换 | `Enter` | `singbox-board core install v1.14.1-xiaobaf14g.1 [--source …]` |
+| 仅下载 | `i` | `core install … --no-switch` |
+| 切换到已存版本 | 下栏 Installed，`Enter` | `singbox-board core use 1.14.2` |
+| 删除已存版本 | 下栏 `d` | `singbox-board core remove <id>` |
+| 添加自定义源（root） | `a` | `sudo singbox-board core source add owner/repo` |
+| 导入自编译核心（root） | `I` | `sudo singbox-board core import /path/sing-box [--sha256 …]` 或 URL |
+| 升级当前核心 | `u` | `singbox-board update` |
+
+- **识别构建**：发布资源按 `sing-box-<版本>-linux-<架构>[-<变体>]` 识别，兼容 `armv7` / `arm-v7` 等不同写法，支持 `.tar.gz`、`.zip`、`.gz` 和裸二进制。
+- **校验**：依次使用发布中的 `SHA256SUMS`、GitHub 提供的资源摘要、导入时指定的 sha256 校验。都没有时（2025 年以前的旧版本）仅依赖 TLS，并在界面上标记为 unverified。下载后会实际运行一次 `sing-box version`，确认能在本机执行。
+- **切换前**：先用新核心对当前配置执行 `sing-box check`，配置不兼容就拒绝切换。例如官方核心不认识 MiChongs 特有的 `providers` 字段，这时可以用 `--force` 强制切换。原来手动放置的二进制会先作为「Previously installed」收进仓库，不会丢失。
+- **切换后**：如果新核心启动失败（有些问题只在运行时才出现，例如新版本把弃用提示改成了致命错误），会自动回滚到之前的核心并重新启动。
+- **`update` 的规则**：沿用当前核心的来源和变体，`daemon.toml` 的 `[update]` 只在还没有托管核心时生效。
+- **权限**：添加自定义源和导入二进制只允许 root。核心以 root 身份运行，这两个操作等同于决定以 root 执行什么程序；`singbox-board` 组的成员只能在内置源和 root 添加的源之间安装、切换。
 
 ## Sub-Store 与 http-meta
 
@@ -191,7 +221,8 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 | `core.binary` / `core.config` / `core.config_dir` / `core.working_dir` | 对应 sing-box 的二进制路径以及 `-c` / `-C` / `-D` 参数 |
 | `core.check_before_start` | 每次启动、重启、重载前先运行 `sing-box check`；校验失败时保留正在运行的实例 |
 | `restart.policy` | `always` / `on-failure` / `never`，重启间隔按指数退避，上限为 `max_backoff_secs` |
-| `update.variant` | 下载的 Release 变体，例如 `ebpf`、`v3-ebpf`、`easytier` |
+| `update.repo` / `update.variant` | 尚未有托管核心时的默认来源和变体；之后 `update` 沿用当前核心的设置 |
+| `core.env` | 传给 sing-box 的环境变量，例如 `ENABLE_DEPRECATED_IMPLICIT_DEFAULT_HTTP_CLIENT = "true"` |
 | `update.proxy` / `update.mirror` | 访问 GitHub 时使用的代理 / 下载镜像前缀（组件下载同样使用） |
 | `components.data_dir` / `components.run_as` | 组件安装目录（含 `state.json`）/ 组件运行用户 |
 | `components.node` / `components.node_mirror` | 指定 Node.js 路径 / Node.js 下载源（国内可用 `https://npmmirror.com/mirrors/node`） |

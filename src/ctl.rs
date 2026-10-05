@@ -6,10 +6,11 @@ use anyhow::{Result, bail};
 
 use crate::client::DaemonClient;
 use crate::protocol::{
-    Component, ComponentAction, ComponentStatus, CoreState, LogSource, Request, Status,
+    Checksum, Component, ComponentAction, ComponentStatus, CoreState, LogSource, Request, Status,
+    StoredCore, core_store_id,
 };
 use crate::substore::{SubStoreClient, provider_snippet};
-use crate::util::{fmt_clock, fmt_duration, now_unix};
+use crate::util::{fmt_bytes, fmt_clock, fmt_duration, now_unix};
 
 pub async fn status(client: &DaemonClient, json: bool) -> Result<()> {
     let status = client.status().await?;
@@ -285,4 +286,258 @@ pub async fn update(
     }
     eprintln!("downloading and verifying the release, this may take a while…");
     command(client, Request::Update { tag, force }).await
+}
+
+// ----- core versions --------------------------------------------------------
+
+fn paint(text: &str, code: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn variant_name(variant: &str) -> &str {
+    if variant.is_empty() {
+        "default"
+    } else {
+        variant
+    }
+}
+
+fn checksum_text(checksum: Checksum) -> String {
+    match checksum {
+        Checksum::Sums => paint("✓ SHA256SUMS", "32"),
+        Checksum::Digest => paint("✓ digest", "32"),
+        Checksum::Pinned => paint("✓ pinned", "32"),
+        Checksum::None => paint("unverified", "33"),
+    }
+}
+
+/// `core` without arguments: the active core and the version store.
+pub async fn core_overview(client: &DaemonClient) -> Result<()> {
+    let status = client.status().await?;
+    match &status.active_core {
+        Some(core) => println!(
+            "{} sing-box {}  {} · {}  {}",
+            paint("●", "32"),
+            paint(&core.version, "1"),
+            core.source_name,
+            variant_name(&core.variant),
+            checksum_text(core.checksum)
+        ),
+        None => match &status.core_version {
+            Some(version) => println!(
+                "{} sing-box {version} at {} (not managed by the version store)",
+                paint("●", "33"),
+                status.binary
+            ),
+            None => println!("{} no sing-box core installed", paint("○", "31")),
+        },
+    }
+    println!();
+    core_installed(client).await?;
+    println!(
+        "\n{}",
+        paint(
+            "list releases: singbox-board core list · switch: singbox-board core install <tag> / core use <id>",
+            "2"
+        )
+    );
+    Ok(())
+}
+
+pub async fn core_sources(client: &DaemonClient) -> Result<()> {
+    let (sources, default) = client.core_sources().await?;
+    for source in sources {
+        let marker = if source.id == default {
+            paint("●", "32")
+        } else {
+            " ".to_owned()
+        };
+        let kind = if source.builtin { "" } else { " [custom]" };
+        println!(
+            "{marker} {:<26} {}{}\n    {}",
+            source.id,
+            paint(&source.name, "1"),
+            kind,
+            paint(&source.description, "2")
+        );
+    }
+    Ok(())
+}
+
+pub async fn core_list(
+    client: &DaemonClient,
+    source: Option<String>,
+    page: u32,
+    stable: bool,
+    refresh: bool,
+) -> Result<()> {
+    let source = match source {
+        Some(source) => source,
+        None => client.core_sources().await?.1,
+    };
+    let page = client.core_releases(&source, page, refresh).await?;
+    let installed = client.core_installed().await?;
+    println!(
+        "{} · {} · page {}{}",
+        paint(&page.source, "1"),
+        page.platform,
+        page.page,
+        if page.has_more {
+            format!(" (more: --page {})", page.page + 1)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  {:<34} {:<11} {}",
+        paint("VERSION", "2"),
+        paint("PUBLISHED", "2"),
+        paint("VARIANTS (● active, ✓ stored)", "2")
+    );
+    for release in page.releases.iter().filter(|r| !stable || !r.prerelease) {
+        let variants: Vec<String> = release
+            .variants
+            .iter()
+            .map(|v| {
+                let id = core_store_id(&page.source, &release.tag, &v.name);
+                match installed.iter().find(|c| c.id == id) {
+                    Some(core) if core.active => {
+                        paint(&format!("●{}", variant_name(&v.name)), "32;1")
+                    }
+                    Some(_) => paint(&format!("✓{}", variant_name(&v.name)), "34"),
+                    None => variant_name(&v.name).to_owned(),
+                }
+            })
+            .collect();
+        let pre = if release.prerelease {
+            paint(" pre", "33")
+        } else {
+            "    ".to_owned()
+        };
+        let date = release
+            .published_at
+            .as_deref()
+            .unwrap_or("")
+            .get(..10)
+            .unwrap_or("");
+        let variants = if variants.is_empty() {
+            paint("no build for this platform", "2")
+        } else {
+            variants.join(" ")
+        };
+        println!("  {:<30}{pre} {:<11} {variants}", release.version, date);
+    }
+    println!(
+        "\n{}",
+        paint(
+            &format!(
+                "install: singbox-board core install <tag> --source {} [--variant <name>]",
+                page.source
+            ),
+            "2"
+        )
+    );
+    Ok(())
+}
+
+pub async fn core_installed(client: &DaemonClient) -> Result<()> {
+    let cores = client.core_installed().await?;
+    if cores.is_empty() {
+        println!("no cores in the version store yet");
+        return Ok(());
+    }
+    println!("{}", paint("installed cores:", "2"));
+    for core in cores {
+        let marker = if core.active {
+            paint("●", "32")
+        } else {
+            " ".to_owned()
+        };
+        println!(
+            "{marker} {:<32} {:<24} {:<10} {:>10}  {}\n    {}",
+            core.version,
+            core.source_name,
+            variant_name(&core.variant),
+            fmt_bytes(core.size),
+            checksum_text(core.checksum),
+            paint(&core.id, "2")
+        );
+    }
+    Ok(())
+}
+
+/// Resolves a store id, version or tag to a stored core id.
+async fn resolve_core(client: &DaemonClient, query: &str) -> Result<String> {
+    let cores = client.core_installed().await?;
+    if let Some(core) = cores.iter().find(|c| c.id == query) {
+        return Ok(core.id.clone());
+    }
+    let matches: Vec<&StoredCore> = cores
+        .iter()
+        .filter(|c| {
+            c.version == query
+                || c.tag.as_deref() == Some(query)
+                || c.tag.as_deref() == Some(&format!("v{query}"))
+        })
+        .collect();
+    match matches.as_slice() {
+        [core] => Ok(core.id.clone()),
+        [] => bail!("no stored core matches {query:?}; see `singbox-board core installed`"),
+        many => bail!(
+            "{query:?} matches several cores, pass an id:\n  {}",
+            many.iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ),
+    }
+}
+
+pub async fn core_install(
+    client: &DaemonClient,
+    tag: String,
+    source: Option<String>,
+    variant: String,
+    activate: bool,
+    force: bool,
+) -> Result<()> {
+    let source = match source {
+        Some(source) => source,
+        None => client.core_sources().await?.1,
+    };
+    let variant = if variant == "default" {
+        String::new()
+    } else {
+        variant
+    };
+    eprintln!(
+        "downloading {} {tag} ({}) if it is not stored yet…",
+        source,
+        variant_name(&variant)
+    );
+    command(
+        client,
+        Request::CoreInstall {
+            source,
+            tag,
+            variant,
+            activate,
+            force,
+        },
+    )
+    .await
+}
+
+pub async fn core_use(client: &DaemonClient, query: &str, force: bool) -> Result<()> {
+    let id = resolve_core(client, query).await?;
+    command(client, Request::CoreActivate { id, force }).await
+}
+
+pub async fn core_remove(client: &DaemonClient, query: &str) -> Result<()> {
+    let id = resolve_core(client, query).await?;
+    command(client, Request::CoreRemove { id }).await
 }

@@ -11,14 +11,15 @@ use ratatui::widgets::{ListState, TableState};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
+use super::core::{CoreView, InputPurpose};
 use super::tasks::{self, EventTx};
 use crate::clash::{
     ClashClient, Configs, Connection, Connections, DEFAULT_TEST_URL, Proxies, Proxy,
 };
 use crate::client::DaemonClient;
 use crate::protocol::{
-    ClashApi, Component, ComponentAction, ComponentStatus, CoreState, LogEntry, Request, Status,
-    UpdateInfo,
+    ClashApi, Component, ComponentAction, ComponentStatus, CoreReleasePage, CoreSource, CoreState,
+    LogEntry, Request, Status, StoredCore, UpdateInfo,
 };
 use crate::substore::{Entry, Overview, provider_snippet};
 
@@ -29,7 +30,7 @@ const DELAY_TIMEOUT_MS: u32 = 5000;
 const DELAY_CONCURRENCY: usize = 8;
 
 pub enum AppEvent {
-    Status(Result<Status, String>),
+    Status(Result<Box<Status>, String>),
     LogsReset,
     Log(LogEntry),
     LogsDisconnected,
@@ -38,6 +39,13 @@ pub enum AppEvent {
     Configs(Configs),
     ClashError(String),
     SubStore(Result<Overview, String>),
+    CoreSources(Result<(Vec<CoreSource>, String), String>),
+    CoreReleases {
+        source: String,
+        page: u32,
+        result: Result<CoreReleasePage, String>,
+    },
+    CoreInstalled(Result<Vec<StoredCore>, String>),
     Delay {
         name: String,
         result: Result<u32, String>,
@@ -59,15 +67,17 @@ pub enum Tab {
     Connections,
     Logs,
     SubStore,
+    Core,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Proxies,
         Tab::Connections,
         Tab::Logs,
         Tab::SubStore,
+        Tab::Core,
     ];
 
     pub fn title(self) -> &'static str {
@@ -77,6 +87,7 @@ impl Tab {
             Tab::Connections => "Connections",
             Tab::Logs => "Logs",
             Tab::SubStore => "Sub-Store",
+            Tab::Core => "Core",
         }
     }
 
@@ -104,6 +115,21 @@ pub enum PendingAction {
     Restart,
     Update,
     CloseAllConnections,
+    CoreInstall {
+        source: String,
+        tag: String,
+        variant: String,
+        activate: bool,
+    },
+    CoreActivate {
+        id: String,
+    },
+    CoreRemove {
+        id: String,
+    },
+    CoreSourceRemove {
+        id: String,
+    },
 }
 
 pub enum Popup {
@@ -128,6 +154,13 @@ pub enum Popup {
         component: Component,
         actions: Vec<ComponentAction>,
         selected: usize,
+    },
+    /// Single-line text input.
+    Input {
+        title: String,
+        hint: String,
+        value: String,
+        purpose: InputPurpose,
     },
 }
 
@@ -177,13 +210,13 @@ pub struct App {
     pub should_quit: bool,
     pub tab: Tab,
     pub popup: Option<Popup>,
-    client: DaemonClient,
-    tx: EventTx,
+    pub(super) client: DaemonClient,
+    pub(super) tx: EventTx,
     clash_api_tx: watch::Sender<Option<ClashApi>>,
     refresh: Arc<Notify>,
     clash: Option<ClashClient>,
 
-    pub status: Option<Status>,
+    pub status: Option<Box<Status>>,
     pub status_error: Option<String>,
 
     pub logs: VecDeque<LogEntry>,
@@ -214,6 +247,8 @@ pub struct App {
     pub entry_state: TableState,
     wizard_shown: bool,
     clipboard: Option<String>,
+
+    pub core: CoreView,
 
     pub toast: Option<Toast>,
     pub busy: Vec<(u64, String)>,
@@ -270,6 +305,7 @@ impl App {
             entry_state: TableState::default(),
             wizard_shown: false,
             clipboard: None,
+            core: CoreView::default(),
             toast: None,
             busy: Vec::new(),
             next_action: 0,
@@ -363,6 +399,13 @@ impl App {
                     .select(if len == 0 { None } else { index.or(Some(0)) });
             }
             AppEvent::SubStore(Err(err)) => self.sub_store_error = Some(err),
+            AppEvent::CoreSources(result) => self.core_sources_loaded(result),
+            AppEvent::CoreReleases {
+                source,
+                page,
+                result,
+            } => self.core_releases_loaded(source, page, result),
+            AppEvent::CoreInstalled(result) => self.core_installed_loaded(result),
             AppEvent::Delay { name, result } => {
                 self.testing.remove(&name);
                 self.delays.insert(name, result);
@@ -371,6 +414,7 @@ impl App {
                 self.busy.retain(|(busy, _)| *busy != id);
                 self.refresh.notify_one();
                 self.store_refresh.notify_one();
+                self.core_refresh_after_action();
                 match result {
                     Ok(message) => self.notify(message, false),
                     Err(err) => self.notify(err, true),
@@ -404,7 +448,7 @@ impl App {
     }
 
     /// Short messages go to the footer, long or multi-line ones to a popup.
-    fn notify(&mut self, text: String, error: bool) {
+    pub(super) fn notify(&mut self, text: String, error: bool) {
         if text.contains('\n') || text.chars().count() > 90 {
             let title = if error { "Error" } else { "Result" };
             self.popup = Some(Popup::Message {
@@ -537,7 +581,7 @@ impl App {
             KeyCode::BackTab => {
                 self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
             }
-            KeyCode::Char(c @ '1'..='5') => self.tab = Tab::ALL[c as usize - '1' as usize],
+            KeyCode::Char(c @ '1'..='6') => self.tab = Tab::ALL[c as usize - '1' as usize],
             KeyCode::Char('s') => self.daemon_action("starting sing-box", Request::Start),
             KeyCode::Char('x') => self.confirm("Stop sing-box?", PendingAction::Stop),
             KeyCode::Char('r') => self.confirm("Restart sing-box?", PendingAction::Restart),
@@ -551,7 +595,11 @@ impl App {
                 Tab::Connections => self.on_connections_key(key),
                 Tab::Logs => self.on_logs_key(key),
                 Tab::SubStore => self.on_store_key(key),
+                Tab::Core => self.core_on_key(key),
             },
+        }
+        if self.tab == Tab::Core {
+            self.core_tab_opened();
         }
     }
 
@@ -568,6 +616,33 @@ impl App {
                     self.popup = Some(popup);
                 }
             }
+            Popup::Input {
+                title,
+                hint,
+                mut value,
+                purpose,
+            } => match key.code {
+                KeyCode::Enter => self.core_submit_input(purpose, value),
+                KeyCode::Esc => {}
+                code => {
+                    match code {
+                        KeyCode::Backspace => {
+                            value.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            value.clear()
+                        }
+                        KeyCode::Char(c) => value.push(c),
+                        _ => {}
+                    }
+                    self.popup = Some(Popup::Input {
+                        title,
+                        hint,
+                        value,
+                        purpose,
+                    });
+                }
+            },
             Popup::Setup { sub_store } => {
                 let answer = match key.code {
                     KeyCode::Char('y' | 'Y') => true,
@@ -901,6 +976,10 @@ impl App {
                     force: false,
                 },
             ),
+            core @ (PendingAction::CoreInstall { .. }
+            | PendingAction::CoreActivate { .. }
+            | PendingAction::CoreRemove { .. }
+            | PendingAction::CoreSourceRemove { .. }) => self.core_run_pending(core),
             PendingAction::CloseAllConnections => {
                 self.clash_action("closing connections", |clash| async move {
                     clash.close_all_connections().await?;
@@ -916,7 +995,7 @@ impl App {
         self.next_action
     }
 
-    fn daemon_action(&mut self, label: &str, request: Request) {
+    pub(super) fn daemon_action(&mut self, label: &str, request: Request) {
         let id = self.begin(label);
         let client = self.client.clone();
         let tx = self.tx.clone();

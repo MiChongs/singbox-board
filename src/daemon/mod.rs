@@ -2,13 +2,13 @@
 
 mod auth;
 mod components;
+mod cores;
 mod github;
 mod logs;
 mod process;
 mod service;
 mod singbox_config;
 mod supervisor;
-mod updater;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -25,10 +25,11 @@ use tokio::sync::broadcast::error::RecvError;
 
 use self::auth::Authorizer;
 use self::components::ComponentsHandle;
+use self::cores::{CoreManager, checksum_label, display_variant};
 use self::logs::LogHub;
 use self::supervisor::{Op, Supervisor, SupervisorHandle};
 use crate::config::DaemonConfig;
-use crate::protocol::{LogEntry, LogSource, MAX_REQUEST_BYTES, Request, Response};
+use crate::protocol::{LogEntry, LogSource, MAX_REQUEST_BYTES, Request, Response, UpdateInfo};
 use crate::util::now_unix_ms;
 
 pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
@@ -61,8 +62,10 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
     let ctx = Arc::new(Ctx {
         supervisor: handle.clone(),
         components: components.clone(),
+        cores: CoreManager::new(config.clone(), logs.clone()),
         logs: logs.clone(),
         auth,
+        config: config.clone(),
     });
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -138,8 +141,10 @@ fn bind_socket(path: &Path, group: Option<Gid>) -> Result<UnixListener> {
 struct Ctx {
     supervisor: SupervisorHandle,
     components: ComponentsHandle,
+    cores: Arc<CoreManager>,
     logs: Arc<LogHub>,
     auth: Arc<Authorizer>,
+    config: DaemonConfig,
 }
 
 async fn serve(stream: UnixStream, ctx: Arc<Ctx>) {
@@ -175,7 +180,9 @@ async fn serve_client(stream: UnixStream, ctx: &Ctx) -> Result<()> {
             let mut status = ctx.supervisor.status();
             status.setup_required = ctx.components.setup_required();
             status.components = ctx.components.statuses();
-            return send(&mut write, &Response::Status(status)).await;
+            status.active_core = ctx.cores.active();
+            status.update_in_progress = ctx.cores.busy();
+            return send(&mut write, &Response::Status(Box::new(status))).await;
         }
         Request::Logs { tail, follow } => {
             return stream_logs(reader, write, &ctx.logs, tail, follow).await;
@@ -202,12 +209,207 @@ async fn serve_client(stream: UnixStream, ctx: &Ctx) -> Result<()> {
         Request::Restart => Op::Restart,
         Request::Reload => Op::Reload,
         Request::Check => Op::Check,
-        Request::CheckUpdate => Op::CheckUpdate,
-        Request::Update { tag, force } => Op::Update { tag, force },
+        core_request => {
+            // Adding sources and importing binaries decides what runs as root.
+            let privileged =
+                cred.uid() == 0 || cred.uid() == nix::unistd::Uid::effective().as_raw();
+            tracing::info!(
+                "uid {} requested {}",
+                cred.uid(),
+                request_name(&core_request)
+            );
+            let response = handle_core(ctx, core_request, privileged).await;
+            return send(&mut write, &response).await;
+        }
     };
     tracing::info!("uid {} requested {op:?}", cred.uid());
     let response = ctx.supervisor.request(op).await;
     send(&mut write, &response).await
+}
+
+fn request_name(request: &Request) -> String {
+    let json = serde_json::to_value(request).unwrap_or_default();
+    json.get("cmd")
+        .and_then(|c| c.as_str())
+        .unwrap_or("?")
+        .to_owned()
+}
+
+fn result(response: anyhow::Result<Response>) -> Response {
+    response.unwrap_or_else(|err| Response::error(format!("{err:#}")))
+}
+
+async fn handle_core(ctx: &Ctx, request: Request, privileged: bool) -> Response {
+    let root_only = |what: &str| {
+        Response::error(format!(
+            "{what} requires root: it decides which binary the daemon runs as root (use sudo)"
+        ))
+    };
+    match request {
+        Request::CoreSources => Response::CoreSources {
+            sources: ctx.cores.sources().await,
+            default: ctx.cores.update_target().0,
+        },
+        Request::CoreReleases {
+            source,
+            page,
+            refresh,
+        } => result(
+            ctx.cores
+                .releases(&source, page, refresh)
+                .await
+                .map(Response::CoreReleases),
+        ),
+        Request::CoreInstalled => Response::CoreInstalled {
+            cores: ctx.cores.installed(),
+        },
+        Request::CoreInstall {
+            source,
+            tag,
+            variant,
+            activate,
+            force,
+        } => match ctx.cores.install(&source, &tag, &variant).await {
+            Ok(core) if activate => activate_core(ctx, &core.id, force, true).await,
+            Ok(core) => Response::done(format!(
+                "stored sing-box {} as {} ({})",
+                core.version,
+                core.id,
+                checksum_label(core.checksum)
+            )),
+            Err(err) => Response::error(format!("{err:#}")),
+        },
+        Request::CoreActivate { id, force } => activate_core(ctx, &id, force, true).await,
+        Request::CoreRemove { id } => result(
+            ctx.cores
+                .remove(&id)
+                .map(|()| Response::done(format!("deleted {id}"))),
+        ),
+        Request::CoreSourceAdd { repo, name } => {
+            if !privileged {
+                return root_only("adding a core source");
+            }
+            result(
+                ctx.cores
+                    .add_source(&repo, name)
+                    .await
+                    .map(|s| Response::done(format!("added core source {} ({})", s.id, s.name))),
+            )
+        }
+        Request::CoreSourceRemove { id } => {
+            if !privileged {
+                return root_only("removing a core source");
+            }
+            result(
+                ctx.cores
+                    .remove_source(&id)
+                    .await
+                    .map(|()| Response::done(format!("removed core source {id}"))),
+            )
+        }
+        Request::CoreImport {
+            location,
+            sha256,
+            activate,
+        } => {
+            if !privileged {
+                return root_only("importing a custom core");
+            }
+            match ctx.cores.import(&location, sha256.as_deref()).await {
+                Ok(core) if activate => activate_core(ctx, &core.id, false, true).await,
+                Ok(core) => Response::done(format!(
+                    "stored sing-box {} as {} ({})",
+                    core.version,
+                    core.id,
+                    checksum_label(core.checksum)
+                )),
+                Err(err) => Response::error(format!("{err:#}")),
+            }
+        }
+        Request::CheckUpdate => result(check_update(ctx).await.map(Response::UpdateInfo)),
+        Request::Update { tag, force } => result(update(ctx, tag.as_deref(), force).await),
+        other => Response::error(format!("unexpected request {}", request_name(&other))),
+    }
+}
+
+/// Keeps a hand-placed binary, then lets the supervisor swap the symlink.
+async fn activate_core(ctx: &Ctx, id: &str, force: bool, restart: bool) -> Response {
+    let Some(core) = ctx.cores.load(id) else {
+        return Response::error(format!("no stored core {id}"));
+    };
+    if ctx.cores.active().is_some_and(|active| active.id == id) {
+        return Response::done(format!(
+            "sing-box {} ({id}) is already active",
+            core.version
+        ));
+    }
+    let adopted = match ctx.cores.adopt(&ctx.config.core.binary).await {
+        Ok(adopted) => adopted,
+        Err(err) => {
+            return Response::error(format!("keep the current core before switching: {err:#}"));
+        }
+    };
+    let label = |core: &crate::protocol::StoredCore| {
+        format!(
+            "sing-box {} ({} · {})",
+            core.version,
+            core.source_name,
+            display_variant(&core.variant)
+        )
+    };
+    let fallback = adopted
+        .or_else(|| ctx.cores.active())
+        .filter(|previous| previous.id != core.id)
+        .map(|previous| (ctx.cores.binary_of(&previous), label(&previous)));
+    ctx.supervisor
+        .request(Op::Activate {
+            target: ctx.cores.binary_of(&core),
+            label: label(&core),
+            force,
+            restart,
+            fallback,
+        })
+        .await
+}
+
+async fn check_update(ctx: &Ctx) -> anyhow::Result<UpdateInfo> {
+    let (source, variant) = ctx.cores.update_target();
+    let release = ctx.cores.release(&source, None).await?;
+    let active = ctx.cores.active();
+    Ok(UpdateInfo {
+        current: ctx.supervisor.status().core_version,
+        latest: release.version().to_owned(),
+        tag: release.tag_name.clone(),
+        asset: ctx.cores.asset_for(&release, &variant).unwrap_or_default(),
+        prerelease: release.prerelease,
+        published_at: release.published_at.clone(),
+        update_available: active
+            .is_none_or(|c| c.tag.as_deref() != Some(release.tag_name.as_str())),
+    })
+}
+
+/// `singbox-board update`: newest (or given) release of the active core's
+/// source and variant, stored and switched to.
+async fn update(ctx: &Ctx, tag: Option<&str>, force: bool) -> anyhow::Result<Response> {
+    let (source, variant) = ctx.cores.update_target();
+    let release = ctx.cores.release(&source, tag).await?;
+    let active = ctx.cores.active();
+    let current = active.as_ref().is_some_and(|c| {
+        c.source == source
+            && c.variant == variant
+            && c.tag.as_deref() == Some(release.tag_name.as_str())
+    });
+    if current && !force {
+        return Ok(Response::done(format!(
+            "sing-box {} is already up to date",
+            release.version()
+        )));
+    }
+    let core = ctx
+        .cores
+        .install(&source, &release.tag_name, &variant)
+        .await?;
+    Ok(activate_core(ctx, &core.id, force, ctx.config.update.restart_after_update).await)
 }
 
 async fn stream_logs<R, W>(

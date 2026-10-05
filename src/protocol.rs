@@ -48,6 +48,58 @@ pub enum Request {
         component: Component,
         action: ComponentAction,
     },
+    /// Release sources the core can be installed from.
+    CoreSources,
+    /// One page (1-based) of a source's releases, newest first.
+    CoreReleases {
+        source: String,
+        #[serde(default)]
+        page: u32,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Cores kept in the local version store.
+    CoreInstalled,
+    /// Download a release into the store and optionally switch to it.
+    CoreInstall {
+        source: String,
+        tag: String,
+        #[serde(default)]
+        variant: String,
+        #[serde(default)]
+        activate: bool,
+        /// Switch even if the new core rejects the configuration.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Switch to a stored core.
+    CoreActivate {
+        id: String,
+        #[serde(default)]
+        force: bool,
+    },
+    CoreRemove {
+        id: String,
+    },
+    /// Root only: add a GitHub repository publishing sing-box builds.
+    CoreSourceAdd {
+        repo: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Root only.
+    CoreSourceRemove {
+        id: String,
+    },
+    /// Root only: store a custom core from a local path or an http(s) URL
+    /// (binary, .tar.gz, .zip or .gz).
+    CoreImport {
+        location: String,
+        #[serde(default)]
+        sha256: Option<String>,
+        #[serde(default)]
+        activate: bool,
+    },
 }
 
 /// Optional services the daemon can install and supervise next to sing-box.
@@ -102,11 +154,24 @@ pub enum ComponentAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Status(Status),
-    Done { message: String },
+    Status(Box<Status>),
+    Done {
+        message: String,
+    },
     Log(LogEntry),
     UpdateInfo(UpdateInfo),
-    Error { message: String },
+    CoreSources {
+        sources: Vec<CoreSource>,
+        /// Source `update` follows (the active core's, else daemon.toml's).
+        default: String,
+    },
+    CoreReleases(CoreReleasePage),
+    CoreInstalled {
+        cores: Vec<StoredCore>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 impl Response {
@@ -181,6 +246,86 @@ pub struct Status {
     pub setup_required: bool,
     #[serde(default)]
     pub components: Vec<ComponentStatus>,
+    /// The stored core `binary` points to; `None` for an unmanaged binary.
+    #[serde(default)]
+    pub active_core: Option<StoredCore>,
+}
+
+/// A GitHub repository publishing `sing-box-<version>-linux-<arch>[-<variant>]` archives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreSource {
+    /// `owner/repo`
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
+/// How a download is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Checksum {
+    /// A SHA256SUMS file published with the release.
+    Sums,
+    /// The sha256 digest GitHub records for the asset.
+    Digest,
+    /// Given explicitly (imports).
+    Pinned,
+    /// Nothing to verify against (TLS only).
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreVariant {
+    /// "" is the plain build, otherwise e.g. "ebpf", "glibc", "v3-glibc".
+    pub name: String,
+    pub asset: String,
+    pub size: u64,
+    pub checksum: Checksum,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreRelease {
+    pub tag: String,
+    pub version: String,
+    pub published_at: Option<String>,
+    pub prerelease: bool,
+    /// Builds for this machine's architecture.
+    pub variants: Vec<CoreVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreReleasePage {
+    pub source: String,
+    /// e.g. "linux-amd64"
+    pub platform: String,
+    pub page: u32,
+    pub has_more: bool,
+    pub releases: Vec<CoreRelease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredCore {
+    /// `<source>/<tag>/<variant>` path below the version store.
+    pub id: String,
+    /// `owner/repo`, or "local" for imports.
+    pub source: String,
+    pub source_name: String,
+    /// As reported by `sing-box version`.
+    pub version: String,
+    pub tag: Option<String>,
+    pub variant: String,
+    pub size: u64,
+    pub sha256: String,
+    pub checksum: Checksum,
+    /// Unix seconds.
+    pub installed_at: u64,
+    /// Files unpacked next to the binary (e.g. libcronet.so).
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +389,28 @@ pub struct UpdateInfo {
     pub update_available: bool,
 }
 
+/// Version store id of a release build: `<source>/<tag>/<variant>` with
+/// path-unsafe characters replaced, shared by the daemon and its clients.
+pub fn core_store_id(source: &str, tag: &str, variant: &str) -> String {
+    fn slug(text: &str) -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "._-+".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    let variant = if variant.is_empty() {
+        "default"
+    } else {
+        variant
+    };
+    format!("{}/{}/{}", slug(source), slug(tag), slug(variant))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +453,25 @@ mod tests {
                 http_meta: false
             }
         ));
+    }
+
+    #[test]
+    fn core_wire_format() {
+        let request: Request = serde_json::from_str(
+            r#"{"cmd":"core_install","source":"SagerNet/sing-box","tag":"v1.12.0"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::CoreInstall {
+                activate: false,
+                force: false,
+                ref variant,
+                ..
+            } if variant.is_empty()
+        ));
+        let json = serde_json::to_string(&Checksum::Digest).unwrap();
+        assert_eq!(json, r#""digest""#);
     }
 
     #[test]

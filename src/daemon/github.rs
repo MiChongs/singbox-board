@@ -1,6 +1,7 @@
 //! Downloads from GitHub releases (and other HTTPS sources) shared by the
 //! sing-box updater and the component installer.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -26,9 +27,11 @@ pub struct Release {
 pub struct Asset {
     pub name: String,
     pub browser_download_url: String,
-    /// `sha256:<hex>`, computed by GitHub for every uploaded asset.
+    /// `sha256:<hex>`, computed by GitHub for assets uploaded since mid 2025.
     #[serde(default)]
     pub digest: Option<String>,
+    #[serde(default)]
+    pub size: u64,
 }
 
 impl Release {
@@ -47,9 +50,29 @@ impl Release {
 }
 
 impl Asset {
-    fn sha256(&self) -> Option<&str> {
+    pub fn sha256(&self) -> Option<&str> {
         self.digest.as_deref()?.strip_prefix("sha256:")
     }
+}
+
+/// Parses `sing-box version 1.14.1-xiaobaf14g.1` from `sing-box version` output.
+pub fn parse_version_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sing-box version "))
+        .map(|version| version.trim().to_owned())
+}
+
+/// Parses `SHA256SUMS` lines of the form `<hex> *<file>` or `<hex>  <file>`.
+pub fn parse_sha256sums(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let (hash, name) = line.trim().split_once(char::is_whitespace)?;
+            let name = name.trim_start().trim_start_matches('*');
+            Some((name.to_owned(), hash.to_ascii_lowercase()))
+        })
+        .collect()
 }
 
 pub fn verify_sha256(data: &[u8], expected: &str, name: &str) -> Result<()> {
@@ -142,6 +165,33 @@ impl GitHub {
             .ok_or_else(|| anyhow!("{repo} has no releases"))
     }
 
+    /// One page (1-based) of releases, newest first, drafts removed. The
+    /// second value tells whether another page may follow.
+    pub async fn releases(
+        &self,
+        repo: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<Release>, bool)> {
+        let releases: Vec<Release> = self
+            .api_get(&format!(
+                "/repos/{repo}/releases?per_page={per_page}&page={}",
+                page.max(1)
+            ))
+            .await?;
+        let has_more = releases.len() as u32 == per_page;
+        Ok((
+            releases.into_iter().filter(|r| !r.draft).collect(),
+            has_more,
+        ))
+    }
+
+    /// Fails unless `repo` exists and is reachable.
+    pub async fn check_repo(&self, repo: &str) -> Result<()> {
+        let _: serde_json::Value = self.api_get(&format!("/repos/{repo}")).await?;
+        Ok(())
+    }
+
     /// Downloads an arbitrary URL into memory, refusing bodies over `limit`.
     pub async fn fetch(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
         let response = self
@@ -188,6 +238,22 @@ impl GitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_output() {
+        let out = "sing-box version 1.14.1-xiaobaf14g.1\n\nEnvironment: go1.26.8 linux/amd64\n";
+        assert_eq!(parse_version_output(out).unwrap(), "1.14.1-xiaobaf14g.1");
+        assert!(parse_version_output("garbage").is_none());
+    }
+
+    #[test]
+    fn sha256sums() {
+        let sums = parse_sha256sums(
+            "e18bcc6c *sing-box-1.14.1-linux-amd64.tar.gz\nABCDEF  other.tar.gz\n",
+        );
+        assert_eq!(sums["sing-box-1.14.1-linux-amd64.tar.gz"], "e18bcc6c");
+        assert_eq!(sums["other.tar.gz"], "abcdef");
+    }
 
     #[test]
     fn asset_digest() {

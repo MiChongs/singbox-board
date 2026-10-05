@@ -106,6 +106,86 @@ enum Cmd {
         #[arg(value_enum)]
         action: Option<ComponentAction>,
     },
+    /// Core versions: list releases, install, switch, import custom builds
+    Core {
+        #[command(subcommand)]
+        action: Option<CoreCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoreCmd {
+    /// Release sources (MiChongs, SagerNet and custom repositories)
+    Sources,
+    /// Add or remove a custom GitHub source (root only)
+    Source {
+        #[command(subcommand)]
+        action: SourceCmd,
+    },
+    /// Releases of a source with the builds available for this machine
+    List {
+        /// owner/repo [default: the source `update` follows]
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        page: u32,
+        /// Hide pre-releases
+        #[arg(long)]
+        stable: bool,
+        /// Bypass the 10 minute cache
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Cores in the local version store
+    Installed,
+    /// Download a release into the store and switch to it
+    Install {
+        /// Release tag, e.g. v1.14.1-xiaobaf14g.1
+        tag: String,
+        /// owner/repo [default: the source `update` follows]
+        #[arg(long)]
+        source: Option<String>,
+        /// Build variant, e.g. ebpf, glibc, musl [default: plain build]
+        #[arg(long, default_value = "")]
+        variant: String,
+        /// Only store it, do not switch
+        #[arg(long)]
+        no_switch: bool,
+        /// Switch even if the new core rejects the configuration
+        #[arg(long)]
+        force: bool,
+    },
+    /// Switch to a stored core (id, version or tag)
+    Use {
+        core: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete a stored core (id, version or tag)
+    Remove { core: String },
+    /// Store a custom core from a local file or http(s) URL (root only)
+    Import {
+        /// Absolute path or URL of a binary, .tar.gz, .zip or .gz
+        location: String,
+        /// Expected sha256 of the file
+        #[arg(long)]
+        sha256: Option<String>,
+        #[arg(long)]
+        no_switch: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCmd {
+    /// Add a GitHub repository publishing sing-box-<version>-linux-<arch> archives
+    Add {
+        /// owner/repo
+        repo: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a custom source
+    Remove { repo: String },
 }
 
 fn main() -> ExitCode {
@@ -165,6 +245,18 @@ fn run_daemon(
 }
 
 fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
+    if !matches!(command, Cmd::Tui) {
+        // Behave like other CLI tools in pipes (`singbox-board core | head`):
+        // exit quietly on a closed stdout instead of panicking. The daemon
+        // keeps ignoring SIGPIPE so a vanished client cannot kill it.
+        // SAFETY: resetting a signal disposition before any thread exists.
+        unsafe {
+            let _ = nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGPIPE,
+                nix::sys::signal::SigHandler::SigDfl,
+            );
+        }
+    }
     let socket = socket.unwrap_or_else(default_socket);
     let client = DaemonClient::new(socket);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -186,9 +278,63 @@ fn run_client(socket: Option<PathBuf>, command: Cmd) -> Result<()> {
             Cmd::Component { component, action } => {
                 ctl::component(&client, component, action).await
             }
+            Cmd::Core { action } => run_core(&client, action).await,
             Cmd::Daemon { .. } => unreachable!("handled in main"),
         }
     })
+}
+
+async fn run_core(client: &DaemonClient, action: Option<CoreCmd>) -> Result<()> {
+    match action {
+        None => ctl::core_overview(client).await,
+        Some(CoreCmd::Sources) => ctl::core_sources(client).await,
+        Some(CoreCmd::Source { action }) => match action {
+            SourceCmd::Add { repo, name } => {
+                ctl::command(client, Request::CoreSourceAdd { repo, name }).await
+            }
+            SourceCmd::Remove { repo } => {
+                ctl::command(client, Request::CoreSourceRemove { id: repo }).await
+            }
+        },
+        Some(CoreCmd::List {
+            source,
+            page,
+            stable,
+            refresh,
+        }) => ctl::core_list(client, source, page, stable, refresh).await,
+        Some(CoreCmd::Installed) => ctl::core_installed(client).await,
+        Some(CoreCmd::Install {
+            tag,
+            source,
+            variant,
+            no_switch,
+            force,
+        }) => ctl::core_install(client, tag, source, variant, !no_switch, force).await,
+        Some(CoreCmd::Use { core, force }) => ctl::core_use(client, &core, force).await,
+        Some(CoreCmd::Remove { core }) => ctl::core_remove(client, &core).await,
+        Some(CoreCmd::Import {
+            location,
+            sha256,
+            no_switch,
+        }) => {
+            // The daemon resolves paths itself; make relative ones absolute here.
+            let is_url = location.starts_with("http://") || location.starts_with("https://");
+            let location = match std::fs::canonicalize(&location) {
+                Ok(path) if !is_url => path.display().to_string(),
+                _ => location,
+            };
+            eprintln!("storing the custom core, this may take a while…");
+            ctl::command(
+                client,
+                Request::CoreImport {
+                    location,
+                    sha256,
+                    activate: !no_switch,
+                },
+            )
+            .await
+        }
+    }
 }
 
 /// Clients follow a readable daemon.toml so a custom socket path just works.
