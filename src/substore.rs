@@ -7,6 +7,8 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::i18n::fl;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Subscription,
@@ -14,10 +16,10 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            EntryKind::Subscription => "sub",
-            EntryKind::Collection => "collection",
+            EntryKind::Subscription => fl!("entry-subscription"),
+            EntryKind::Collection => fl!("entry-collection"),
         }
     }
 }
@@ -89,7 +91,7 @@ impl SubStoreClient {
     /// `api` is the backend base including the secret path, from the daemon status.
     pub fn new(api: &str) -> Result<Self> {
         crate::util::init_tls();
-        let base = Url::parse(api).with_context(|| format!("invalid Sub-Store URL {api}"))?;
+        let base = Url::parse(api).with_context(|| fl!("err-sub-store-url", url = api))?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(3))
@@ -116,10 +118,10 @@ impl SubStoreClient {
             .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("GET {}", url.path()))?
+            .with_context(|| fl!("err-request", url = url.path()))?
             .json()
             .await
-            .with_context(|| format!("decode {}", url.path()))?;
+            .with_context(|| fl!("err-decode", url = url.path()))?;
         match envelope.data {
             Some(data) if envelope.status == "success" => Ok(data),
             _ => bail!(
@@ -178,6 +180,7 @@ impl SubStoreClient {
 pub fn provider_snippet(tag: &str, url: &str) -> String {
     let tag = serde_json::to_string(tag).unwrap_or_default();
     let url = serde_json::to_string(url).unwrap_or_default();
+    let comment = fl!("snippet-group-comment");
     format!(
         r#"{{
   "providers": [
@@ -194,7 +197,7 @@ pub fn provider_snippet(tag: &str, url: &str) -> String {
     }}
   ]
 }}
-// Use the nodes in a group, e.g.
+// {comment}
 // {{ "type": "urltest", "tag": "auto", "providers": [{tag}] }}"#
     )
 }

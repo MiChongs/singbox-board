@@ -8,8 +8,10 @@ use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use crate::i18n::{self, fl};
 use crate::protocol::{
-    CoreReleasePage, CoreSource, LogEntry, Request, Response, Status, StoredCore, UpdateInfo,
+    CoreReleasePage, CoreSource, Envelope, LogEntry, Request, Response, Status, StoredCore,
+    UpdateInfo,
 };
 
 #[derive(Debug, Clone)]
@@ -30,31 +32,36 @@ impl DaemonClient {
         let mut stream = UnixStream::connect(&self.socket)
             .await
             .map_err(|err| self.connect_error(err))?;
-        let mut line = serde_json::to_vec(request)?;
+        // Replies come back in the language of this client.
+        let envelope = Envelope {
+            request: request.clone(),
+            lang: Some(i18n::current().tag().to_owned()),
+        };
+        let mut line = serde_json::to_vec(&envelope)?;
         line.push(b'\n');
         stream.write_all(&line).await?;
         Ok(BufReader::new(stream))
     }
 
     fn connect_error(&self, err: io::Error) -> anyhow::Error {
-        let socket = self.socket.display();
+        let socket = self.socket.display().to_string();
         match err.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => anyhow!(
-                "daemon is not running (no socket at {socket}); \
-                 start it with `systemctl start singbox-board` or `sudo singbox-board daemon`"
-            ),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                anyhow!(fl!("client-daemon-not-running", socket = socket))
+            }
             io::ErrorKind::PermissionDenied => match stale_session_group(&self.socket) {
-                Some(group) => anyhow!(
-                    "permission denied on {socket}: you are in the `{group}` group, but this \
-                     login session started before you were added. Run `newgrp {group}` (or \
-                     `sg {group} -c singbox-board`), or log out and back in"
-                ),
-                None => anyhow!(
-                    "permission denied on {socket}; run as root or join the socket group \
-                     (`sudo usermod -aG singbox-board $USER`, then log in again)"
-                ),
+                Some(group) => anyhow!(fl!(
+                    "client-permission-stale-group",
+                    socket = socket,
+                    group = group
+                )),
+                None => anyhow!(fl!("client-permission-denied", socket = socket)),
             },
-            _ => anyhow!("connect {socket}: {err}"),
+            _ => anyhow!(fl!(
+                "client-connect-failed",
+                socket = socket,
+                error = err.to_string()
+            )),
         }
     }
 
@@ -65,7 +72,7 @@ impl DaemonClient {
             let mut reader = self.open(&request).await?;
             let mut line = String::new();
             if reader.read_line(&mut line).await? == 0 {
-                bail!("daemon closed the connection");
+                bail!(fl!("client-connection-closed"));
             }
             match serde_json::from_str(&line)? {
                 Response::Error { message } => Err(anyhow!(message)),
@@ -74,7 +81,7 @@ impl DaemonClient {
         };
         tokio::time::timeout(limit, exchange)
             .await
-            .map_err(|_| anyhow!("daemon did not answer within {}s", limit.as_secs()))?
+            .map_err(|_| anyhow!(fl!("client-timeout", seconds = limit.as_secs())))?
     }
 
     pub async fn status(&self) -> Result<Status> {
@@ -195,5 +202,8 @@ fn timeout_for(request: &Request) -> Duration {
 }
 
 fn unexpected(response: &Response) -> anyhow::Error {
-    anyhow!("unexpected response from daemon: {response:?}")
+    anyhow!(fl!(
+        "client-unexpected-response",
+        response = format!("{response:?}")
+    ))
 }

@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::UpdateConfig;
+use crate::i18n::{fl, fl_log};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
@@ -44,8 +45,13 @@ impl Release {
     }
 
     pub fn require(&self, name: &str) -> Result<&Asset> {
-        self.asset(name)
-            .ok_or_else(|| anyhow!("release {} has no asset {name}", self.tag_name))
+        self.asset(name).ok_or_else(|| {
+            anyhow!(fl!(
+                "github-no-asset",
+                tag = self.tag_name.clone(),
+                name = name
+            ))
+        })
     }
 }
 
@@ -79,7 +85,12 @@ pub fn verify_sha256(data: &[u8], expected: &str, name: &str) -> Result<()> {
     let actual = hex::encode(Sha256::digest(data));
     ensure!(
         actual.eq_ignore_ascii_case(expected),
-        "checksum mismatch for {name}: expected {expected}, got {actual}"
+        fl!(
+            "err-checksum-mismatch",
+            name = name,
+            expected = expected,
+            actual = actual.clone()
+        )
     );
     Ok(())
 }
@@ -101,7 +112,7 @@ impl GitHub {
             .read_timeout(Duration::from_secs(60));
         builder = match config.proxy.as_deref().filter(|p| !p.is_empty()) {
             Some(proxy) => {
-                builder.proxy(reqwest::Proxy::all(proxy).context("invalid update.proxy")?)
+                builder.proxy(reqwest::Proxy::all(proxy).context(fl!("github-invalid-proxy"))?)
             }
             None => builder.no_proxy(),
         };
@@ -124,19 +135,24 @@ impl GitHub {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await.with_context(|| format!("GET {url}"))?;
+        let response = request
+            .send()
+            .await
+            .with_context(|| fl!("err-request", url = url.clone()))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!(
-                "GET {url}: HTTP {status}: {}",
-                body.chars().take(200).collect::<String>()
-            );
+            bail!(fl!(
+                "github-http-error",
+                url = url,
+                status = status.to_string(),
+                body = body.chars().take(200).collect::<String>()
+            ));
         }
         response
             .json()
             .await
-            .with_context(|| format!("decode {url}"))
+            .with_context(|| fl!("err-decode", url = url.clone()))
     }
 
     /// A release by exact tag, or the newest one (optionally including pre-releases).
@@ -162,7 +178,7 @@ impl GitHub {
         releases
             .into_iter()
             .find(|release| !release.draft)
-            .ok_or_else(|| anyhow!("{repo} has no releases"))
+            .ok_or_else(|| anyhow!(fl!("github-no-releases", repo = repo)))
     }
 
     /// One page (1-based) of releases, newest first, drafts removed. The
@@ -199,16 +215,20 @@ impl GitHub {
             .get(url)
             .send()
             .await
-            .with_context(|| format!("GET {url}"))?
+            .with_context(|| fl!("err-request", url = url))?
             .error_for_status()
-            .with_context(|| format!("GET {url}"))?;
+            .with_context(|| fl!("err-request", url = url))?;
         let mut data = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("download {url}"))?;
+            let chunk = chunk.with_context(|| fl!("err-download", url = url))?;
             ensure!(
                 data.len() + chunk.len() <= limit,
-                "{url} is larger than {limit} bytes"
+                fl!(
+                    "err-too-large",
+                    url = url,
+                    limit = crate::util::fmt_bytes(limit as u64)
+                )
             );
             data.extend_from_slice(&chunk);
         }
@@ -229,7 +249,7 @@ impl GitHub {
         let data = self.fetch(&url, limit).await?;
         match asset.sha256() {
             Some(expected) => verify_sha256(&data, expected, &asset.name)?,
-            None => tracing::warn!("GitHub published no digest for {}", asset.name),
+            None => tracing::warn!("{}", fl_log!("github-no-digest", name = asset.name.clone())),
         }
         Ok(data)
     }

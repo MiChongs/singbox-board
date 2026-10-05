@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use unicode_width::UnicodeWidthStr;
+
+use crate::i18n::fl;
 
 /// Installs the process-wide rustls crypto provider (idempotent).
 pub fn init_tls() {
@@ -47,7 +50,11 @@ pub fn fmt_duration(secs: u64) -> String {
     let minutes = secs % 3_600 / 60;
     let seconds = secs % 60;
     if days > 0 {
-        format!("{days}d {hours:02}:{minutes:02}:{seconds:02}")
+        fl!(
+            "duration-days",
+            days = days,
+            clock = format!("{hours:02}:{minutes:02}:{seconds:02}")
+        )
     } else if hours > 0 {
         format!("{hours:02}:{minutes:02}:{seconds:02}")
     } else {
@@ -62,6 +69,37 @@ pub fn fmt_clock(unix_ms: u64) -> String {
         Some(time) => time.format("%H:%M:%S").to_string(),
         None => "--:--:--".to_owned(),
     }
+}
+
+/// An error and its causes, joined like `{:#}` but with the separator of the
+/// current language.
+pub fn error_chain(err: &anyhow::Error) -> String {
+    let separator = fl!("chain-separator");
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(&separator)
+}
+
+/// Joins list items with the separator of the current language.
+pub fn join_list<S: AsRef<str>>(items: &[S]) -> String {
+    let separator = fl!("list-separator");
+    items
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(&separator)
+}
+
+/// Width of `text` in terminal columns; CJK characters take two.
+pub fn text_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Pads `text` with spaces to `width` terminal columns.
+pub fn pad(text: &str, width: usize) -> String {
+    let fill = width.saturating_sub(text_width(text));
+    format!("{text}{}", " ".repeat(fill))
 }
 
 /// Removes ANSI escape sequences (CSI and OSC) from a line of terminal output.
@@ -115,11 +153,12 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         .create_new(true)
         .mode(mode)
         .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
+        .with_context(|| fl!("err-create", path = tmp.display().to_string()))?;
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path).with_context(|| format!("move {} into place", path.display()))
+    std::fs::rename(&tmp, path)
+        .with_context(|| fl!("err-replace", path = path.display().to_string()))
 }
 
 /// Alphanumeric token from the kernel CSPRNG.
@@ -155,6 +194,13 @@ mod tests {
         assert_eq!(fmt_duration(5), "00:05");
         assert_eq!(fmt_duration(3_725), "01:02:05");
         assert_eq!(fmt_duration(90_061), "1d 01:01:01");
+    }
+
+    #[test]
+    fn padding_counts_columns() {
+        assert_eq!(pad("ab", 4), "ab  ");
+        assert_eq!(pad("版本", 6), "版本  ");
+        assert_eq!(pad("toolong", 3), "toolong");
     }
 
     #[test]

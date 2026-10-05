@@ -24,7 +24,9 @@ use super::github::GitHub;
 use super::logs::LogHub;
 use super::service::{Service, ServiceHandle, ServiceSpec};
 use crate::config::DaemonConfig;
+use crate::i18n::{self, Lang, fl, fl_log};
 use crate::protocol::{Component, ComponentAction, ComponentStatus, Response};
+use crate::util::error_chain;
 
 /// What the manager knows about a component besides its process state.
 #[derive(Debug, Clone, Default)]
@@ -43,15 +45,18 @@ struct Info {
     entries: HashMap<Component, Entry>,
 }
 
+/// Requests carry the language their answer is written in.
 enum Msg {
     Setup {
         sub_store: bool,
         http_meta: bool,
+        lang: Lang,
         reply: oneshot::Sender<Response>,
     },
     Action {
         component: Component,
         action: ComponentAction,
+        lang: Lang,
         reply: oneshot::Sender<Response>,
     },
 }
@@ -110,6 +115,7 @@ impl ComponentsHandle {
             Msg::Setup {
                 sub_store,
                 http_meta,
+                lang: i18n::current(),
                 reply,
             },
             rx,
@@ -123,6 +129,7 @@ impl ComponentsHandle {
             Msg::Action {
                 component,
                 action,
+                lang: i18n::current(),
                 reply,
             },
             rx,
@@ -132,10 +139,10 @@ impl ComponentsHandle {
 
     async fn send(&self, msg: Msg, rx: oneshot::Receiver<Response>) -> Response {
         if self.tx.send(msg).await.is_err() {
-            return Response::error("daemon is shutting down");
+            return Response::error(fl!("daemon-shutting-down"));
         }
         rx.await
-            .unwrap_or_else(|_| Response::error("daemon is shutting down"))
+            .unwrap_or_else(|_| Response::error(fl!("daemon-shutting-down")))
     }
 
     /// Stops all component processes, even while the manager is busy installing.
@@ -163,7 +170,7 @@ struct Manager {
 pub fn spawn(config: DaemonConfig, logs: Arc<LogHub>) -> ComponentsHandle {
     let layout = Layout::new(config.components.data_dir.clone());
     let state = State::load(&layout.state()).unwrap_or_else(|err| {
-        logs.warn(format!("{err:#}; starting with empty component state"));
+        logs.warn(fl_log!("components-state-reset", error = error_chain(&err)));
         State::default()
     });
     let services: HashMap<Component, ServiceHandle> = Component::ALL
@@ -205,16 +212,17 @@ pub fn spawn(config: DaemonConfig, logs: Arc<LogHub>) -> ComponentsHandle {
 impl Manager {
     async fn run(mut self) {
         if !self.state.setup_done {
-            self.logs.info(
-                "optional components not configured yet; answer the first-run question in the TUI or run `singbox-board setup`",
-            );
+            self.logs.info(fl_log!("components-setup-pending"));
         }
         for component in Component::ALL {
             if self.state.enabled(component)
                 && let Err(err) = self.ensure_running(component).await
             {
-                self.logs
-                    .warn(format!("{} failed to start: {err:#}", component.title()));
+                self.logs.warn(fl_log!(
+                    "components-start-failed",
+                    name = component.title(),
+                    error = error_chain(&err)
+                ));
             }
         }
         self.started_tx.send_replace(true);
@@ -223,19 +231,21 @@ impl Manager {
                 Msg::Setup {
                     sub_store,
                     http_meta,
+                    lang,
                     reply,
                 } => {
-                    let response = self.setup(sub_store, http_meta).await;
+                    let response = i18n::scope(lang, self.setup(sub_store, http_meta)).await;
                     let _ = reply.send(response);
                 }
                 Msg::Action {
                     component,
                     action,
+                    lang,
                     reply,
                 } => {
-                    let response = match self.action(component, action).await {
+                    let response = match i18n::scope(lang, self.action(component, action)).await {
                         Ok(message) => Response::done(message),
-                        Err(err) => Response::error(format!("{err:#}")),
+                        Err(err) => Response::error(error_chain(&err)),
                     };
                     let _ = reply.send(response);
                 }
@@ -310,13 +320,13 @@ impl Manager {
         self.state.set_enabled(Component::SubStore, sub_store);
         self.state.set_enabled(Component::HttpMeta, http_meta);
         if let Err(err) = self.save() {
-            return Response::error(format!("{err:#}"));
+            return Response::error(error_chain(&err));
         }
         self.publish();
-        self.logs.info(format!(
-            "setup: Sub-Store {}, http-meta {}",
-            on_off(sub_store),
-            on_off(http_meta)
+        self.logs.info(fl_log!(
+            "components-setup-log",
+            sub_store = yes_no(sub_store),
+            http_meta = yes_no(http_meta)
         ));
         let mut lines = Vec::new();
         let mut failed = false;
@@ -326,12 +336,16 @@ impl Manager {
                     Ok(()) => lines.push(self.describe(component)),
                     Err(err) => {
                         failed = true;
-                        lines.push(format!("{}: {err:#}", component.title()));
+                        lines.push(fl!(
+                            "components-line-error",
+                            name = component.title(),
+                            error = error_chain(&err)
+                        ));
                     }
                 }
             } else {
                 self.services[&component].stop().await;
-                lines.push(format!("{}: disabled", component.title()));
+                lines.push(fl!("components-line-disabled", name = component.title()));
             }
         }
         let message = lines.join("\n");
@@ -347,17 +361,18 @@ impl Manager {
         match action {
             ComponentAction::Start | ComponentAction::Restart => {
                 if !self.state.enabled(component) {
-                    bail!(
-                        "{title} is disabled; enable it with `singbox-board component {} enable`",
-                        component.name()
-                    );
+                    bail!(fl!(
+                        "components-disabled",
+                        name = title,
+                        id = component.name()
+                    ));
                 }
                 self.ensure_running(component).await?;
                 Ok(self.describe(component))
             }
             ComponentAction::Stop => Ok(match self.services[&component].stop().await {
-                Some(exit) => format!("{title} stopped ({exit})"),
-                None => format!("{title} is not running"),
+                Some(exit) => fl!("components-stopped", name = title, exit = exit),
+                None => fl!("components-not-running", name = title),
             }),
             ComponentAction::Enable => {
                 self.state.setup_done = true;
@@ -372,18 +387,22 @@ impl Manager {
                 self.save()?;
                 self.publish();
                 self.services[&component].stop().await;
-                Ok(format!("{title} disabled"))
+                Ok(fl!("components-disabled-done", name = title))
             }
             ComponentAction::Update => {
                 let changed = self.install(component, "updating").await?;
                 let running = self.services[&component].runtime().pid.is_some();
                 if !changed {
-                    return Ok(format!("{title} is up to date"));
+                    return Ok(fl!("up-to-date", name = title));
                 }
                 if running {
                     self.ensure_running(component).await?;
                 }
-                Ok(format!("{title} updated\n{}", self.describe(component)))
+                Ok(format!(
+                    "{}\n{}",
+                    fl!("components-updated", name = title),
+                    self.describe(component)
+                ))
             }
         }
     }
@@ -405,7 +424,8 @@ impl Manager {
         self.busy.remove(&component);
         let saved = self.save();
         self.publish();
-        let changed = result.with_context(|| format!("install {}", component.title()))?;
+        let changed =
+            result.with_context(|| fl!("components-install-failed", name = component.title()))?;
         saved?;
         Ok(changed)
     }
@@ -422,10 +442,11 @@ impl Manager {
         };
         let address = format!("{}:{port}", local_host(host));
         if !wait_for_port(&address, READY_TIMEOUT).await {
-            self.logs.warn(format!(
-                "{} is running but {address} did not accept connections within {}s",
-                component.title(),
-                READY_TIMEOUT.as_secs()
+            self.logs.warn(fl_log!(
+                "components-not-ready",
+                name = component.title(),
+                address = address.clone(),
+                seconds = READY_TIMEOUT.as_secs()
             ));
         }
         Ok(())
@@ -520,7 +541,7 @@ impl Manager {
             return Ok(None);
         }
         let user = User::from_name(name)?
-            .ok_or_else(|| anyhow!("user {name:?} does not exist; set components.run_as"))?;
+            .ok_or_else(|| anyhow!(fl!("components-user-missing", user = name)))?;
         Ok(Some((user.uid.as_raw(), user.gid.as_raw())))
     }
 
@@ -533,11 +554,16 @@ impl Manager {
             .and_then(|e| e.url.clone())
             .unwrap_or_default();
         match runtime.pid {
-            Some(pid) => format!("{} running (pid {pid}) at {url}", component.title()),
-            None => format!(
-                "{} {}",
-                component.title(),
-                runtime.state.label().to_lowercase()
+            Some(pid) => fl!(
+                "components-running",
+                name = component.title(),
+                pid = pid.to_string(),
+                url = url
+            ),
+            None => fl!(
+                "components-state",
+                name = component.title(),
+                state = runtime.state.key()
             ),
         }
     }
@@ -549,8 +575,9 @@ fn insert(map: &mut BTreeMap<String, String>, key: &str, value: &Option<String>)
     }
 }
 
-fn on_off(enabled: bool) -> &'static str {
-    if enabled { "enabled" } else { "disabled" }
+/// Selector value for messages that phrase a yes/no choice.
+fn yes_no(enabled: bool) -> &'static str {
+    if enabled { "yes" } else { "no" }
 }
 
 fn path_str(path: &Path) -> String {
@@ -568,10 +595,11 @@ fn merge_env(base: Vec<(&str, String)>, extra: &BTreeMap<String, String>) -> Vec
 
 /// Creates a directory the service user can write to.
 fn writable_dir(dir: &Path, user: Option<(u32, u32)>) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let shown = || dir.display().to_string();
+    std::fs::create_dir_all(dir).with_context(|| fl!("err-create", path = shown()))?;
     if let Some((uid, gid)) = user {
         chown(dir, Some(uid.into()), Some(gid.into()))
-            .with_context(|| format!("chown {}", dir.display()))?;
+            .with_context(|| fl!("err-chown", path = shown()))?;
     }
     Ok(())
 }

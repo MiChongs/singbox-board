@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::daemon::github::Asset;
+use crate::i18n::fl;
+use crate::util::fmt_bytes;
 
 const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 const ARCHIVE_SUFFIXES: [&str; 4] = [".tar.gz", ".tgz", ".zip", ".gz"];
@@ -113,12 +115,16 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
             return Ok(());
         }
         let path = dir.join(file_name);
-        let mut out =
-            std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        let mut out = std::fs::File::create(&path)
+            .with_context(|| fl!("err-create", path = path.display().to_string()))?;
         let copied = std::io::copy(&mut reader.take(MAX_UNPACKED_BYTES - total + 1), &mut out)?;
         total += copied;
         if total > MAX_UNPACKED_BYTES {
-            bail!("{name} unpacks to more than {MAX_UNPACKED_BYTES} bytes");
+            bail!(fl!(
+                "archive-too-large",
+                name = name,
+                limit = fmt_bytes(MAX_UNPACKED_BYTES)
+            ));
         }
         let mode = if executable { 0o755 } else { 0o644 };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
@@ -129,7 +135,7 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
     match detect(name, data) {
         Format::TarGz => {
             let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(data));
-            for entry in archive.entries().context("read archive")? {
+            for entry in archive.entries().context(fl!("archive-read-failed"))? {
                 let mut entry = entry?;
                 if !entry.header().entry_type().is_file() {
                     continue;
@@ -141,7 +147,8 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
             }
         }
         Format::Zip => {
-            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).context("open zip")?;
+            let mut zip =
+                zip::ZipArchive::new(std::io::Cursor::new(data)).context(fl!("err-open-zip"))?;
             for i in 0..zip.len() {
                 let mut file = zip.by_index(i)?;
                 if file.is_dir() {
@@ -174,7 +181,7 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
         .or_else(|| files.iter().find(|(n, _)| is_elf(&dir.join(n))))
         .map(|(n, _)| n.clone());
     let Some(main) = main else {
-        bail!("{name} does not contain a sing-box executable");
+        bail!(fl!("archive-no-binary", name = name));
     };
     if main != "sing-box" {
         std::fs::rename(dir.join(&main), dir.join("sing-box"))?;

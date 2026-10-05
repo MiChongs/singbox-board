@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 use super::logs::LogHub;
+use crate::i18n::fl;
 use crate::protocol::LogSource;
 use crate::util::strip_ansi;
 
@@ -62,17 +63,18 @@ pub fn pipe_to_logs<R: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+/// How a process ended, in the current language.
 pub fn describe(status: &io::Result<ExitStatus>) -> String {
     match status {
         Ok(status) => match (status.code(), status.signal()) {
-            (Some(code), _) => format!("exit code {code}"),
+            (Some(code), _) => fl!("exit-code", code = code),
             (None, Some(signal)) => match Signal::try_from(signal) {
-                Ok(signal) => format!("killed by {}", signal.as_str()),
-                Err(_) => format!("killed by signal {signal}"),
+                Ok(signal) => fl!("exit-signal", signal = signal.as_str()),
+                Err(_) => fl!("exit-signal", signal = signal.to_string()),
             },
-            _ => "unknown exit status".to_owned(),
+            _ => fl!("exit-unknown"),
         },
-        Err(err) => format!("wait failed: {err}"),
+        Err(err) => fl!("exit-wait-failed", error = err.to_string()),
     }
 }
 

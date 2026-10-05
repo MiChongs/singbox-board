@@ -8,6 +8,7 @@ use reqwest::{Method, RequestBuilder, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::i18n::fl;
 use crate::protocol::ClashApi;
 
 pub const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -139,8 +140,8 @@ struct ErrorResponse {
 
 impl ClashClient {
     pub fn new(api: &ClashApi) -> Result<Self> {
-        let base =
-            Url::parse(&api.url).with_context(|| format!("invalid Clash API url {}", api.url))?;
+        let base = Url::parse(&api.url)
+            .with_context(|| fl!("err-clash-api-url", url = api.url.clone()))?;
         crate::util::init_tls();
         let http = reqwest::Client::builder()
             // The controller is local; never route it through a proxy.

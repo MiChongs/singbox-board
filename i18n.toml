@@ -1,0 +1,10 @@
+# Localization (Project Fluent, loaded through i18n-embed). Messages live in
+# i18n/<language>/singbox-board.ftl; `en` is the reference every other
+# language is checked against.
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"
+# Message file name (i18n/<language>/<domain>.ftl), shared by the runtime
+# loader and the compile-time checks of fl!().
+domain = "singbox-board"

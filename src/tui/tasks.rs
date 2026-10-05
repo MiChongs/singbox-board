@@ -11,6 +11,7 @@ use crate::clash::ClashClient;
 use crate::client::DaemonClient;
 use crate::protocol::ClashApi;
 use crate::substore::SubStoreClient;
+use crate::util::error_chain;
 
 pub type EventTx = mpsc::UnboundedSender<AppEvent>;
 
@@ -57,7 +58,7 @@ async fn poll_sub_store(
             match SubStoreClient::new(&wanted) {
                 Ok(client) => current = Some((wanted, client)),
                 Err(err) => {
-                    let _ = tx.send(AppEvent::SubStore(Err(format!("{err:#}"))));
+                    let _ = tx.send(AppEvent::SubStore(Err(error_chain(&err))));
                     continue;
                 }
             }
@@ -65,7 +66,7 @@ async fn poll_sub_store(
         let Some((_, client)) = &current else {
             continue;
         };
-        let result = client.overview().await.map_err(|err| format!("{err:#}"));
+        let result = client.overview().await.map_err(|err| error_chain(&err));
         if tx.send(AppEvent::SubStore(result)).is_err() {
             return;
         }
@@ -80,7 +81,7 @@ async fn poll_status(client: DaemonClient, tx: EventTx) {
             .status()
             .await
             .map(Box::new)
-            .map_err(|err| format!("{err:#}"));
+            .map_err(|err| error_chain(&err));
         if tx.send(AppEvent::Status(result)).is_err() {
             return;
         }
@@ -137,7 +138,7 @@ async fn poll_clash(tx: EventTx, mut api: watch::Receiver<Option<ClashApi>>, ref
                     full = true;
                 }
                 Err(err) => {
-                    let _ = tx.send(AppEvent::ClashError(format!("{err:#}")));
+                    let _ = tx.send(AppEvent::ClashError(error_chain(&err)));
                     continue;
                 }
             }
@@ -149,7 +150,7 @@ async fn poll_clash(tx: EventTx, mut api: watch::Receiver<Option<ClashApi>>, ref
         let ok = result.is_ok();
         let event = match result {
             Ok(connections) => AppEvent::Connections(connections),
-            Err(err) => AppEvent::ClashError(format!("{err:#}")),
+            Err(err) => AppEvent::ClashError(error_chain(&err)),
         };
         if tx.send(event).is_err() {
             return;

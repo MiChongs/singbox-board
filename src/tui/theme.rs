@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Padding};
 
 use crate::protocol::CoreState;
+use crate::util::pad;
 
 pub const TEXT: Color = Color::Rgb(205, 214, 244);
 pub const SUBTEXT: Color = Color::Rgb(166, 173, 200);
@@ -107,12 +108,14 @@ pub fn header_row() -> Style {
     Style::new().fg(SUBTEXT).add_modifier(Modifier::BOLD)
 }
 
+/// Label cell of a key/value card, padded to `width` columns.
+pub fn label(text: &str, width: usize) -> Span<'static> {
+    Span::styled(pad(text, width), Style::new().fg(DIM))
+}
+
 /// `label  value` line for key/value cards.
-pub fn field(label: &str, width: usize, value: impl Into<Span<'static>>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<width$}"), Style::new().fg(DIM)),
-        value.into(),
-    ])
+pub fn field(text: &str, width: usize, value: impl Into<Span<'static>>) -> Line<'static> {
+    Line::from(vec![label(text, width), value.into()])
 }
 
 /// Delay in milliseconds coloured by quality.

@@ -116,6 +116,21 @@ singbox-board component http-meta update    # start|stop|restart|enable|disable|
 
 `systemctl reload singbox-board` 与 `singbox-board reload` 等价。
 
+### 界面语言
+
+命令行、TUI 与守护进程日志均提供简体中文与英文两种语言，基于 Mozilla Project Fluent（通过 `i18n-embed` 加载）实现，文案位于 `i18n/<语言>/singbox-board.ftl`，编译时嵌入程序。
+
+- 客户端（TUI 与命令行）依次读取 `--lang` 参数、环境变量 `SINGBOX_BOARD_LANG` 与系统区域设置（`LANGUAGE`、`LC_ALL`、`LC_MESSAGES`、`LANG`）确定语言，可选值为 `zh-CN` 与 `en`，其他区域设置使用英文。
+- 守护进程按发起请求的客户端所用语言返回结果，同一守护进程可同时服务使用不同语言的用户。
+- 守护进程自身的日志（journald 与 TUI 日志页）使用 `daemon.toml` 中的 `language` 设置，默认值 `auto` 表示跟随服务的区域设置。
+
+```bash
+singbox-board --lang zh-CN status
+SINGBOX_BOARD_LANG=en singbox-board
+```
+
+如需新增语言，请将 `i18n/en/singbox-board.ftl` 复制到新的语言目录后翻译，并在 `src/i18n.rs` 的 `Lang` 中登记。`cargo test` 会核对各语言的消息 ID 与参数是否与英文一致，并拒绝间隔号、破折号等装饰性符号。
+
 ### TUI 按键
 
 | 按键 | 功能 |
@@ -178,7 +193,7 @@ singbox-board component http-meta update    # start|stop|restart|enable|disable|
 | Sub-Store 前端 | `sub-store-org/Sub-Store-Front-End` 的 `dist.zip` | GitHub 资源 sha256 摘要 | 由后端托管（合并模式，单端口） |
 | http-meta | `xream/http-meta` 的 `http-meta.bundle.js`、`tpl.yaml` | GitHub 资源 sha256 摘要 | `node http-meta.bundle.js` |
 | mihomo | `MetaCubeX/mihomo`，按架构选择 `.gz` | GitHub 资源 sha256 摘要 | 由 http-meta 按需启动 |
-| Node.js | 系统 `node`（v22 及以上）；没有时下载官方 LTS | `SHASUMS256.txt` | — |
+| Node.js | 系统 `node`（v22 及以上）；没有时下载官方 LTS | `SHASUMS256.txt` | 无 |
 
 - 文件位于 `/var/lib/singbox-board/{sub-store,http-meta,runtime}`。组件以 `components.run_as` 指定的用户运行（默认 `nobody`），只对各自的数据目录有写权限。
 - Sub-Store 采用合并模式：前端和后端共用 `127.0.0.1:3001`，后端 API 位于首次启用时生成的随机路径下（相当于访问密钥，因为 Sub-Store 本身没有鉴权），不带该路径访问会返回 404。Web 界面地址形如 `http://127.0.0.1:3001/?api=http://127.0.0.1:3001/<密钥>`，可在 `singbox-board component sub-store` 或 TUI 中查看。
@@ -217,6 +232,7 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 
 | 键 | 说明 |
 |---|---|
+| `language` | 守护进程日志的语言：`auto`（跟随区域设置）、`zh-CN` 或 `en`；对客户端请求的回复使用客户端自身的语言 |
 | `socket_group` | 允许使用控制 socket 的用户组。组存在时 socket 为 `0660 root:<组>`，否则为 `0600` |
 | `core.binary` / `core.config` / `core.config_dir` / `core.working_dir` | 对应 sing-box 的二进制路径以及 `-c` / `-C` / `-D` 参数 |
 | `core.check_before_start` | 每次启动、重启、重载前先运行 `sing-box check`；校验失败时保留正在运行的实例 |

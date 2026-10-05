@@ -7,16 +7,18 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, Wrap};
 
 use super::app::{App, Focus, Popup, StoreFocus, Tab};
-use super::core::{self as core_view, InputPurpose, variant_label};
+use super::core::{self as core_view, InputPurpose};
 use super::theme::{
     ACCENT, BLUE, CRUST, DIM, DOWN, GREEN, MARK, RED, SKY, SPINNER, SUBTEXT, SURFACE, TEXT, UP,
-    YELLOW, chip, delay_color, dim, field, header_row, key, panel, pill, selected, state_color,
-    state_pill,
+    YELLOW, chip, delay_color, dim, field, header_row, key, label, panel, pill, selected,
+    state_color, state_pill,
 };
+use crate::i18n::fl;
 use crate::protocol::{
-    Component, ComponentAction, ComponentStatus, CoreState, LogEntry, LogSource,
+    Component, ComponentAction, ComponentStatus, CoreState, LogEntry, LogSource, variant_label,
+    version_label,
 };
-use crate::util::{fmt_bytes, fmt_clock, fmt_duration, fmt_speed, now_unix};
+use crate::util::{fmt_bytes, fmt_clock, fmt_duration, fmt_speed, join_list, now_unix, text_width};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, tabs, body, footer] = Layout::vertical([
@@ -43,8 +45,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Popup::Help) => draw_help(frame),
         Some(Popup::Confirm { message, .. }) => draw_confirm(frame, message),
         Some(Popup::Message {
-            title, body, error, ..
-        }) => draw_message(frame, title, body, *error),
+            title,
+            body,
+            error,
+            copy,
+        }) => draw_message(frame, title, body, *error, copy.is_some()),
         Some(Popup::Setup { sub_store }) => draw_setup(frame, *sub_store),
         Some(Popup::Menu {
             component,
@@ -79,25 +84,23 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 status
                     .core_version
                     .clone()
-                    .unwrap_or_else(|| "not installed".to_owned()),
+                    .unwrap_or_else(|| fl!("not-installed")),
                 Style::new().fg(TEXT).bold(),
             ));
             if let Some(core) = &status.active_core {
                 left.push(dim("  "));
+                left.push(Span::styled(core.source_label(), Style::new().fg(ACCENT)));
+                left.push(dim("  "));
                 left.push(Span::styled(
-                    core.source_name.clone(),
-                    Style::new().fg(ACCENT),
-                ));
-                left.push(dim(" · "));
-                left.push(Span::styled(
-                    variant_label(&core.variant).to_owned(),
+                    variant_label(&core.variant),
                     Style::new().fg(BLUE),
                 ));
             }
             if let Some(started) = status.started_at {
-                left.push(dim(format!(
-                    "  up {}",
-                    fmt_duration(now_unix().saturating_sub(started))
+                left.push(dim("  "));
+                left.push(dim(fl!(
+                    "tui-uptime",
+                    uptime = fmt_duration(now_unix().saturating_sub(started))
                 )));
             }
             if let Some(mode) = app
@@ -111,14 +114,18 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         (None, Some(err)) => left.push(Span::styled(first_line(err), Style::new().fg(RED))),
-        (None, None) => left.push(dim("connecting to daemon…")),
+        (None, None) => left.push(dim(fl!("tui-connecting"))),
     }
     let left = Line::from(left);
     // Right-hand daemon info only when it fits next to the left part.
     let right = app.status.as_ref().map(|status| {
         Line::from(dim(format!(
-            "daemon {} · pid {} ",
-            status.daemon_version, status.daemon_pid
+            "{} ",
+            fl!(
+                "tui-header-daemon",
+                version = status.daemon_version.clone(),
+                pid = status.daemon_pid.to_string()
+            )
         )))
     });
     let right_width = right.as_ref().map_or(0, |r| r.width() as u16);
@@ -153,32 +160,40 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let keys: &[(&str, &str)] = match app.tab {
-        Tab::Proxies => &[
-            ("←→", "focus"),
-            ("⏎", "select"),
-            ("t", "test"),
-            ("T", "test one"),
+    let keys: Vec<(&str, String)> = match app.tab {
+        Tab::Proxies => vec![
+            ("←→", fl!("key-focus")),
+            ("⏎", fl!("key-select")),
+            ("t", fl!("key-test")),
+            ("T", fl!("key-test-one")),
         ],
-        Tab::Connections => &[("↑↓", "move"), ("d", "close"), ("D", "close all")],
-        Tab::Logs => &[("↑↓", "scroll"), ("PgUp/Dn", "page"), ("End", "follow")],
-        Tab::SubStore => &[
-            ("←→", "focus"),
-            ("⏎", "actions"),
-            ("y", "copy URL"),
-            ("w", "web UI"),
+        Tab::Connections => vec![
+            ("↑↓", fl!("key-move")),
+            ("d", fl!("key-close")),
+            ("D", fl!("key-close-all")),
+        ],
+        Tab::Logs => vec![
+            ("↑↓", fl!("key-scroll")),
+            ("PgUp/Dn", fl!("key-page")),
+            ("End", fl!("key-follow")),
+        ],
+        Tab::SubStore => vec![
+            ("←→", fl!("key-focus")),
+            ("⏎", fl!("key-actions")),
+            ("y", fl!("key-copy-url")),
+            ("w", fl!("key-web-ui")),
         ],
         Tab::Core => core_view::hints(app),
-        Tab::Overview => &[],
+        Tab::Overview => Vec::new(),
     };
-    let global: [(&str, &str); 7] = [
-        ("s", "start"),
-        ("x", "stop"),
-        ("r", "restart"),
-        ("R", "reload"),
-        ("u", "update"),
-        ("m", "mode"),
-        ("?", "help"),
+    let global = [
+        ("s", fl!("key-start")),
+        ("x", fl!("key-stop")),
+        ("r", fl!("key-restart")),
+        ("R", fl!("key-reload")),
+        ("u", fl!("key-update")),
+        ("m", fl!("key-mode")),
+        ("?", fl!("key-help")),
     ];
     let mut spans = vec![Span::raw(" ")];
     for (i, (k, label)) in keys.iter().chain(global.iter()).enumerate() {
@@ -192,7 +207,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let right = if let Some((_, label)) = app.busy.last() {
         Some(Span::styled(
-            format!(" {} {label}… ", SPINNER[app.frame % SPINNER.len()]),
+            format!(" {} {label} ", SPINNER[app.frame % SPINNER.len()]),
             Style::new().fg(CRUST).bg(YELLOW).bold(),
         ))
     } else {
@@ -227,7 +242,7 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
     draw_traffic_panel(frame, traffic_area, app);
     draw_clash_panel(frame, clash_area, app);
 
-    let block = panel("Recent logs", false);
+    let block = panel(&fl!("tui-panel-recent-logs"), false);
     let inner = block.inner(bottom);
     frame.render_widget(block, bottom);
     let height = inner.height as usize;
@@ -242,20 +257,23 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
         None => vec![Line::from(Span::styled(
             app.status_error
                 .clone()
-                .unwrap_or_else(|| "waiting for daemon…".to_owned()),
+                .unwrap_or_else(|| fl!("tui-waiting-daemon")),
             Style::new().fg(RED),
         ))],
         Some(status) => {
             let mut state = vec![state_pill(status.state)];
             if let (Some(pid), Some(started)) = (status.pid, status.started_at) {
-                state.push(dim(format!(
-                    "  pid {pid} · up {}",
-                    fmt_duration(now.saturating_sub(started))
+                state.push(dim("  "));
+                state.push(dim(fl!(
+                    "state-pid-uptime",
+                    pid = pid.to_string(),
+                    uptime = fmt_duration(now.saturating_sub(started))
                 )));
             }
             if let Some(at) = status.next_restart_at {
+                state.push(Span::raw("  "));
                 state.push(Span::styled(
-                    format!("  restart in {}s", at.saturating_sub(now)),
+                    fl!("tui-restart-in", seconds = at.saturating_sub(now)),
                     Style::new().fg(YELLOW),
                 ));
             }
@@ -263,51 +281,46 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
                 status
                     .core_version
                     .clone()
-                    .unwrap_or_else(|| "not installed — see the Core tab".to_owned()),
+                    .unwrap_or_else(|| fl!("tui-core-not-installed")),
                 Style::new().fg(TEXT).bold(),
             )];
             if let Some(active) = &status.active_core {
                 core.push(dim("  "));
+                core.push(Span::styled(active.source_label(), Style::new().fg(ACCENT)));
+                core.push(dim("  "));
                 core.push(Span::styled(
-                    active.source_name.clone(),
-                    Style::new().fg(ACCENT),
-                ));
-                core.push(dim(" · "));
-                core.push(Span::styled(
-                    variant_label(&active.variant).to_owned(),
+                    variant_label(&active.variant),
                     Style::new().fg(BLUE),
                 ));
             }
             if status.update_in_progress {
-                core.push(Span::styled("  downloading…", Style::new().fg(YELLOW)));
+                core.push(Span::raw("  "));
+                core.push(Span::styled(
+                    fl!("tui-downloading"),
+                    Style::new().fg(YELLOW),
+                ));
             }
-            let last_exit = status.last_exit.clone().unwrap_or_else(|| "—".to_owned());
+            let last_exit = status.last_exit.clone().unwrap_or_else(|| fl!("none"));
             let mut lines = vec![
                 Line::from({
-                    let mut line = vec![Span::styled(
-                        format!("{:<FIELD$}", "State"),
-                        Style::new().fg(DIM),
-                    )];
+                    let mut line = vec![label(&fl!("field-state"), FIELD)];
                     line.extend(state);
                     line
                 }),
                 Line::from({
-                    let mut line = vec![Span::styled(
-                        format!("{:<FIELD$}", "Core"),
-                        Style::new().fg(DIM),
-                    )];
+                    let mut line = vec![label(&fl!("field-core"), FIELD)];
                     line.extend(core);
                     line
                 }),
                 field(
-                    "Binary",
+                    &fl!("field-binary"),
                     FIELD,
                     Span::styled(status.binary.clone(), Style::new().fg(SUBTEXT)),
                 ),
                 Line::from(vec![
-                    Span::styled(format!("{:<FIELD$}", "Restarts"), Style::new().fg(DIM)),
+                    label(&fl!("field-restarts"), FIELD),
                     Span::raw(status.restarts.to_string()),
-                    dim("   last exit "),
+                    dim(format!("   {}  ", fl!("field-last-exit"))),
                     Span::styled(
                         last_exit,
                         Style::new().fg(if status.state == CoreState::Failed {
@@ -318,22 +331,19 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                 ]),
                 field(
-                    "Daemon",
+                    &fl!("field-daemon"),
                     FIELD,
-                    dim(format!(
-                        "{} · up {} · {}",
-                        status.daemon_version,
-                        fmt_duration(now.saturating_sub(status.daemon_started_at)),
-                        app.socket()
+                    dim(fl!(
+                        "tui-daemon-detail",
+                        version = status.daemon_version.clone(),
+                        uptime = fmt_duration(now.saturating_sub(status.daemon_started_at)),
+                        socket = app.socket()
                     )),
                 ),
             ];
             for component in &status.components {
                 let mut line = vec![
-                    Span::styled(
-                        format!("{:<FIELD$}", component.component.title()),
-                        Style::new().fg(DIM),
-                    ),
+                    label(component.component.title(), FIELD),
                     component_badge(component),
                 ];
                 if let Some(url) = component.url.as_ref().filter(|_| component.pid.is_some()) {
@@ -348,7 +358,7 @@ fn draw_core_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_traffic_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("Traffic", false);
+    let block = panel(&fl!("tui-panel-traffic"), false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [up_label, up_spark, down_label, down_spark] = Layout::vertical([
@@ -362,10 +372,10 @@ fn draw_traffic_panel(frame: &mut Frame, area: Rect, app: &App) {
     let width = inner.width as usize;
     let label = |arrow: &str, color: Color, speed: u64, total: u64| {
         let speed = format!("{arrow} {:>12}", fmt_speed(speed));
-        let total = format!("   total {}", fmt_bytes(total));
+        let total = format!("   {}", fl!("tui-traffic-total", bytes = fmt_bytes(total)));
         let mut spans = vec![Span::styled(speed.clone(), Style::new().fg(color).bold())];
         // Drop the total rather than clip it in narrow terminals.
-        if speed.chars().count() + total.chars().count() <= width {
+        if text_width(&speed) + text_width(&total) <= width {
             spans.push(dim(total));
         }
         Line::from(spans)
@@ -406,38 +416,37 @@ fn draw_traffic_panel(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+const CLASH_FIELD: usize = 8;
+
 fn draw_clash_panel(frame: &mut Frame, area: Rect, app: &App) {
     let api = app.status.as_ref().and_then(|s| s.clash_api.as_ref());
     let mut lines = vec![field(
         "API",
-        8,
+        CLASH_FIELD,
         match api {
             Some(api) => Span::styled(api.url.clone(), Style::new().fg(SUBTEXT)),
-            None => Span::styled(
-                "not configured (experimental.clash_api)",
-                Style::new().fg(YELLOW),
-            ),
+            None => Span::styled(fl!("clash-api-not-configured"), Style::new().fg(YELLOW)),
         },
     )];
     if let Some(err) = &app.clash_error {
         lines.push(field(
-            "Error",
-            8,
+            &fl!("field-error"),
+            CLASH_FIELD,
             Span::styled(first_line(err), Style::new().fg(RED)),
         ));
     } else if api.is_some() {
         let mode = app
             .configs
             .as_ref()
-            .map_or("—".to_owned(), |c| c.mode.to_lowercase());
-        lines.push(field("Mode", 8, chip(mode, SKY)));
+            .map_or_else(|| fl!("unknown"), |c| c.mode.to_lowercase());
+        lines.push(field(&fl!("field-mode"), CLASH_FIELD, chip(mode, SKY)));
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<8}", "Conns"), Style::new().fg(DIM)),
+            label(&fl!("field-connections"), CLASH_FIELD),
             Span::styled(
                 app.connections.len().to_string(),
                 Style::new().fg(TEXT).bold(),
             ),
-            dim("   memory "),
+            dim(format!("   {}  ", fl!("field-memory"))),
             Span::raw(fmt_bytes(app.traffic.memory)),
         ]));
     }
@@ -449,13 +458,17 @@ fn draw_clash_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn delay_span(app: &App, name: &str) -> Span<'static> {
     if app.testing.contains(name) {
         return Span::styled(
-            format!("{} test", SPINNER[app.frame % SPINNER.len()]),
+            format!(
+                "{} {}",
+                SPINNER[app.frame % SPINNER.len()],
+                fl!("tui-testing")
+            ),
             Style::new().fg(YELLOW),
         );
     }
     match app.delay_of(name) {
-        None => dim("—"),
-        Some(Err(_)) => Span::styled("timeout", Style::new().fg(RED)),
+        None => dim("-"),
+        Some(Err(_)) => Span::styled(fl!("tui-delay-timeout"), Style::new().fg(RED)),
         Some(Ok(ms)) => Span::styled(format!("{ms} ms"), Style::new().fg(delay_color(ms))),
     }
 }
@@ -467,7 +480,7 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(err) = app.clash_error.as_ref().filter(|_| app.groups.is_empty()) {
         let text = Paragraph::new(first_line(err))
             .fg(RED)
-            .block(panel("Groups", false));
+            .block(panel(&fl!("tui-panel-groups"), false));
         frame.render_widget(text, area);
         return;
     }
@@ -495,7 +508,7 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
     let groups_focused = app.focus == Focus::Groups;
     let list = List::new(items)
         .block(panel(
-            &format!("Groups · {}", app.groups.len()),
+            &fl!("tui-panel-groups-count", count = app.groups.len()),
             groups_focused,
         ))
         .highlight_style(selected(groups_focused))
@@ -536,9 +549,9 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     let members_focused = app.focus == Focus::Members;
     let hint = if selectable {
-        "⏎ select · t test"
+        format!("⏎ {}  t {}", fl!("key-select"), fl!("key-test"))
     } else {
-        "t test"
+        format!("t {}", fl!("key-test"))
     };
     let table = Table::new(
         rows,
@@ -549,7 +562,15 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(9),
         ],
     )
-    .header(Row::new(["", "Name", "Type", "Delay"]).style(header_row()))
+    .header(
+        Row::new([
+            String::new(),
+            fl!("col-name"),
+            fl!("col-type"),
+            fl!("col-delay"),
+        ])
+        .style(header_row()),
+    )
     .block(
         panel(&group_name, members_focused)
             .title_top(Line::from(dim(format!(" {hint} "))).right_aligned()),
@@ -574,7 +595,11 @@ fn age(start: &str) -> String {
 }
 
 fn draw_connections(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = panel(&format!("Connections · {}", app.connections.len()), true).title_top(
+    let block = panel(
+        &fl!("tui-panel-connections", count = app.connections.len()),
+        true,
+    )
+    .title_top(
         Line::from(vec![
             Span::styled(
                 format!(" ↑ {} ", fmt_speed(app.traffic.up_speed)),
@@ -628,7 +653,16 @@ fn draw_connections(frame: &mut Frame, area: Rect, app: &mut App) {
         ],
     )
     .header(
-        Row::new(["Destination", "Net", "Chain", "Rule", "Up", "Down", "Age"]).style(header_row()),
+        Row::new([
+            fl!("col-destination"),
+            fl!("col-network"),
+            fl!("col-chain"),
+            fl!("col-rule"),
+            fl!("col-upload"),
+            fl!("col-download"),
+            fl!("col-age"),
+        ])
+        .style(header_row()),
     )
     .block(block)
     .row_highlight_style(selected(true))
@@ -672,13 +706,16 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
     match entry.source {
         LogSource::Daemon => Line::from(vec![
             dim(fmt_clock(entry.ts)),
-            Span::styled(" daemon ", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                format!(" {} ", entry.source.label()),
+                Style::new().fg(ACCENT).bold(),
+            ),
             Span::raw(line.clone()),
         ]),
         LogSource::SubStore | LogSource::HttpMeta => Line::from(vec![
             dim(fmt_clock(entry.ts)),
             Span::styled(
-                format!(" {} ", entry.source.tag()),
+                format!(" {} ", entry.source.label()),
                 Style::new().fg(SKY).bold(),
             ),
             Span::raw(line.clone()),
@@ -696,18 +733,24 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
     let follow = if app.log_scroll == 0 {
-        Span::styled(" ● following ", Style::new().fg(GREEN))
+        Span::styled(
+            format!(" ● {} ", fl!("tui-logs-following")),
+            Style::new().fg(GREEN),
+        )
     } else {
         Span::styled(
-            format!(" ↑{} · End follows ", app.log_scroll),
+            format!(" {} ", fl!("tui-logs-scrolled", lines = app.log_scroll)),
             Style::new().fg(YELLOW),
         )
     };
     let mut status = vec![follow];
     if !app.logs_connected {
-        status.push(Span::styled("disconnected ", Style::new().fg(RED)));
+        status.push(Span::styled(
+            format!("{} ", fl!("tui-logs-disconnected")),
+            Style::new().fg(RED),
+        ));
     }
-    let block = panel(&format!("Logs · {}", app.logs.len()), true)
+    let block = panel(&fl!("tui-panel-logs", count = app.logs.len()), true)
         .title_top(Line::from(status).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -721,10 +764,10 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
 // ----- Sub-Store --------------------------------------------------------------------
 
 fn component_badge(c: &ComponentStatus) -> Span<'static> {
-    if let Some(busy) = &c.busy {
-        pill(format!("{}…", busy.to_uppercase()), YELLOW)
+    if let Some(busy) = c.busy_label() {
+        pill(busy.to_uppercase(), YELLOW)
     } else if !c.enabled {
-        chip("disabled", DIM)
+        chip(fl!("state-disabled"), DIM)
     } else {
         pill(c.state.label(), state_color(c.state))
     }
@@ -740,20 +783,20 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|component| match app.component(*component) {
             None => Row::new(vec![
                 Cell::from(component.title()),
-                Cell::from(dim("unknown")),
+                Cell::from(dim(fl!("unknown"))),
             ]),
             Some(c) => {
                 let uptime = c
                     .started_at
                     .filter(|_| c.pid.is_some())
-                    .map(|s| format!("up {}", fmt_duration(now.saturating_sub(s))))
+                    .map(|s| fl!("tui-uptime", uptime = fmt_duration(now.saturating_sub(s))))
                     .unwrap_or_else(|| c.last_exit.clone().unwrap_or_default());
-                let versions = c
-                    .versions
-                    .iter()
-                    .map(|(k, v)| format!("{k} {v}"))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
+                let versions = join_list(
+                    &c.versions
+                        .iter()
+                        .map(|(k, v)| format!("{} {v}", version_label(k)))
+                        .collect::<Vec<_>>(),
+                );
                 Row::new(vec![
                     Cell::from(Span::styled(
                         component.title(),
@@ -775,14 +818,26 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         rows,
         [
             Constraint::Length(10),
-            Constraint::Length(14),
+            Constraint::Length(18),
             Constraint::Length(14),
             Constraint::Fill(2),
             Constraint::Fill(3),
         ],
     )
-    .header(Row::new(["Component", "State", "", "Versions", "URL"]).style(header_row()))
-    .block(panel("Components", focused).title_top(Line::from(dim(" ⏎ actions ")).right_aligned()))
+    .header(
+        Row::new([
+            fl!("col-component"),
+            fl!("col-state"),
+            String::new(),
+            fl!("col-versions"),
+            fl!("col-url"),
+        ])
+        .style(header_row()),
+    )
+    .block(
+        panel(&fl!("tui-panel-components"), focused)
+            .title_top(Line::from(dim(format!(" ⏎ {} ", fl!("key-actions")))).right_aligned()),
+    )
     // A background highlight would hide the state pills; bold only.
     .row_highlight_style(Style::new().add_modifier(ratatui::style::Modifier::BOLD))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
@@ -792,26 +847,32 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
     let running = app
         .component(Component::SubStore)
         .is_some_and(|c| c.state == CoreState::Running);
-    let version = app
-        .sub_store
-        .as_ref()
-        .map(|o| format!(" · Sub-Store {}", o.version))
-        .unwrap_or_default();
-    let block = panel(&format!("Subscriptions → sing-box{version}"), focused)
-        .title_top(Line::from(dim(" y copy URL · p provider snippet ")).right_aligned());
+    let title = match &app.sub_store {
+        Some(overview) => fl!(
+            "tui-panel-subscriptions-version",
+            version = overview.version.clone()
+        ),
+        None => fl!("tui-panel-subscriptions"),
+    };
+    let hint = format!(
+        " y {}  p {} ",
+        fl!("key-copy-url"),
+        fl!("key-provider-snippet")
+    );
+    let block = panel(&title, focused).title_top(Line::from(dim(hint)).right_aligned());
     let message = if !app
         .component(Component::SubStore)
         .is_some_and(|c| c.enabled)
     {
-        Some("Sub-Store is disabled. Select it above and press Enter → enable.".to_owned())
+        Some(fl!("tui-sub-store-disabled"))
     } else if !running {
-        Some("Sub-Store is not running.".to_owned())
+        Some(fl!("tui-sub-store-stopped"))
     } else if let Some(err) = &app.sub_store_error {
         Some(first_line(err))
     } else if app.sub_store.as_ref().is_some_and(|o| o.entries.is_empty()) {
-        Some("No subscriptions yet. Add them in the web UI (press w to copy its URL).".to_owned())
+        Some(fl!("tui-no-subscriptions"))
     } else if app.sub_store.is_none() {
-        Some("loading…".to_owned())
+        Some(fl!("tui-loading"))
     } else {
         None
     };
@@ -857,7 +918,15 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Fill(3),
         ],
     )
-    .header(Row::new(["Type", "Name", "Source", "sing-box URL"]).style(header_row()))
+    .header(
+        Row::new([
+            fl!("col-type"),
+            fl!("col-name"),
+            fl!("col-source"),
+            fl!("col-singbox-url"),
+        ])
+        .style(header_row()),
+    )
     .block(block)
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
@@ -874,15 +943,27 @@ fn popup_area(frame: &Frame, width: u16, height: u16) -> Rect {
     )
 }
 
-fn help_lines(rows: &[(&'static str, &'static str)]) -> Vec<Line<'static>> {
+/// Rows `lines` take inside a bordered, padded popup `width` columns wide.
+fn wrapped_rows(lines: &[Line], width: u16) -> u16 {
+    let inner = usize::from(width.saturating_sub(4)).max(1);
+    lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(inner))
+        .sum::<usize>() as u16
+}
+
+/// A section title (empty key) or a `key  description` row.
+fn help_lines(rows: &[(&'static str, String)]) -> Vec<Line<'static>> {
     rows.iter()
         .map(|(k, desc)| {
-            if desc.is_empty() {
-                Line::from(Span::styled(*k, Style::new().fg(ACCENT).bold()))
+            if k.is_empty() && desc.is_empty() {
+                Line::raw("")
+            } else if k.is_empty() {
+                Line::from(Span::styled(desc.clone(), Style::new().fg(ACCENT).bold()))
             } else {
                 Line::from(vec![
                     Span::styled(format!("  {k:<13}"), Style::new().fg(TEXT).bold()),
-                    dim(*desc),
+                    dim(desc.clone()),
                 ])
             }
         })
@@ -890,45 +971,47 @@ fn help_lines(rows: &[(&'static str, &'static str)]) -> Vec<Line<'static>> {
 }
 
 fn draw_help(frame: &mut Frame) {
+    let blank = || ("", String::new());
     let left = help_lines(&[
-        ("Global", ""),
-        ("1-6 / Tab", "switch tab"),
-        ("s / x / r", "start / stop / restart"),
-        ("R", "check config, hot reload"),
-        ("c", "sing-box check"),
-        ("u", "update the active core"),
-        ("m", "cycle Clash mode"),
-        ("q / Ctrl-C", "quit"),
-        ("", ""),
-        ("Proxies", ""),
-        ("←→ ↑↓", "groups / nodes"),
-        ("Enter", "select node"),
-        ("t / T", "delay test group / node"),
-        ("", ""),
-        ("Connections · Logs", ""),
-        ("d / D", "close one / all"),
-        ("PgUp/Dn End", "scroll, follow"),
+        ("", fl!("help-global")),
+        ("1-6 / Tab", fl!("help-switch-tab")),
+        ("s / x / r", fl!("help-start-stop-restart")),
+        ("R", fl!("help-reload")),
+        ("c", fl!("help-check")),
+        ("u", fl!("help-update")),
+        ("m", fl!("help-mode")),
+        ("q / Ctrl-C", fl!("help-quit")),
+        blank(),
+        ("", fl!("help-proxies")),
+        ("←→ ↑↓", fl!("help-groups-nodes")),
+        ("Enter", fl!("help-select-node")),
+        ("t / T", fl!("help-delay-test")),
+        blank(),
+        ("", fl!("help-connections-logs")),
+        ("d / D", fl!("help-close-connections")),
+        ("PgUp/Dn End", fl!("help-scroll")),
     ]);
     let right = help_lines(&[
-        ("Sub-Store", ""),
-        ("←→", "components / subscriptions"),
-        ("Enter", "actions / provider snippet"),
-        ("y / w / p", "copy URL / web UI / snippet"),
-        ("", ""),
-        ("Core", ""),
-        ("←→", "sources / releases / store"),
-        ("Enter", "switch to selected"),
-        ("v / V", "next / previous variant"),
-        ("i", "download only"),
-        ("d", "delete stored / source"),
-        ("p / n / f", "stable only / more / refresh"),
-        ("a", "add GitHub source (root)"),
-        ("I", "import binary or URL (root)"),
+        ("", "Sub-Store".to_owned()),
+        ("←→", fl!("help-store-panes")),
+        ("Enter", fl!("help-store-enter")),
+        ("y / w / p", fl!("help-store-copy")),
+        blank(),
+        ("", fl!("help-core")),
+        ("←→", fl!("help-core-panes")),
+        ("Enter", fl!("help-core-switch")),
+        ("v / V", fl!("help-core-variant")),
+        ("i", fl!("help-core-download")),
+        ("d", fl!("help-core-delete")),
+        ("p / n / f", fl!("help-core-list")),
+        ("a", fl!("help-core-add-source")),
+        ("I", fl!("help-core-import")),
     ]);
     let height = left.len().max(right.len()) as u16 + 2;
-    let area = popup_area(frame, 96, height);
+    let area = popup_area(frame, 104, height);
     frame.render_widget(Clear, area);
-    let block = panel("Keys", true).title_top(Line::from(dim(" any key closes ")).right_aligned());
+    let block = panel(&fl!("help-title"), true)
+        .title_top(Line::from(dim(format!(" {} ", fl!("help-close-hint")))).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [l, r] =
@@ -949,28 +1032,28 @@ fn draw_confirm(frame: &mut Frame, message: &str) {
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         key("y"),
-        dim(" confirm    "),
+        dim(format!(" {}    ", fl!("key-confirm"))),
         key("n"),
-        dim(" cancel"),
+        dim(format!(" {}", fl!("key-cancel"))),
     ]));
     let width: u16 = 72;
-    // Borders and padding take 4 columns and 4 rows; count wrapped rows.
-    let inner = usize::from(width - 4);
-    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner)).sum();
+    let height = wrapped_rows(&lines, width) + 4;
     let text = Text::from(lines);
-    let height = rows as u16 + 4;
     let area = popup_area(frame, width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false })
-            .block(panel("Confirm", true).padding(ratatui::widgets::Padding::uniform(1))),
+            .block(
+                panel(&fl!("tui-panel-confirm"), true)
+                    .padding(ratatui::widgets::Padding::uniform(1)),
+            ),
         area,
     );
 }
 
-fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool) {
+fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool, copyable: bool) {
     let area = frame.area();
     let width = (area.width * 4 / 5).max(40);
     let height = (body.lines().count() as u16 + 4)
@@ -979,13 +1062,18 @@ fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool) {
     let rect = popup_area(frame, width, height);
     frame.render_widget(Clear, rect);
     let color = if error { RED } else { GREEN };
+    let hint = if copyable {
+        fl!("tui-hint-copy-close")
+    } else {
+        fl!("tui-hint-close")
+    };
     frame.render_widget(
         Paragraph::new(body.to_owned())
             .wrap(Wrap { trim: false })
             .block(
                 panel(title, true)
                     .border_style(Style::new().fg(color))
-                    .title_top(Line::from(dim(" Esc closes ")).right_aligned()),
+                    .title_top(Line::from(dim(format!(" {hint} "))).right_aligned()),
             ),
         rect,
     );
@@ -1016,14 +1104,16 @@ fn draw_input(frame: &mut Frame, title: &str, hint: &str, value: &str, purpose: 
         Line::raw(""),
         Line::from(vec![
             key("⏎"),
-            dim(" submit    "),
+            dim(format!(" {}    ", fl!("key-submit"))),
             key("Esc"),
-            dim(" cancel    "),
+            dim(format!(" {}    ", fl!("key-cancel"))),
             key("^U"),
-            dim(" clear"),
+            dim(format!(" {}", fl!("key-clear"))),
         ]),
     ];
-    let area = popup_area(frame, 80, 9);
+    let width: u16 = 80;
+    let height = wrapped_rows(&lines, width) + 2;
+    let area = popup_area(frame, width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1037,59 +1127,52 @@ fn draw_setup(frame: &mut Frame, sub_store: Option<bool>) {
     let (name, about, question) = match sub_store {
         None => (
             "Sub-Store",
-            vec![
-                "Subscription manager with a web UI (sub-store-org/Sub-Store).",
-                "Converts and merges subscriptions and serves them in sing-box",
-                "format, so sing-box `providers` can import the nodes.",
-            ],
-            "Enable Sub-Store?",
+            fl!("setup-sub-store-about"),
+            fl!("ask-sub-store"),
         ),
         Some(_) => (
             "http-meta",
-            vec![
-                "Starts mihomo on demand so Sub-Store scripts can test whether",
-                "nodes are reachable (xream/http-meta + MetaCubeX/mihomo).",
-                "Only useful together with Sub-Store node-check scripts.",
-            ],
-            "Enable http-meta?",
+            fl!("setup-http-meta-about"),
+            fl!("ask-http-meta"),
         ),
     };
     let mut lines = vec![
-        Line::from(dim(
-            "singbox-board can install and supervise optional components.",
-        )),
+        Line::from(dim(fl!("setup-intro"))),
         Line::raw(""),
         Line::from(Span::styled(name, Style::new().fg(ACCENT).bold())),
     ];
     lines.extend(
         about
-            .into_iter()
-            .map(|t| Line::from(Span::styled(t, Style::new().fg(SUBTEXT)))),
+            .lines()
+            .map(|t| Line::from(Span::styled(t.to_owned(), Style::new().fg(SUBTEXT)))),
     );
     if let Some(answer) = sub_store {
         lines.push(Line::raw(""));
-        lines.push(Line::from(dim(format!(
-            "Sub-Store: {}",
-            if answer { "yes" } else { "no" }
-        ))));
+        lines.push(Line::from(dim(if answer {
+            fl!("setup-sub-store-yes")
+        } else {
+            fl!("setup-sub-store-no")
+        })));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled(question, Style::new().fg(TEXT).bold()),
         Span::raw("   "),
         key("y"),
-        dim(" yes  "),
+        dim(format!(" {}  ", fl!("key-yes"))),
         key("n"),
-        dim(" no  "),
+        dim(format!(" {}  ", fl!("key-no"))),
         key("Esc"),
-        dim(" ask later"),
+        dim(format!(" {}", fl!("key-ask-later"))),
     ]));
-    let area = popup_area(frame, 72, lines.len() as u16 + 2);
+    let width: u16 = 76;
+    let height = wrapped_rows(&lines, width) + 2;
+    let area = popup_area(frame, width, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel("First run · optional components", true)),
+            .block(panel(&fl!("setup-title"), true)),
         area,
     );
 }
@@ -1104,12 +1187,12 @@ fn draw_menu(
         .iter()
         .map(|action| {
             let label = match action {
-                ComponentAction::Start => "Start",
-                ComponentAction::Stop => "Stop",
-                ComponentAction::Restart => "Restart",
-                ComponentAction::Enable => "Enable (download, install and start)",
-                ComponentAction::Disable => "Disable (stop and keep stopped)",
-                ComponentAction::Update => "Update to the latest release",
+                ComponentAction::Start => fl!("menu-start"),
+                ComponentAction::Stop => fl!("menu-stop"),
+                ComponentAction::Restart => fl!("menu-restart"),
+                ComponentAction::Enable => fl!("menu-enable"),
+                ComponentAction::Disable => fl!("menu-disable"),
+                ComponentAction::Update => fl!("menu-update"),
             };
             ListItem::new(format!(" {label}"))
         })

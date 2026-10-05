@@ -18,8 +18,9 @@ use tokio::time::{Instant as Deadline, timeout};
 use super::logs::LogHub;
 use super::process::{describe, first_line, isolate, pipe_to_logs, sleep_until_opt, wait_child};
 use crate::config::{RestartConfig, RestartPolicy};
+use crate::i18n::{self, Lang, fl, fl_log};
 use crate::protocol::{CoreState, LogSource};
-use crate::util::now_unix;
+use crate::util::{error_chain, now_unix};
 
 const STARTUP_GRACE: Duration = Duration::from_millis(1500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,9 +48,10 @@ pub struct ServiceRuntime {
     pub next_restart_at: Option<u64>,
 }
 
+/// Requests carry the language their answer is written in.
 enum Msg {
-    Start(Box<ServiceSpec>, oneshot::Sender<Result<u32, String>>),
-    Stop(oneshot::Sender<Option<String>>),
+    Start(Box<ServiceSpec>, Lang, oneshot::Sender<Result<u32, String>>),
+    Stop(Lang, oneshot::Sender<Option<String>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -64,18 +66,18 @@ impl ServiceHandle {
     pub async fn start(&self, spec: ServiceSpec) -> Result<u32> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Start(Box::new(spec), reply))
+            .send(Msg::Start(Box::new(spec), i18n::current(), reply))
             .await
-            .map_err(|_| anyhow::anyhow!("daemon is shutting down"))?;
+            .map_err(|_| anyhow::anyhow!(fl!("daemon-shutting-down")))?;
         rx.await
-            .map_err(|_| anyhow::anyhow!("daemon is shutting down"))?
+            .map_err(|_| anyhow::anyhow!(fl!("daemon-shutting-down")))?
             .map_err(anyhow::Error::msg)
     }
 
     /// Stops the service; returns its exit description when it was running.
     pub async fn stop(&self) -> Option<String> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Msg::Stop(reply)).await.ok()?;
+        self.tx.send(Msg::Stop(i18n::current(), reply)).await.ok()?;
         rx.await.ok().flatten()
     }
 
@@ -155,22 +157,24 @@ impl Service {
             let restart_at = self.restart_at;
             tokio::select! {
                 message = self.rx.recv() => match message {
-                    Some(Msg::Start(spec, reply)) => {
+                    Some(Msg::Start(spec, lang, reply)) => {
                         self.stop_child().await;
                         self.spec = Some(*spec);
                         self.want_running = true;
                         self.restart_at = None;
                         self.backoff = initial_backoff(&self.restart);
-                        let result = self.launch().await.map_err(|err| format!("{err:#}"));
+                        let result = i18n::scope(lang, self.launch())
+                            .await
+                            .map_err(|err| error_chain(&err));
                         if result.is_err() {
                             self.want_running = false;
                         }
                         let _ = reply.send(result);
                     }
-                    Some(Msg::Stop(reply)) => {
+                    Some(Msg::Stop(lang, reply)) => {
                         self.want_running = false;
                         self.restart_at = None;
-                        let exit = self.stop_child().await;
+                        let exit = i18n::scope(lang, self.stop_child()).await;
                         self.set_state(CoreState::Stopped);
                         let _ = reply.send(exit);
                     }
@@ -189,10 +193,10 @@ impl Service {
                     self.restart_at = None;
                     self.restarts += 1;
                     if let Err(err) = self.launch().await {
-                        self.logs.warn(format!(
-                            "{} restart failed: {}",
-                            self.title,
-                            first_line(&format!("{err:#}"))
+                        self.logs.warn(fl_log!(
+                            "service-restart-failed",
+                            name = self.title,
+                            error = first_line(&error_chain(&err))
                         ));
                         if self.want_running {
                             self.schedule_restart();
@@ -225,7 +229,7 @@ impl Service {
     async fn launch(&mut self) -> Result<u32> {
         let result = self.try_launch().await;
         if let Err(err) = &result {
-            self.last_exit = Some(first_line(&format!("{err:#}")));
+            self.last_exit = Some(first_line(&error_chain(err)));
             self.set_state(CoreState::Failed);
         }
         result
@@ -233,7 +237,7 @@ impl Service {
 
     async fn try_launch(&mut self) -> Result<u32> {
         let Some(spec) = self.spec.clone() else {
-            bail!("{} has no launch specification", self.title);
+            bail!(fl!("service-no-spec", name = self.title));
         };
         self.set_state(CoreState::Starting);
         if let Some(exe) = &spec.reap_exe {
@@ -253,7 +257,7 @@ impl Service {
         isolate(&mut command);
         let mut child = command
             .spawn()
-            .with_context(|| format!("spawn {}", spec.program.display()))?;
+            .with_context(|| fl!("err-spawn", path = spec.program.display().to_string()))?;
         let pid = child.id().unwrap_or_default();
         self.pipes.clear();
         if let Some(stdout) = child.stdout.take() {
@@ -264,16 +268,28 @@ impl Service {
             self.pipes
                 .push(pipe_to_logs(stderr, self.logs.clone(), self.source));
         }
-        self.logs
-            .info(format!("{} started (pid {pid})", self.title));
+        self.logs.info(fl_log!(
+            "service-started",
+            name = self.title,
+            pid = pid.to_string()
+        ));
 
         if let Ok(status) = timeout(STARTUP_GRACE, child.wait()).await {
-            let exit = describe(&status);
             self.drain_pipes().await;
             let recent = self.logs.recent_lines(self.source, 8).join("\n");
-            self.logs
-                .warn(format!("{} exited during startup: {exit}", self.title));
-            bail!("{} exited during startup ({exit})\n{recent}", self.title);
+            self.logs.warn(fl_log!(
+                "service-exited-startup",
+                name = self.title,
+                exit = i18n::in_log_language(|| describe(&status))
+            ));
+            bail!(
+                "{}\n{recent}",
+                fl!(
+                    "service-exited-startup",
+                    name = self.title,
+                    exit = describe(&status)
+                )
+            );
         }
         self.child = Some(child);
         self.started_at = Some((Instant::now(), now_unix()));
@@ -296,10 +312,10 @@ impl Service {
         let status = match timeout(STOP_TIMEOUT, child.wait()).await {
             Ok(status) => status,
             Err(_) => {
-                self.logs.warn(format!(
-                    "{} did not exit within {}s, sending SIGKILL",
-                    self.title,
-                    STOP_TIMEOUT.as_secs()
+                self.logs.warn(fl_log!(
+                    "service-kill",
+                    name = self.title,
+                    seconds = STOP_TIMEOUT.as_secs()
                 ));
                 let _ = child.start_kill();
                 child.wait().await
@@ -308,7 +324,11 @@ impl Service {
         let exit = describe(&status);
         self.drain_pipes().await;
         self.reap_spec();
-        self.logs.info(format!("{} stopped ({exit})", self.title));
+        self.logs.info(fl_log!(
+            "service-stopped",
+            name = self.title,
+            exit = i18n::in_log_language(|| describe(&status))
+        ));
         self.started_at = None;
         self.last_exit = Some(exit.clone());
         self.set_state(CoreState::Stopped);
@@ -329,7 +349,7 @@ impl Service {
         let ran_for = self.started_at.take().map(|(at, _)| at.elapsed());
         self.last_exit = Some(exit.clone());
         self.logs
-            .warn(format!("{} exited unexpectedly ({exit})", self.title));
+            .warn(fl_log!("service-exited", name = self.title, exit = exit));
         if ran_for.is_some_and(|d| d >= Duration::from_secs(self.restart.stable_after_secs)) {
             self.backoff = initial_backoff(&self.restart);
         }
@@ -356,10 +376,10 @@ impl Service {
         let max = Duration::from_secs(self.restart.max_backoff_secs.max(1));
         self.backoff = (self.backoff * 2).min(max);
         self.restart_at = Some(Deadline::now() + delay);
-        self.logs.info(format!(
-            "restarting {} in {:.1}s",
-            self.title,
-            delay.as_secs_f64()
+        self.logs.info(fl_log!(
+            "service-restarting-in",
+            name = self.title,
+            seconds = format!("{:.1}", delay.as_secs_f64())
         ));
         self.set_state(CoreState::Backoff);
     }
@@ -387,9 +407,10 @@ fn reap(exe: &Path, logs: &LogHub) {
             continue;
         };
         if target == exe || target.as_os_str() == deleted.as_str() {
-            logs.info(format!(
-                "terminating leftover {} (pid {pid})",
-                exe.display()
+            logs.info(fl_log!(
+                "service-reap",
+                path = exe.display().to_string(),
+                pid = pid.to_string()
             ));
             let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
         }

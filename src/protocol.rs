@@ -9,8 +9,20 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::fl;
+
 /// Upper bound for a single request line.
 pub const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// A request line: the command plus the language the client wants replies
+/// in. Daemons that predate `lang` ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    #[serde(flatten)]
+    pub request: Request,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -202,14 +214,27 @@ pub enum CoreState {
 }
 
 impl CoreState {
-    pub fn label(self) -> &'static str {
+    /// Badge text, e.g. "RUNNING".
+    pub fn label(self) -> String {
         match self {
-            CoreState::Stopped => "STOPPED",
-            CoreState::Starting => "STARTING",
-            CoreState::Running => "RUNNING",
-            CoreState::Stopping => "STOPPING",
-            CoreState::Backoff => "BACKOFF",
-            CoreState::Failed => "FAILED",
+            CoreState::Stopped => fl!("state-stopped"),
+            CoreState::Starting => fl!("state-starting"),
+            CoreState::Running => fl!("state-running"),
+            CoreState::Stopping => fl!("state-stopping"),
+            CoreState::Backoff => fl!("state-backoff"),
+            CoreState::Failed => fl!("state-failed"),
+        }
+    }
+
+    /// Selector for messages that phrase each state differently.
+    pub fn key(self) -> &'static str {
+        match self {
+            CoreState::Stopped => "stopped",
+            CoreState::Starting => "starting",
+            CoreState::Running => "running",
+            CoreState::Stopping => "stopping",
+            CoreState::Backoff => "backoff",
+            CoreState::Failed => "failed",
         }
     }
 }
@@ -251,6 +276,25 @@ pub struct Status {
     pub active_core: Option<StoredCore>,
 }
 
+/// Release sources everyone may install from.
+pub const BUILTIN_SOURCES: [&str; 2] = ["MiChongs/sing-box", "SagerNet/sing-box"];
+
+/// `source_name` of cores imported by hand and of a binary that was in place
+/// before the version store took over. Stored as is, shown translated.
+pub const IMPORTED_NAME: &str = "Custom import";
+pub const ADOPTED_NAME: &str = "Previously installed";
+
+/// Display name and description of a built-in source.
+pub fn builtin_source(id: &str) -> Option<(String, String)> {
+    let index = BUILTIN_SOURCES
+        .iter()
+        .position(|builtin| builtin.eq_ignore_ascii_case(id))?;
+    Some(match index {
+        0 => (fl!("source-michongs"), fl!("source-michongs-description")),
+        _ => (fl!("source-sagernet"), fl!("source-sagernet-description")),
+    })
+}
+
 /// A GitHub repository publishing `sing-box-<version>-linux-<arch>[-<variant>]` archives.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreSource {
@@ -274,6 +318,37 @@ pub enum Checksum {
     /// Nothing to verify against (TLS only).
     #[default]
     None,
+}
+
+impl Checksum {
+    /// Short name of the verification, e.g. "SHA256SUMS".
+    pub fn label(self) -> String {
+        match self {
+            Checksum::Sums => fl!("checksum-sums"),
+            Checksum::Digest => fl!("checksum-digest"),
+            Checksum::Pinned => fl!("checksum-pinned"),
+            Checksum::None => fl!("checksum-none"),
+        }
+    }
+
+    /// How a stored core was verified, for messages.
+    pub fn description(self) -> String {
+        match self {
+            Checksum::Sums => fl!("checksum-verified-sums"),
+            Checksum::Digest => fl!("checksum-verified-digest"),
+            Checksum::Pinned => fl!("checksum-verified-pinned"),
+            Checksum::None => fl!("checksum-unverified"),
+        }
+    }
+}
+
+/// Display name of a build variant; "" is the standard build.
+pub fn variant_label(variant: &str) -> String {
+    if variant.is_empty() {
+        fl!("variant-default")
+    } else {
+        variant.to_owned()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,12 +403,27 @@ pub struct StoredCore {
     pub active: bool,
 }
 
+impl StoredCore {
+    /// Source name to display. Built-in and local names are translated; the
+    /// stored name of a built-in source may predate the current wording.
+    pub fn source_label(&self) -> String {
+        if let Some((name, _)) = builtin_source(&self.source) {
+            return name;
+        }
+        match self.source_name.as_str() {
+            IMPORTED_NAME => fl!("source-imported"),
+            ADOPTED_NAME => fl!("source-adopted"),
+            name => name.to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentStatus {
     pub component: Component,
     pub enabled: bool,
     pub installed: bool,
-    /// A long operation in progress, e.g. "installing".
+    /// A long operation in progress: "installing" or "updating".
     pub busy: Option<String>,
     pub state: CoreState,
     pub pid: Option<u32>,
@@ -349,6 +439,26 @@ pub struct ComponentStatus {
     pub api: Option<String>,
 }
 
+impl ComponentStatus {
+    /// Text for the operation in progress.
+    pub fn busy_label(&self) -> Option<String> {
+        self.busy.as_deref().map(|busy| match busy {
+            "installing" => fl!("busy-installing"),
+            "updating" => fl!("busy-updating"),
+            other => other.to_owned(),
+        })
+    }
+}
+
+/// Display name of a key in [`ComponentStatus::versions`].
+pub fn version_label(key: &str) -> String {
+    match key {
+        "backend" => fl!("version-backend"),
+        "frontend" => fl!("version-frontend"),
+        other => other.to_owned(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogSource {
@@ -359,12 +469,13 @@ pub enum LogSource {
 }
 
 impl LogSource {
-    pub fn tag(self) -> &'static str {
+    /// Tag shown in front of a log line.
+    pub fn label(self) -> String {
         match self {
-            LogSource::Core => "sing-box",
-            LogSource::Daemon => "daemon",
-            LogSource::SubStore => "sub-store",
-            LogSource::HttpMeta => "http-meta",
+            LogSource::Core => "sing-box".to_owned(),
+            LogSource::Daemon => fl!("log-source-daemon"),
+            LogSource::SubStore => "sub-store".to_owned(),
+            LogSource::HttpMeta => "http-meta".to_owned(),
         }
     }
 }
@@ -472,6 +583,30 @@ mod tests {
         ));
         let json = serde_json::to_string(&Checksum::Digest).unwrap();
         assert_eq!(json, r#""digest""#);
+    }
+
+    #[test]
+    fn envelope_carries_the_language() {
+        let line = serde_json::to_string(&Envelope {
+            request: Request::Start,
+            lang: Some("zh-CN".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"cmd":"start","lang":"zh-CN"}"#);
+        // Older daemons parse the bare request and ignore `lang`.
+        assert!(matches!(
+            serde_json::from_str::<Request>(&line).unwrap(),
+            Request::Start
+        ));
+        let logs: Request = serde_json::from_str(r#"{"cmd":"logs","tail":5,"lang":"en"}"#).unwrap();
+        assert!(matches!(logs, Request::Logs { tail: 5, .. }));
+        // Older clients send no language.
+        let envelope: Envelope =
+            serde_json::from_str(r#"{"cmd":"core_remove","id":"a/b/c"}"#).unwrap();
+        assert!(envelope.lang.is_none());
+        assert!(matches!(envelope.request, Request::CoreRemove { ref id } if id == "a/b/c"));
+        let envelope: Envelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(envelope.lang.as_deref(), Some("zh-CN"));
     }
 
     #[test]

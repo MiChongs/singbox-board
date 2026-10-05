@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::fl;
+
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/singbox-board/daemon.toml";
 pub const DEFAULT_SOCKET: &str = "/run/singbox-board/daemon.sock";
 
@@ -13,6 +15,9 @@ pub const TEMPLATE: &str = include_str!("../contrib/daemon.toml");
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    /// Language of the daemon's log: "auto" (the locale), "en" or "zh-CN".
+    /// Replies to clients use the language each client asks for.
+    pub language: String,
     pub socket: PathBuf,
     pub socket_group: Option<String>,
     pub allowed_uids: Vec<u32>,
@@ -30,6 +35,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            language: "auto".to_owned(),
             socket: PathBuf::from(DEFAULT_SOCKET),
             socket_group: Some("singbox-board".to_owned()),
             allowed_uids: Vec::new(),
@@ -274,13 +280,15 @@ impl DaemonConfig {
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 let config = toml::from_str(&content)
-                    .with_context(|| format!("parse {}", path.display()))?;
+                    .with_context(|| fl!("err-parse", path = path.display().to_string()))?;
                 Ok((config, true))
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound && !explicit => {
                 Ok((Self::default(), false))
             }
-            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+            Err(err) => {
+                Err(err).with_context(|| fl!("err-read", path = path.display().to_string()))
+            }
         }
     }
 }

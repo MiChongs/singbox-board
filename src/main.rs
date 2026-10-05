@@ -1,8 +1,10 @@
 mod clash;
+mod cli;
 mod client;
 mod config;
 mod ctl;
 mod daemon;
+mod i18n;
 mod protocol;
 mod substore;
 mod tui;
@@ -12,26 +14,65 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::client::DaemonClient;
 use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_SOCKET, DaemonConfig};
+use crate::i18n::{Lang, fl, fl_log};
 use crate::protocol::{Component, ComponentAction, Request};
+use crate::util::error_chain;
 
 #[derive(Parser)]
 #[command(
     name = "singbox-board",
     version,
-    about = "Root daemon and terminal dashboard for MiChongs/sing-box",
-    long_about = "Root daemon and terminal dashboard for MiChongs/sing-box.\n\n\
-                  Run `singbox-board daemon` as root to supervise sing-box, then use \
-                  `singbox-board` (TUI) or the subcommands below as root or as a member \
-                  of the socket group."
+    about = fl!("cli-about"),
+    long_about = fl!("cli-long-about"),
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct Cli {
-    /// Control socket of the daemon [default: from daemon.toml or /run/singbox-board/daemon.sock]
-    #[arg(long, global = true, env = "SINGBOX_BOARD_SOCKET")]
+    #[arg(
+        long,
+        global = true,
+        env = "SINGBOX_BOARD_SOCKET",
+        hide_env = true,
+        value_name = "PATH",
+        display_order = 100,
+        help = fl!("cli-socket")
+    )]
     socket: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "SINGBOX_BOARD_LANG",
+        hide_env = true,
+        value_name = "LANG",
+        value_parser = parse_lang,
+        display_order = 101,
+        help = fl!("cli-lang")
+    )]
+    lang: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        action = ArgAction::Help,
+        display_order = 102,
+        help = fl!("cli-help")
+    )]
+    help: Option<bool>,
+
+    #[arg(
+        short = 'V',
+        long,
+        action = ArgAction::Version,
+        display_order = 103,
+        help = fl!("cli-version")
+    )]
+    version: Option<bool>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -39,74 +80,79 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the terminal dashboard (default)
+    #[command(about = fl!("cli-tui"))]
     Tui,
-    /// Run the root daemon that supervises sing-box
+    #[command(about = fl!("cli-daemon"))]
     Daemon {
-        /// Daemon configuration file
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", help = fl!("cli-daemon-config"))]
         config: Option<PathBuf>,
-        /// Allow running without root (development only)
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-daemon-allow-non-root"))]
         allow_non_root: bool,
-        /// Print the commented default configuration and exit
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-daemon-print-default-config"))]
         print_default_config: bool,
     },
-    /// Show daemon and sing-box status
+    #[command(about = fl!("cli-status"))]
     Status {
-        /// Print raw JSON
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-status-json"))]
         json: bool,
     },
-    /// Start sing-box
+    #[command(about = fl!("cli-start"))]
     Start,
-    /// Stop sing-box
+    #[command(about = fl!("cli-stop"))]
     Stop,
-    /// Restart sing-box
+    #[command(about = fl!("cli-restart"))]
     Restart,
-    /// Validate the configuration and hot-reload sing-box (SIGHUP)
+    #[command(about = fl!("cli-reload"))]
     Reload,
-    /// Validate the sing-box configuration (`sing-box check`)
+    #[command(about = fl!("cli-check"))]
     Check,
-    /// Print sing-box and daemon output
+    #[command(about = fl!("cli-logs"))]
     Logs {
-        /// Number of buffered lines to print first
-        #[arg(short = 'n', long, default_value_t = 200)]
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = 200,
+            hide_default_value = true,
+            help = fl!("cli-logs-tail")
+        )]
         tail: usize,
-        /// Keep printing new lines
-        #[arg(short, long)]
+        #[arg(short, long, help = fl!("cli-logs-follow"))]
         follow: bool,
     },
-    /// Install or update sing-box from the MiChongs/sing-box GitHub releases
+    #[command(about = fl!("cli-update"))]
     Update {
-        /// Only report whether an update is available
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-update-check"))]
         check: bool,
-        /// Install a specific release tag, e.g. v1.14.1-xiaobaf14g.1
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-update-tag"))]
         tag: Option<String>,
-        /// Reinstall even if the version is unchanged
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-update-force"))]
         force: bool,
     },
-    /// Choose the optional components (Sub-Store, http-meta); asked on first run
+    #[command(about = fl!("cli-setup"))]
     Setup {
-        /// Enable Sub-Store (yes/no); asked interactively when omitted
-        #[arg(long, value_name = "BOOL", value_parser = clap::builder::BoolishValueParser::new())]
+        #[arg(
+            long,
+            value_name = "BOOL",
+            value_parser = clap::builder::BoolishValueParser::new(),
+            help = fl!("cli-setup-sub-store")
+        )]
         sub_store: Option<bool>,
-        /// Enable http-meta (yes/no); asked interactively when omitted
-        #[arg(long, value_name = "BOOL", value_parser = clap::builder::BoolishValueParser::new())]
+        #[arg(
+            long,
+            value_name = "BOOL",
+            value_parser = clap::builder::BoolishValueParser::new(),
+            help = fl!("cli-setup-http-meta")
+        )]
         http_meta: Option<bool>,
     },
-    /// Manage an optional component; shows its details and URLs without an action
+    #[command(about = fl!("cli-component"))]
     Component {
-        #[arg(value_enum)]
+        #[arg(value_enum, hide_possible_values = true, help = fl!("cli-component-name"))]
         component: Component,
-        #[arg(value_enum)]
+        #[arg(value_enum, hide_possible_values = true, help = fl!("cli-component-action"))]
         action: Option<ComponentAction>,
     },
-    /// Core versions: list releases, install, switch, import custom builds
+    #[command(about = fl!("cli-core"))]
     Core {
         #[command(subcommand)]
         action: Option<CoreCmd>,
@@ -115,81 +161,126 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CoreCmd {
-    /// Release sources (MiChongs, SagerNet and custom repositories)
+    #[command(about = fl!("cli-core-sources"))]
     Sources,
-    /// Add or remove a custom GitHub source (root only)
+    #[command(about = fl!("cli-core-source"))]
     Source {
         #[command(subcommand)]
         action: SourceCmd,
     },
-    /// Releases of a source with the builds available for this machine
+    #[command(about = fl!("cli-core-list"))]
     List {
-        /// owner/repo [default: the source `update` follows]
-        #[arg(long)]
+        #[arg(long, value_name = "OWNER/REPO", help = fl!("cli-core-source-option"))]
         source: Option<String>,
-        #[arg(long, default_value_t = 1)]
+        #[arg(
+            long,
+            default_value_t = 1,
+            hide_default_value = true,
+            help = fl!("cli-core-list-page")
+        )]
         page: u32,
-        /// Hide pre-releases
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-list-stable"))]
         stable: bool,
-        /// Bypass the 10 minute cache
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-list-refresh"))]
         refresh: bool,
     },
-    /// Cores in the local version store
+    #[command(about = fl!("cli-core-installed"))]
     Installed,
-    /// Download a release into the store and switch to it
+    #[command(about = fl!("cli-core-install"))]
     Install {
-        /// Release tag, e.g. v1.14.1-xiaobaf14g.1
+        #[arg(help = fl!("cli-core-install-tag"))]
         tag: String,
-        /// owner/repo [default: the source `update` follows]
-        #[arg(long)]
+        #[arg(long, value_name = "OWNER/REPO", help = fl!("cli-core-source-option"))]
         source: Option<String>,
-        /// Build variant, e.g. ebpf, glibc, musl [default: plain build]
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            hide_default_value = true,
+            help = fl!("cli-core-install-variant")
+        )]
         variant: String,
-        /// Only store it, do not switch
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-no-switch"))]
         no_switch: bool,
-        /// Switch even if the new core rejects the configuration
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-force"))]
         force: bool,
     },
-    /// Switch to a stored core (id, version or tag)
+    #[command(about = fl!("cli-core-use"))]
     Use {
+        #[arg(help = fl!("cli-core-id"))]
         core: String,
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-force"))]
         force: bool,
     },
-    /// Delete a stored core (id, version or tag)
-    Remove { core: String },
-    /// Store a custom core from a local file or http(s) URL (root only)
+    #[command(about = fl!("cli-core-remove"))]
+    Remove {
+        #[arg(help = fl!("cli-core-id"))]
+        core: String,
+    },
+    #[command(about = fl!("cli-core-import"))]
     Import {
-        /// Absolute path or URL of a binary, .tar.gz, .zip or .gz
+        #[arg(help = fl!("cli-core-import-location"))]
         location: String,
-        /// Expected sha256 of the file
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-import-sha256"))]
         sha256: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-core-no-switch"))]
         no_switch: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum SourceCmd {
-    /// Add a GitHub repository publishing sing-box-<version>-linux-<arch> archives
+    #[command(about = fl!("cli-source-add"))]
     Add {
-        /// owner/repo
+        #[arg(value_name = "OWNER/REPO", help = fl!("cli-source-add-repo"))]
         repo: String,
-        #[arg(long)]
+        #[arg(long, help = fl!("cli-source-add-name"))]
         name: Option<String>,
     },
-    /// Remove a custom source
-    Remove { repo: String },
+    #[command(about = fl!("cli-source-remove"))]
+    Remove {
+        #[arg(value_name = "OWNER/REPO", help = fl!("cli-source-remove-repo"))]
+        repo: String,
+    },
+}
+
+fn parse_lang(value: &str) -> Result<String, cli::LocalizedError> {
+    match i18n::resolve(Some(value)) {
+        Ok(_) => Ok(value.to_owned()),
+        Err(value) => Err(cli::LocalizedError(fl!("cli-lang-invalid", value = value))),
+    }
+}
+
+/// The language of this run, read before clap so that help and parse errors
+/// are localized too: `--lang`, then `SINGBOX_BOARD_LANG`, then the locale.
+fn initial_language() -> Lang {
+    let mut args = std::env::args().skip(1);
+    let mut flag = None;
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--lang" {
+            flag = args.next();
+        } else if let Some(value) = arg.strip_prefix("--lang=") {
+            flag = Some(value.to_owned());
+        }
+    }
+    flag.or_else(|| std::env::var("SINGBOX_BOARD_LANG").ok())
+        .and_then(|value| i18n::resolve(Some(&value)).ok())
+        .unwrap_or_else(|| i18n::resolve(None).unwrap_or(Lang::En))
+}
+
+fn parse_cli() -> Cli {
+    let matches = cli::localize(Cli::command())
+        .try_get_matches()
+        .unwrap_or_else(|err| cli::exit(err));
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| cli::exit(err))
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    i18n::set_language(initial_language());
+    let cli = parse_cli();
+    let explicit_lang = cli.lang.is_some();
     let result = match cli.command.unwrap_or(Cmd::Tui) {
         Cmd::Daemon {
             config,
@@ -200,14 +291,14 @@ fn main() -> ExitCode {
                 print!("{}", config::TEMPLATE);
                 return ExitCode::SUCCESS;
             }
-            run_daemon(cli.socket, config, allow_non_root)
+            run_daemon(cli.socket, config, allow_non_root, explicit_lang)
         }
         command => run_client(cli.socket, command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err:#}");
+            eprintln!("{}", fl!("error-line", message = error_chain(&err)));
             ExitCode::FAILURE
         }
     }
@@ -217,6 +308,7 @@ fn run_daemon(
     socket: Option<PathBuf>,
     config_path: Option<PathBuf>,
     allow_non_root: bool,
+    explicit_lang: bool,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -228,10 +320,18 @@ fn run_daemon(
     let explicit = config_path.is_some();
     let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
     let (mut config, found) = DaemonConfig::load(&path, explicit)?;
+    // `--lang` / SINGBOX_BOARD_LANG win over daemon.toml.
+    if !explicit_lang {
+        match i18n::resolve(Some(&config.language)) {
+            Ok(lang) => i18n::set_language(lang),
+            Err(value) => tracing::warn!("{}", fl_log!("daemon-language-invalid", value = value)),
+        }
+    }
+    let path_text = path.display().to_string();
     if found {
-        tracing::info!("loaded {}", path.display());
+        tracing::info!("{}", fl_log!("daemon-config-loaded", path = path_text));
     } else {
-        tracing::info!("{} not found, using defaults", path.display());
+        tracing::info!("{}", fl_log!("daemon-config-missing", path = path_text));
     }
     if let Some(socket) = socket {
         config.socket = socket;
@@ -323,7 +423,7 @@ async fn run_core(client: &DaemonClient, action: Option<CoreCmd>) -> Result<()> 
                 Ok(path) if !is_url => path.display().to_string(),
                 _ => location,
             };
-            eprintln!("storing the custom core, this may take a while…");
+            eprintln!("{}", fl!("ctl-importing-core"));
             ctl::command(
                 client,
                 Request::CoreImport {

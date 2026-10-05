@@ -5,6 +5,8 @@ use std::ffi::CString;
 
 use nix::unistd::{Gid, Group, Uid, User, getgrouplist};
 
+use crate::i18n::fl_log;
+
 #[derive(Debug, Clone)]
 pub struct Authorizer {
     daemon_uid: u32,
@@ -17,11 +19,18 @@ impl Authorizer {
         let group = group_name.and_then(|name| match Group::from_name(name) {
             Ok(Some(group)) => Some(group.gid),
             Ok(None) => {
-                tracing::warn!("socket group {name:?} does not exist; only root may connect");
+                tracing::warn!("{}", fl_log!("auth-group-missing", group = name));
                 None
             }
             Err(err) => {
-                tracing::warn!("cannot look up socket group {name:?}: {err}");
+                tracing::warn!(
+                    "{}",
+                    fl_log!(
+                        "auth-group-lookup-failed",
+                        group = name,
+                        error = err.to_string()
+                    )
+                );
                 None
             }
         });

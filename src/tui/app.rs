@@ -17,11 +17,13 @@ use crate::clash::{
     ClashClient, Configs, Connection, Connections, DEFAULT_TEST_URL, Proxies, Proxy,
 };
 use crate::client::DaemonClient;
+use crate::i18n::fl;
 use crate::protocol::{
     ClashApi, Component, ComponentAction, ComponentStatus, CoreReleasePage, CoreSource, CoreState,
     LogEntry, Request, Status, StoredCore, UpdateInfo,
 };
 use crate::substore::{Entry, Overview, provider_snippet};
+use crate::util::{error_chain, text_width};
 
 const MAX_LOG_LINES: usize = 5000;
 const HISTORY_POINTS: usize = 300;
@@ -80,14 +82,14 @@ impl Tab {
         Tab::Core,
     ];
 
-    pub fn title(self) -> &'static str {
+    pub fn title(self) -> String {
         match self {
-            Tab::Overview => "Overview",
-            Tab::Proxies => "Proxies",
-            Tab::Connections => "Connections",
-            Tab::Logs => "Logs",
-            Tab::SubStore => "Sub-Store",
-            Tab::Core => "Core",
+            Tab::Overview => fl!("tab-overview"),
+            Tab::Proxies => fl!("tab-proxies"),
+            Tab::Connections => fl!("tab-connections"),
+            Tab::Logs => fl!("tab-logs"),
+            Tab::SubStore => "Sub-Store".to_owned(),
+            Tab::Core => fl!("tab-core"),
         }
     }
 
@@ -424,23 +426,24 @@ impl App {
                 self.busy.retain(|(busy, _)| *busy != id);
                 match result {
                     Ok(info) if info.update_available => {
+                        let version = if info.prerelease {
+                            fl!("version-prerelease", version = info.latest.clone())
+                        } else {
+                            info.latest.clone()
+                        };
                         self.popup = Some(Popup::Confirm {
-                            message: format!(
-                                "Install sing-box {}{}?\ninstalled: {}",
-                                info.latest,
-                                if info.prerelease {
-                                    " (pre-release)"
-                                } else {
-                                    ""
-                                },
-                                info.current.as_deref().unwrap_or("none")
+                            message: fl!(
+                                "tui-confirm-update",
+                                version = version,
+                                current = info.current.clone().unwrap_or_else(|| fl!("none"))
                             ),
                             action: PendingAction::Update,
                         });
                     }
-                    Ok(info) => {
-                        self.notify(format!("sing-box {} is up to date", info.latest), false)
-                    }
+                    Ok(info) => self.notify(
+                        fl!("up-to-date", name = format!("sing-box {}", info.latest)),
+                        false,
+                    ),
                     Err(err) => self.notify(err, true),
                 }
             }
@@ -449,10 +452,14 @@ impl App {
 
     /// Short messages go to the footer, long or multi-line ones to a popup.
     pub(super) fn notify(&mut self, text: String, error: bool) {
-        if text.contains('\n') || text.chars().count() > 90 {
-            let title = if error { "Error" } else { "Result" };
+        if text.contains('\n') || text_width(&text) > 90 {
+            let title = if error {
+                fl!("tui-title-error")
+            } else {
+                fl!("tui-title-result")
+            };
             self.popup = Some(Popup::Message {
-                title: title.to_owned(),
+                title,
                 body: text,
                 error,
                 copy: None,
@@ -582,11 +589,11 @@ impl App {
                 self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
             }
             KeyCode::Char(c @ '1'..='6') => self.tab = Tab::ALL[c as usize - '1' as usize],
-            KeyCode::Char('s') => self.daemon_action("starting sing-box", Request::Start),
-            KeyCode::Char('x') => self.confirm("Stop sing-box?", PendingAction::Stop),
-            KeyCode::Char('r') => self.confirm("Restart sing-box?", PendingAction::Restart),
-            KeyCode::Char('R') => self.daemon_action("reloading configuration", Request::Reload),
-            KeyCode::Char('c') => self.daemon_action("checking configuration", Request::Check),
+            KeyCode::Char('s') => self.daemon_action(&fl!("busy-starting"), Request::Start),
+            KeyCode::Char('x') => self.confirm(fl!("tui-confirm-stop"), PendingAction::Stop),
+            KeyCode::Char('r') => self.confirm(fl!("tui-confirm-restart"), PendingAction::Restart),
+            KeyCode::Char('R') => self.daemon_action(&fl!("busy-reloading"), Request::Reload),
+            KeyCode::Char('c') => self.daemon_action(&fl!("busy-checking"), Request::Check),
             KeyCode::Char('u') => self.check_update(),
             KeyCode::Char('m') => self.cycle_mode(),
             _ => match self.tab {
@@ -609,7 +616,7 @@ impl App {
             Popup::Message {
                 copy: Some(text), ..
             } if key.code == KeyCode::Char('y') => {
-                self.copy(text, "snippet");
+                self.copy(text, fl!("tui-copied-snippet"));
             }
             Popup::Message { .. } => {
                 if !matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
@@ -661,7 +668,7 @@ impl App {
                         })
                     }
                     Some(sub_store) => self.daemon_action(
-                        "setting up components",
+                        &fl!("busy-setup"),
                         Request::Setup {
                             sub_store,
                             http_meta: answer,
@@ -753,9 +760,10 @@ impl App {
                 move_table(&mut self.conn_state, len, isize::MAX / 2)
             }
             KeyCode::Char('d') | KeyCode::Delete => self.close_selected_connection(),
-            KeyCode::Char('D') => {
-                self.confirm("Close all connections?", PendingAction::CloseAllConnections)
-            }
+            KeyCode::Char('D') => self.confirm(
+                fl!("tui-confirm-close-all"),
+                PendingAction::CloseAllConnections,
+            ),
             _ => {}
         }
     }
@@ -801,7 +809,7 @@ impl App {
             KeyCode::Char('y') => match self.store_focus {
                 StoreFocus::Entries => {
                     if let Some(url) = self.selected_entry().map(|e| e.singbox_url.clone()) {
-                        self.copy(url, "sing-box subscription URL");
+                        self.copy(url, fl!("tui-copied-subscription-url"));
                     }
                 }
                 StoreFocus::Components => {
@@ -809,10 +817,8 @@ impl App {
                         .component(self.selected_component())
                         .and_then(|c| c.url.clone());
                     match url {
-                        Some(url) => self.copy(url, "URL"),
-                        None => {
-                            self.notify("no URL yet; enable the component first".to_owned(), true)
-                        }
+                        Some(url) => self.copy(url, fl!("tui-copied-url")),
+                        None => self.notify(fl!("tui-no-url"), true),
                     }
                 }
             },
@@ -821,8 +827,8 @@ impl App {
                     .component(Component::SubStore)
                     .and_then(|c| c.url.clone())
                 {
-                    Some(url) => self.copy(url, "Sub-Store web UI URL"),
-                    None => self.notify("Sub-Store is not set up".to_owned(), true),
+                    Some(url) => self.copy(url, fl!("tui-copied-web-ui")),
+                    None => self.notify(fl!("tui-sub-store-not-set-up"), true),
                 }
             }
             _ => {}
@@ -855,7 +861,7 @@ impl App {
     fn open_component_menu(&mut self) {
         let component = self.selected_component();
         let Some(status) = self.component(component) else {
-            self.notify("daemon status is not available".to_owned(), true);
+            self.notify(fl!("tui-status-unavailable"), true);
             return;
         };
         let actions = if !status.enabled {
@@ -882,38 +888,42 @@ impl App {
     }
 
     fn component_action(&mut self, component: Component, action: ComponentAction) {
-        let verb = match action {
-            ComponentAction::Start => "starting",
-            ComponentAction::Stop => "stopping",
-            ComponentAction::Restart => "restarting",
-            ComponentAction::Enable => "installing",
-            ComponentAction::Disable => "disabling",
-            ComponentAction::Update => "updating",
+        let action_key = match action {
+            ComponentAction::Start => "start",
+            ComponentAction::Stop => "stop",
+            ComponentAction::Restart => "restart",
+            ComponentAction::Enable => "enable",
+            ComponentAction::Disable => "disable",
+            ComponentAction::Update => "update",
         };
         self.daemon_action(
-            &format!("{verb} {}", component.title()),
+            &fl!(
+                "busy-component",
+                action = action_key,
+                component = component.title()
+            ),
             Request::Component { component, action },
         );
     }
 
     fn show_snippet(&mut self) {
         let Some(entry) = self.selected_entry() else {
-            self.notify("no subscription selected".to_owned(), true);
+            self.notify(fl!("tui-no-subscription-selected"), true);
             return;
         };
         let snippet = provider_snippet(&entry.name, &entry.singbox_url);
         self.popup = Some(Popup::Message {
-            title: format!("sing-box provider for {} · y copy", entry.name),
+            title: fl!("tui-snippet-title", name = entry.name.clone()),
             body: snippet.clone(),
             error: false,
             copy: Some(snippet),
         });
     }
 
-    /// Queues `text` for the terminal clipboard (OSC 52).
-    fn copy(&mut self, text: String, what: &str) {
+    /// Queues `text` for the terminal clipboard (OSC 52) and confirms with `message`.
+    fn copy(&mut self, text: String, message: String) {
         self.clipboard = Some(text);
-        self.notify(format!("copied {what}"), false);
+        self.notify(message, false);
     }
 
     pub fn take_clipboard(&mut self) -> Option<String> {
@@ -958,19 +968,16 @@ impl App {
 
     // ----- actions ------------------------------------------------------
 
-    fn confirm(&mut self, message: &str, action: PendingAction) {
-        self.popup = Some(Popup::Confirm {
-            message: message.to_owned(),
-            action,
-        });
+    fn confirm(&mut self, message: String, action: PendingAction) {
+        self.popup = Some(Popup::Confirm { message, action });
     }
 
     fn run_pending(&mut self, action: PendingAction) {
         match action {
-            PendingAction::Stop => self.daemon_action("stopping sing-box", Request::Stop),
-            PendingAction::Restart => self.daemon_action("restarting sing-box", Request::Restart),
+            PendingAction::Stop => self.daemon_action(&fl!("busy-stopping"), Request::Stop),
+            PendingAction::Restart => self.daemon_action(&fl!("busy-restarting"), Request::Restart),
             PendingAction::Update => self.daemon_action(
-                "downloading sing-box",
+                &fl!("busy-downloading"),
                 Request::Update {
                     tag: None,
                     force: false,
@@ -981,9 +988,9 @@ impl App {
             | PendingAction::CoreRemove { .. }
             | PendingAction::CoreSourceRemove { .. }) => self.core_run_pending(core),
             PendingAction::CloseAllConnections => {
-                self.clash_action("closing connections", |clash| async move {
+                self.clash_action(&fl!("busy-closing-connections"), |clash| async move {
                     clash.close_all_connections().await?;
-                    Ok("all connections closed".to_owned())
+                    Ok(fl!("tui-connections-closed"))
                 })
             }
         }
@@ -1003,7 +1010,7 @@ impl App {
             let result = client
                 .command(request)
                 .await
-                .map_err(|err| format!("{err:#}"));
+                .map_err(|err| error_chain(&err));
             let _ = tx.send(AppEvent::ActionDone { id, result });
         });
     }
@@ -1014,40 +1021,34 @@ impl App {
         Fut: Future<Output = anyhow::Result<String>> + Send,
     {
         let Some(clash) = self.clash.clone() else {
-            self.notify(
-                "Clash API is not configured (experimental.clash_api)".to_owned(),
-                true,
-            );
+            self.notify(fl!("tui-clash-api-missing"), true);
             return;
         };
         let id = self.begin(label);
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = action(clash).await.map_err(|err| format!("{err:#}"));
+            let result = action(clash).await.map_err(|err| error_chain(&err));
             let _ = tx.send(AppEvent::ActionDone { id, result });
         });
     }
 
     fn check_update(&mut self) {
-        let id = self.begin("checking for updates");
+        let id = self.begin(&fl!("busy-checking-updates"));
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = client
-                .check_update()
-                .await
-                .map_err(|err| format!("{err:#}"));
+            let result = client.check_update().await.map_err(|err| error_chain(&err));
             let _ = tx.send(AppEvent::UpdateChecked { id, result });
         });
     }
 
     fn cycle_mode(&mut self) {
         let Some(configs) = &self.configs else {
-            self.notify("mode list is not available yet".to_owned(), true);
+            self.notify(fl!("tui-mode-list-unavailable"), true);
             return;
         };
         if configs.mode_list.len() < 2 {
-            self.notify("only one Clash mode is configured".to_owned(), true);
+            self.notify(fl!("tui-single-mode"), true);
             return;
         }
         let index = configs
@@ -1056,9 +1057,9 @@ impl App {
             .position(|m| m.eq_ignore_ascii_case(&configs.mode))
             .map_or(0, |i| (i + 1) % configs.mode_list.len());
         let mode = configs.mode_list[index].clone();
-        self.clash_action("switching mode", move |clash| async move {
+        self.clash_action(&fl!("busy-switching-mode"), move |clash| async move {
             clash.set_mode(&mode).await?;
-            Ok(format!("mode set to {mode}"))
+            Ok(fl!("tui-mode-set", mode = mode))
         });
     }
 
@@ -1074,12 +1075,12 @@ impl App {
             return;
         };
         if !self.group(&group).is_some_and(Proxy::is_selectable) {
-            self.notify(format!("{group} does not accept manual selection"), true);
+            self.notify(fl!("tui-not-selectable", group = group), true);
             return;
         }
-        self.clash_action("selecting node", move |clash| async move {
+        self.clash_action(&fl!("busy-selecting-node"), move |clash| async move {
             clash.select(&group, &member).await?;
-            Ok(format!("{group} → {member}"))
+            Ok(fl!("tui-node-selected", group = group, node = member))
         });
     }
 
@@ -1093,10 +1094,7 @@ impl App {
 
     fn test_delays(&mut self, names: Vec<String>) {
         let Some(clash) = self.clash.clone() else {
-            self.notify(
-                "Clash API is not configured (experimental.clash_api)".to_owned(),
-                true,
-            );
+            self.notify(fl!("tui-clash-api-missing"), true);
             return;
         };
         for name in &names {
@@ -1113,7 +1111,7 @@ impl App {
                         let result = clash
                             .delay(&name, DEFAULT_TEST_URL, DELAY_TIMEOUT_MS)
                             .await
-                            .map_err(|err| format!("{err:#}"));
+                            .map_err(|err| error_chain(&err));
                         let _ = tx.send(AppEvent::Delay { name, result });
                     }
                 })
@@ -1131,9 +1129,9 @@ impl App {
         };
         let id = connection.id.clone();
         let target = connection.target();
-        self.clash_action("closing connection", move |clash| async move {
+        self.clash_action(&fl!("busy-closing-connection"), move |clash| async move {
             clash.close_connection(&id).await?;
-            Ok(format!("closed {target}"))
+            Ok(fl!("tui-connection-closed", target = target))
         });
     }
 }

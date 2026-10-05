@@ -2,6 +2,11 @@
 # Default location: /etc/singbox-board/daemon.toml
 # Every key is optional; the values below are the built-in defaults.
 
+# Language of the daemon's own log: "auto" follows the locale (LC_ALL,
+# LC_MESSAGES, LANG), otherwise "en" or "zh-CN". Replies to `singbox-board`
+# commands and the TUI use the language of the client that sent them.
+language = "auto"
+
 # Control socket used by `singbox-board` (TUI / CLI) to talk to the daemon.
 socket = "/run/singbox-board/daemon.sock"
 

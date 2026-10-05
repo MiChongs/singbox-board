@@ -26,10 +26,12 @@ use super::github::{
 };
 use super::logs::LogHub;
 use crate::config::DaemonConfig;
+use crate::i18n::{self, fl, fl_log};
 use crate::protocol::{
-    Checksum, CoreRelease, CoreReleasePage, CoreSource, CoreVariant, StoredCore, core_store_id,
+    ADOPTED_NAME, BUILTIN_SOURCES, Checksum, CoreRelease, CoreReleasePage, CoreSource, CoreVariant,
+    IMPORTED_NAME, StoredCore, builtin_source, core_store_id, variant_label,
 };
-use crate::util::{fmt_bytes, now_unix};
+use crate::util::{fmt_bytes, join_list, now_unix};
 
 pub const LOCAL_SOURCE: &str = "local";
 const PER_PAGE: u32 = 15;
@@ -41,20 +43,6 @@ const SUMS_NAMES: [&str; 5] = [
     "sha256sums.txt",
     "sha256sum.txt",
     "checksums.txt",
-];
-
-/// Release sources everyone may install from.
-const BUILTIN: [(&str, &str, &str); 2] = [
-    (
-        "MiChongs/sing-box",
-        "MiChongs · xiaobaf14g",
-        "Smart · XHTTP · EasyTier · eBPF",
-    ),
-    (
-        "SagerNet/sing-box",
-        "SagerNet · official",
-        "Upstream releases",
-    ),
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -94,7 +82,11 @@ impl CoreManager {
             Ok(text) => serde_json::from_str::<SourcesFile>(&text)
                 .map(|f| f.custom)
                 .unwrap_or_else(|err| {
-                    logs.warn(format!("ignoring {}: {err}", sources_path.display()));
+                    logs.warn(fl_log!(
+                        "cores-sources-ignored",
+                        path = sources_path.display().to_string(),
+                        error = err.to_string()
+                    ));
                     Vec::new()
                 }),
             Err(_) => Vec::new(),
@@ -122,13 +114,16 @@ impl CoreManager {
     // ----- sources ------------------------------------------------------
 
     pub async fn sources(&self) -> Vec<CoreSource> {
-        let mut sources: Vec<CoreSource> = BUILTIN
+        let mut sources: Vec<CoreSource> = BUILTIN_SOURCES
             .iter()
-            .map(|(id, name, description)| CoreSource {
-                id: (*id).to_owned(),
-                name: (*name).to_owned(),
-                description: (*description).to_owned(),
-                builtin: true,
+            .filter_map(|id| {
+                let (name, description) = builtin_source(id)?;
+                Some(CoreSource {
+                    id: (*id).to_owned(),
+                    name,
+                    description,
+                    builtin: true,
+                })
             })
             .collect();
         let configured = &self.config.update.repo;
@@ -139,7 +134,7 @@ impl CoreManager {
             sources.push(CoreSource {
                 id: configured.clone(),
                 name: configured.clone(),
-                description: "update.repo in daemon.toml".to_owned(),
+                description: fl!("source-configured-description"),
                 builtin: true,
             });
         }
@@ -147,7 +142,7 @@ impl CoreManager {
             sources.push(CoreSource {
                 id: custom.repo.clone(),
                 name: custom.name.clone(),
-                description: "custom source".to_owned(),
+                description: fl!("source-custom-description"),
                 builtin: false,
             });
         }
@@ -159,9 +154,7 @@ impl CoreManager {
             .await
             .into_iter()
             .find(|s| s.id.eq_ignore_ascii_case(id))
-            .ok_or_else(|| {
-                anyhow!("unknown core source {id}; root can add it with `singbox-board core source add {id}`")
-            })
+            .ok_or_else(|| anyhow!(fl!("cores-unknown-source", id = id)))
     }
 
     pub async fn add_source(&self, repo: &str, name: Option<String>) -> Result<CoreSource> {
@@ -174,15 +167,15 @@ impl CoreManager {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c));
         if !valid {
-            bail!("expected a GitHub repository as owner/name, got {repo:?}");
+            bail!(fl!("cores-invalid-repo", repo = repo));
         }
         if self.source(repo).await.is_ok() {
-            bail!("{repo} is already a core source");
+            bail!(fl!("cores-source-exists", repo = repo));
         }
         self.github()?
             .check_repo(repo)
             .await
-            .with_context(|| format!("look up {repo}"))?;
+            .with_context(|| fl!("cores-lookup-failed", repo = repo))?;
         let name = name
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| repo.to_owned());
@@ -192,11 +185,12 @@ impl CoreManager {
             name: name.clone(),
         });
         self.save_sources(&custom)?;
-        self.logs.info(format!("added core source {repo}"));
+        self.logs
+            .info(fl_log!("cores-source-added-log", repo = repo));
         Ok(CoreSource {
             id: repo.to_owned(),
             name,
-            description: "custom source".to_owned(),
+            description: fl!("source-custom-description"),
             builtin: false,
         })
     }
@@ -206,10 +200,10 @@ impl CoreManager {
         let before = custom.len();
         custom.retain(|s| !s.repo.eq_ignore_ascii_case(id));
         if custom.len() == before {
-            bail!("{id} is not a custom source (built-in sources cannot be removed)");
+            bail!(fl!("cores-not-custom", id = id));
         }
         self.save_sources(&custom)?;
-        self.logs.info(format!("removed core source {id}"));
+        self.logs.info(fl_log!("cores-source-removed-log", id = id));
         Ok(())
     }
 
@@ -299,9 +293,7 @@ impl CoreManager {
         };
         found.map_err(|err| {
             if err.to_string().contains("404") {
-                anyhow!(
-                    "{source} has no release {tag} (pick another source with --source owner/repo)"
-                )
+                anyhow!(fl!("cores-no-release", source = source, tag = tag))
             } else {
                 err
             }
@@ -319,7 +311,7 @@ impl CoreManager {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_./+".contains(c));
         if !valid {
-            bail!("invalid core id {id:?}");
+            bail!(fl!("cores-invalid-id", id = id));
         }
         Ok(self.root.join(id))
     }
@@ -404,35 +396,33 @@ impl CoreManager {
         let tokens = self.tokens();
         let builds = match_assets(&release.assets, &tokens);
         let Some((_, asset)) = builds.iter().find(|(v, _)| v == variant) else {
-            let available: Vec<&str> = builds
-                .iter()
-                .map(|(v, _)| if v.is_empty() { "default" } else { v.as_str() })
-                .collect();
-            bail!(
-                "{} {} has no {} build with variant {:?}; available: {}",
-                source.id,
-                release.tag_name,
-                self.platform(),
-                display_variant(variant),
-                if available.is_empty() {
-                    "none".to_owned()
+            let available: Vec<String> = builds.iter().map(|(v, _)| variant_label(v)).collect();
+            bail!(fl!(
+                "cores-no-variant",
+                source = source.id.clone(),
+                tag = release.tag_name.clone(),
+                platform = self.platform(),
+                variant = variant_label(variant),
+                available = if available.is_empty() {
+                    fl!("none")
                 } else {
-                    available.join(", ")
+                    join_list(&available)
                 }
-            );
+            ));
         };
-        self.logs.info(format!(
-            "downloading {} ({}) from {}",
-            asset.name,
-            fmt_bytes(asset.size),
-            source.id
+        self.logs.info(fl_log!(
+            "cores-downloading",
+            asset = asset.name.clone(),
+            size = fmt_bytes(asset.size),
+            source = source.id.clone()
         ));
         let data = github.download(asset, MAX_DOWNLOAD).await?;
         let checksum = verify_release_asset(&github, &release, asset, &data).await?;
         if checksum == Checksum::None {
-            self.logs.warn(format!(
-                "{} publishes no checksum for {}; relying on TLS only",
-                source.id, asset.name
+            self.logs.warn(fl_log!(
+                "cores-no-checksum",
+                source = source.id.clone(),
+                asset = asset.name.clone()
             ));
         }
         let meta = StoredCore {
@@ -459,7 +449,7 @@ impl CoreManager {
         let location = location.trim();
         let (name, data) = if location.starts_with("http://") || location.starts_with("https://") {
             self.logs
-                .info(format!("downloading custom core {location}"));
+                .info(fl_log!("cores-import-downloading", location = location));
             let data = self.github()?.fetch(location, MAX_DOWNLOAD).await?;
             let name = location
                 .split(['?', '#'])
@@ -471,11 +461,11 @@ impl CoreManager {
         } else {
             let path = Path::new(location);
             if !path.is_absolute() {
-                bail!("give an absolute path or an http(s) URL");
+                bail!(fl!("cores-import-location"));
             }
             let data = tokio::fs::read(path)
                 .await
-                .with_context(|| format!("read {}", path.display()))?;
+                .with_context(|| fl!("err-read", path = path.display().to_string()))?;
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -490,8 +480,7 @@ impl CoreManager {
             }
             None => Checksum::None,
         };
-        self.store_local(&name, data, "Custom import", checksum)
-            .await
+        self.store_local(&name, data, IMPORTED_NAME, checksum).await
     }
 
     /// Keeps a hand-placed binary at `binary` selectable before it is replaced by a symlink.
@@ -502,15 +491,15 @@ impl CoreManager {
         }
         let data = tokio::fs::read(binary)
             .await
-            .with_context(|| format!("read {}", binary.display()))?;
+            .with_context(|| fl!("err-read", path = binary.display().to_string()))?;
         let core = self
-            .store_local("sing-box", data, "Previously installed", Checksum::None)
+            .store_local("sing-box", data, ADOPTED_NAME, Checksum::None)
             .await?;
-        self.logs.info(format!(
-            "kept the previous {} ({}) as core {}",
-            binary.display(),
-            core.version,
-            core.id
+        self.logs.info(fl_log!(
+            "cores-adopted",
+            path = binary.display().to_string(),
+            version = core.version.clone(),
+            id = core.id.clone()
         ));
         Ok(Some(core))
     }
@@ -550,11 +539,12 @@ impl CoreManager {
         let staging = self.root.join(format!(".staging-{}", random_token(8)));
         let name_owned = name.to_owned();
         let staging_clone = staging.clone();
+        let lang = i18n::current();
         let unpacked = tokio::task::spawn_blocking(move || {
-            archive::unpack(&name_owned, &data, &staging_clone)
+            i18n::in_language(lang, || archive::unpack(&name_owned, &data, &staging_clone))
         })
         .await
-        .context("unpack task panicked")?;
+        .context(fl!("err-task-panicked"))?;
         let files = match unpacked {
             Ok(files) => files,
             Err(err) => {
@@ -566,9 +556,7 @@ impl CoreManager {
             Ok(version) => version,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&staging);
-                return Err(err.context(format!(
-                    "{name} does not run on this system (wrong architecture or variant?)"
-                )));
+                return Err(err.context(fl!("cores-not-runnable", name = name)));
             }
         };
         meta.version = version;
@@ -579,13 +567,13 @@ impl CoreManager {
         }
         let _ = std::fs::remove_dir_all(&final_dir);
         std::fs::rename(&staging, &final_dir)
-            .with_context(|| format!("move core into {}", final_dir.display()))?;
-        self.logs.info(format!(
-            "stored sing-box {} as {} ({}, {})",
-            meta.version,
-            meta.id,
-            fmt_bytes(meta.size),
-            checksum_label(meta.checksum)
+            .with_context(|| fl!("cores-move-failed", path = final_dir.display().to_string()))?;
+        self.logs.info(fl_log!(
+            "cores-stored-log",
+            version = meta.version.clone(),
+            id = meta.id.clone(),
+            size = fmt_bytes(meta.size),
+            checksum = i18n::in_log_language(|| meta.checksum.description())
         ));
         Ok(meta)
     }
@@ -593,19 +581,20 @@ impl CoreManager {
     pub fn remove(&self, id: &str) -> Result<()> {
         let dir = self.dir_of(id)?;
         if !dir.join("meta.json").is_file() {
-            bail!("no stored core {id}");
+            bail!(fl!("cores-not-stored", id = id));
         }
         if self.active().is_some_and(|c| c.id == id) {
-            bail!("{id} is the active core; switch to another one first");
+            bail!(fl!("cores-remove-active", id = id));
         }
-        std::fs::remove_dir_all(&dir).with_context(|| format!("delete {}", dir.display()))?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| fl!("err-delete", path = dir.display().to_string()))?;
         // Drop now-empty tag/source directories.
         for parent in dir.ancestors().skip(1).take(2) {
             if parent.starts_with(&self.root) && parent != self.root {
                 let _ = std::fs::remove_dir(parent);
             }
         }
-        self.logs.info(format!("deleted core {id}"));
+        self.logs.info(fl_log!("cores-deleted-log", id = id));
         Ok(())
     }
 
@@ -690,7 +679,7 @@ async fn verify_release_asset(
 ) -> Result<Checksum> {
     if let Some(sums) = sums_asset(release) {
         let text = String::from_utf8(github.download(sums, 4 * 1024 * 1024).await?)
-            .with_context(|| format!("{} is not text", sums.name))?;
+            .with_context(|| fl!("cores-sums-not-text", name = sums.name.clone()))?;
         if let Some(expected) = parse_sha256sums(&text).remove(&asset.name) {
             verify_sha256(data, &expected, &asset.name)?;
             return Ok(Checksum::Sums);
@@ -712,36 +701,19 @@ async fn core_version(binary: &Path) -> Result<String> {
             .output(),
     )
     .await
-    .map_err(|_| anyhow!("`sing-box version` timed out"))??;
+    .map_err(|_| anyhow!(fl!("cores-version-timeout")))??;
     let stdout = String::from_utf8_lossy(&output.stdout);
     match parse_version_output(&stdout) {
         Some(version) if output.status.success() => Ok(version),
-        _ => bail!(
-            "`sing-box version` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
+        _ => bail!(fl!(
+            "cores-version-failed",
+            error = String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        )),
     }
 }
 
 pub fn store_id(source: &str, tag: &str, variant: &str) -> String {
     core_store_id(source, tag, variant)
-}
-
-pub fn display_variant(variant: &str) -> &str {
-    if variant.is_empty() {
-        "default"
-    } else {
-        variant
-    }
-}
-
-pub fn checksum_label(checksum: Checksum) -> &'static str {
-    match checksum {
-        Checksum::Sums => "verified with SHA256SUMS",
-        Checksum::Digest => "verified with GitHub digest",
-        Checksum::Pinned => "verified with given sha256",
-        Checksum::None => "unverified",
-    }
 }
 
 #[cfg(test)]

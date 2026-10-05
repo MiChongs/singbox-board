@@ -14,10 +14,12 @@ use super::app::{App, AppEvent, PendingAction, Popup};
 use super::theme::{
     self, ACCENT, BLUE, GREEN, MARK, PEACH, SUBTEXT, TEXT, YELLOW, chip, dim, panel, pill, selected,
 };
+use crate::i18n::fl;
 use crate::protocol::{
     Checksum, CoreRelease, CoreReleasePage, CoreSource, Request, StoredCore, core_store_id,
+    variant_label,
 };
-use crate::util::fmt_bytes;
+use crate::util::{error_chain, fmt_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CoreFocus {
@@ -117,7 +119,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = client.core_sources().await.map_err(|e| format!("{e:#}"));
+            let result = client.core_sources().await.map_err(|e| error_chain(&e));
             let _ = tx.send(AppEvent::CoreSources(result));
         });
     }
@@ -126,7 +128,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = client.core_installed().await.map_err(|e| format!("{e:#}"));
+            let result = client.core_installed().await.map_err(|e| error_chain(&e));
             let _ = tx.send(AppEvent::CoreInstalled(result));
         });
     }
@@ -143,7 +145,7 @@ impl App {
             let result = client
                 .core_releases(&source, page, refresh)
                 .await
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| error_chain(&e));
             let _ = tx.send(AppEvent::CoreReleases {
                 source,
                 page,
@@ -291,18 +293,16 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.popup = Some(Popup::Input {
-                    title: "Add a core source".to_owned(),
-                    hint: "GitHub repository publishing sing-box-<version>-linux-<arch>.tar.gz (root only)"
-                        .to_owned(),
+                    title: fl!("tui-add-source-title"),
+                    hint: fl!("tui-add-source-hint"),
                     value: String::new(),
                     purpose: InputPurpose::AddSource,
                 })
             }
             KeyCode::Char('I') => {
                 self.popup = Some(Popup::Input {
-                    title: "Import a custom core".to_owned(),
-                    hint: "absolute path or http(s) URL of a binary, .tar.gz, .zip or .gz, optionally followed by its sha256 (root only)"
-                        .to_owned(),
+                    title: fl!("tui-import-title"),
+                    hint: fl!("tui-import-hint"),
                     value: String::new(),
                     purpose: InputPurpose::ImportCore,
                 })
@@ -360,9 +360,10 @@ impl App {
         };
         let Some(variant) = release.variants.get(self.core.variant_index(release)) else {
             self.notify(
-                format!(
-                    "{} has no build for {}",
-                    release.version, self.core.platform
+                fl!(
+                    "tui-no-build-for",
+                    version = release.version.clone(),
+                    platform = self.core.platform.clone()
                 ),
                 true,
             );
@@ -377,33 +378,41 @@ impl App {
         let stored = self.core.stored(&source, &release.tag, &variant.name);
         if stored.is_some_and(|c| c.active) {
             self.notify(
-                format!("{} is already the active core", release.version),
+                fl!("tui-already-active", version = release.version.clone()),
                 false,
             );
             return;
         }
-        let download = match stored {
-            Some(_) => "already stored".to_owned(),
-            None => format!("downloads {}", fmt_bytes(variant.size)),
+        let version = if release.prerelease {
+            fl!("version-prerelease", version = release.version.clone())
+        } else {
+            release.version.clone()
         };
-        let mut message = format!(
-            "{} sing-box {}{}\n{} · {} · {} · {}",
-            if activate { "Switch to" } else { "Download" },
-            release.version,
-            if release.prerelease {
-                " (pre-release)"
+        let checksum = variant.checksum.label();
+        let mut message = [
+            if activate {
+                fl!("tui-confirm-switch", version = version)
             } else {
-                ""
+                fl!("tui-confirm-download", version = version)
             },
-            source_name,
-            variant_label(&variant.name),
-            download,
-            checksum_text(variant.checksum),
-        );
+            fl!(
+                "tui-detail-build",
+                source = source_name,
+                variant = variant_label(&variant.name)
+            ),
+            match stored {
+                Some(_) => fl!("tui-detail-stored", checksum = checksum),
+                None => fl!(
+                    "tui-detail-download",
+                    size = fmt_bytes(variant.size),
+                    checksum = checksum
+                ),
+            },
+        ]
+        .join("\n");
         if activate {
-            message.push_str(
-                "\nYour configuration is checked first; sing-box restarts on the new core.",
-            );
+            message.push('\n');
+            message.push_str(&fl!("tui-switch-note"));
         }
         self.popup = Some(Popup::Confirm {
             message,
@@ -427,18 +436,22 @@ impl App {
         };
         if core.active {
             self.notify(
-                format!("{} is already the active core", core.version),
+                fl!("tui-already-active", version = core.version.clone()),
                 false,
             );
             return;
         }
         self.popup = Some(Popup::Confirm {
-            message: format!(
-                "Switch to sing-box {}\n{} · {}\nYour configuration is checked first; sing-box restarts on the new core.",
-                core.version,
-                core.source_name,
-                variant_label(&core.variant)
-            ),
+            message: [
+                fl!("tui-confirm-switch", version = core.version.clone()),
+                fl!(
+                    "tui-detail-build",
+                    source = core.source_label(),
+                    variant = variant_label(&core.variant)
+                ),
+                fl!("tui-switch-note"),
+            ]
+            .join("\n"),
             action: PendingAction::CoreActivate {
                 id: core.id.clone(),
             },
@@ -455,20 +468,20 @@ impl App {
             return;
         };
         if core.active {
-            self.notify(
-                "the active core cannot be deleted; switch first".to_owned(),
-                true,
-            );
+            self.notify(fl!("tui-active-not-deletable"), true);
             return;
         }
         self.popup = Some(Popup::Confirm {
-            message: format!(
-                "Delete stored core sing-box {}?\n{} · {} · frees {}",
-                core.version,
-                core.source_name,
-                variant_label(&core.variant),
-                fmt_bytes(core.size)
-            ),
+            message: [
+                fl!("tui-confirm-delete", version = core.version.clone()),
+                fl!(
+                    "tui-detail-build",
+                    source = core.source_label(),
+                    variant = variant_label(&core.variant)
+                ),
+                fl!("tui-detail-frees", size = fmt_bytes(core.size)),
+            ]
+            .join("\n"),
             action: PendingAction::CoreRemove {
                 id: core.id.clone(),
             },
@@ -480,16 +493,14 @@ impl App {
             return;
         };
         if source.builtin {
-            self.notify(
-                format!("{} is built in and cannot be removed", source.name),
-                true,
-            );
+            self.notify(fl!("tui-builtin-source", name = source.name.clone()), true);
             return;
         }
         self.popup = Some(Popup::Confirm {
             message: format!(
-                "Remove core source {}?\nStored cores from it are kept.",
-                source.id
+                "{}\n{}",
+                fl!("tui-confirm-remove-source", source = source.id.clone()),
+                fl!("tui-remove-source-note")
             ),
             action: PendingAction::CoreSourceRemove {
                 id: source.id.clone(),
@@ -504,7 +515,7 @@ impl App {
         }
         match purpose {
             InputPurpose::AddSource => self.daemon_action(
-                "adding core source",
+                &fl!("busy-adding-source"),
                 Request::CoreSourceAdd {
                     repo: value,
                     name: None,
@@ -515,7 +526,7 @@ impl App {
                 let location = parts.next().unwrap_or_default().to_owned();
                 let sha256 = parts.next().map(str::to_owned);
                 self.daemon_action(
-                    "importing core",
+                    &fl!("busy-importing-core"),
                     Request::CoreImport {
                         location,
                         sha256,
@@ -534,10 +545,10 @@ impl App {
                 variant,
                 activate,
             } => self.daemon_action(
-                if activate {
-                    "switching core"
+                &if activate {
+                    fl!("busy-switching-core")
                 } else {
-                    "downloading core"
+                    fl!("busy-downloading-core")
                 },
                 Request::CoreInstall {
                     source,
@@ -547,15 +558,17 @@ impl App {
                     force: false,
                 },
             ),
-            PendingAction::CoreActivate { id } => {
-                self.daemon_action("switching core", Request::CoreActivate { id, force: false })
-            }
+            PendingAction::CoreActivate { id } => self.daemon_action(
+                &fl!("busy-switching-core"),
+                Request::CoreActivate { id, force: false },
+            ),
             PendingAction::CoreRemove { id } => {
-                self.daemon_action("deleting core", Request::CoreRemove { id })
+                self.daemon_action(&fl!("busy-deleting-core"), Request::CoreRemove { id })
             }
-            PendingAction::CoreSourceRemove { id } => {
-                self.daemon_action("removing source", Request::CoreSourceRemove { id })
-            }
+            PendingAction::CoreSourceRemove { id } => self.daemon_action(
+                &fl!("busy-removing-source"),
+                Request::CoreSourceRemove { id },
+            ),
             _ => {}
         }
     }
@@ -577,27 +590,10 @@ fn clamp(state: &mut TableState, len: usize) {
     }
 }
 
-pub fn variant_label(variant: &str) -> &str {
-    if variant.is_empty() {
-        "default"
-    } else {
-        variant
-    }
-}
-
-fn checksum_text(checksum: Checksum) -> &'static str {
-    match checksum {
-        Checksum::Sums => "SHA256SUMS",
-        Checksum::Digest => "GitHub digest",
-        Checksum::Pinned => "pinned sha256",
-        Checksum::None => "unverified",
-    }
-}
-
 fn checksum_chip(checksum: Checksum) -> Span<'static> {
     match checksum {
-        Checksum::None => chip("⚠ unverified", YELLOW),
-        other => chip(format!("✓ {}", checksum_text(other)), GREEN),
+        Checksum::None => chip(format!("⚠ {}", checksum.label()), YELLOW),
+        verified => chip(format!("✓ {}", verified.label()), GREEN),
     }
 }
 
@@ -634,7 +630,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_active(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("Active core", false);
+    let block = panel(&fl!("tui-panel-active-core"), false);
     let status = app.status.as_deref();
     let state = status.map(|s| s.state);
     let lines = match status.and_then(|s| s.active_core.as_ref()) {
@@ -644,25 +640,29 @@ fn draw_active(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  sing-box "),
                 Span::styled(core.version.clone(), Style::new().fg(TEXT).bold()),
                 Span::raw("   "),
-                Span::styled(core.source_name.clone(), Style::new().fg(ACCENT).bold()),
-                dim("  ·  "),
+                Span::styled(core.source_label(), Style::new().fg(ACCENT).bold()),
+                Span::raw("  "),
                 chip(variant_label(&core.variant), BLUE),
                 Span::raw(" "),
                 checksum_chip(core.checksum),
             ]),
             Line::from(vec![
                 Span::styled(core.id.clone(), Style::new().fg(SUBTEXT)),
-                dim(format!(
-                    "  ·  {}  ·  installed {}{}  ·  linked at {}",
-                    fmt_bytes(core.size),
-                    local_date(core.installed_at),
+                Span::raw("   "),
+                dim({
+                    let mut details = vec![
+                        fmt_bytes(core.size),
+                        fl!("tui-installed-on", date = local_date(core.installed_at)),
+                    ];
                     if core.files.len() > 2 {
-                        format!("  ·  {} files", core.files.len())
-                    } else {
-                        String::new()
-                    },
-                    status.map_or("", |s| s.binary.as_str())
-                )),
+                        details.push(fl!("tui-file-count", count = core.files.len()));
+                    }
+                    details.push(fl!(
+                        "tui-linked-at",
+                        path = status.map_or(String::new(), |s| s.binary.clone())
+                    ));
+                    details.join(&fl!("clause-separator"))
+                }),
             ]),
         ],
         None => match status {
@@ -675,26 +675,26 @@ fn draw_active(frame: &mut Frame, area: Rect, app: &App) {
                         Style::new().bold(),
                     ),
                     Span::raw("   "),
-                    chip("unmanaged", YELLOW),
+                    chip(fl!("tui-unmanaged"), YELLOW),
                 ]),
-                Line::from(dim(format!(
-                    "{} is a plain file; switching keeps it in the store as \"Previously installed\"",
-                    s.binary
+                Line::from(dim(fl!(
+                    "tui-unmanaged-note",
+                    binary = s.binary.clone(),
+                    name = fl!("source-adopted")
                 ))),
             ],
             Some(_) => vec![
                 Line::from(vec![
-                    pill("NO CORE", theme::RED),
-                    Span::raw("  no sing-box core installed"),
+                    pill(fl!("tui-no-core"), theme::RED),
+                    Span::raw("  "),
+                    Span::raw(fl!("ctl-core-none")),
                 ]),
-                Line::from(dim(
-                    "pick a release below and press Enter to install and switch to it",
-                )),
+                Line::from(dim(fl!("tui-no-core-hint"))),
             ],
             None => vec![Line::from(dim(app
                 .status_error
                 .clone()
-                .unwrap_or_else(|| "waiting for daemon…".to_owned())))],
+                .unwrap_or_else(|| fl!("tui-waiting-daemon"))))],
         },
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -715,7 +715,7 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
             ];
             if !source.builtin {
                 title.push(Span::raw(" "));
-                title.push(chip("custom", PEACH));
+                title.push(chip(fl!("source-custom-tag"), PEACH));
             }
             ListItem::new(vec![
                 Line::from(title),
@@ -725,7 +725,7 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(panel("Sources", focused))
+        .block(panel(&fl!("tui-panel-sources"), focused))
         .highlight_style(selected(focused))
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(list, area, &mut app.core.source_state);
@@ -734,28 +734,38 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
 fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.core.focus == CoreFocus::Releases;
     let source = app.core.releases_for.clone().unwrap_or_default();
-    let filter = if app.core.stable_only {
-        " · stable only"
+    let title = if source.is_empty() {
+        fl!("tui-panel-releases-empty")
+    } else if app.core.stable_only {
+        fl!(
+            "tui-panel-releases-stable",
+            source = source.clone(),
+            platform = app.core.platform.clone()
+        )
     } else {
-        ""
+        fl!(
+            "tui-panel-releases",
+            source = source.clone(),
+            platform = app.core.platform.clone()
+        )
     };
-    let mut block = panel(
-        &format!("Releases · {source} · {}{filter}", app.core.platform),
-        focused,
-    );
+    let mut block = panel(&title, focused);
     let visible_count = app.core.visible().len();
-    let more = if app.core.has_more { " · n more" } else { "" };
-    block =
-        block.title_top(Line::from(dim(format!(" {visible_count} shown{more} "))).right_aligned());
+    let shown = if app.core.has_more {
+        fl!("tui-releases-shown-more", count = visible_count)
+    } else {
+        fl!("tui-releases-shown", count = visible_count)
+    };
+    block = block.title_top(Line::from(dim(format!(" {shown} "))).right_aligned());
 
     if let Some(release) = app.core.selected_release() {
         let chosen = app.core.variant_index(release);
-        let mut spans = vec![dim(" variants ")];
+        let mut spans = vec![dim(format!(" {} ", fl!("tui-variants")))];
         if release.variants.is_empty() {
-            spans.push(dim("none for this platform "));
+            spans.push(dim(format!("{} ", fl!("no-build-for-platform"))));
         }
         for (i, variant) in release.variants.iter().enumerate() {
-            let label = variant_label(&variant.name).to_owned();
+            let label = variant_label(&variant.name);
             spans.push(if i == chosen {
                 Span::styled(
                     format!(" {label} "),
@@ -766,7 +776,7 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
             });
         }
         if release.variants.len() > 1 {
-            spans.push(dim(" v next "));
+            spans.push(dim(format!(" v {} ", fl!("key-next"))));
         }
         block = block.title_bottom(Line::from(spans));
     }
@@ -780,13 +790,14 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if app.core.loading {
             Line::from(Span::styled(
                 format!(
-                    "{} loading releases…",
-                    theme::SPINNER[app.frame % theme::SPINNER.len()]
+                    "{} {}",
+                    theme::SPINNER[app.frame % theme::SPINNER.len()],
+                    fl!("tui-loading-releases")
                 ),
                 Style::new().fg(YELLOW),
             ))
         } else {
-            Line::from(dim("no releases"))
+            Line::from(dim(fl!("tui-no-releases")))
         };
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: true }).block(block),
@@ -806,29 +817,35 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
             let version = Line::from(vec![
                 Span::raw(release.version.clone()),
                 if release.prerelease {
-                    Span::styled("  pre", Style::new().fg(YELLOW))
+                    Span::styled(
+                        format!("  {}", fl!("prerelease-marker")),
+                        Style::new().fg(YELLOW),
+                    )
                 } else {
                     Span::raw("")
                 },
             ]);
             let variant_cell = match variant {
                 Some(v) => Line::from(vec![
-                    Span::styled(variant_label(&v.name).to_owned(), Style::new().fg(BLUE)),
+                    Span::styled(variant_label(&v.name), Style::new().fg(BLUE)),
                     if release.variants.len() > 1 {
                         dim(format!(" +{}", release.variants.len() - 1))
                     } else {
                         Span::raw("")
                     },
                 ]),
-                None => Line::from(dim("—")),
+                None => Line::from(dim("-")),
             };
             let state = match (stored, variant) {
-                (Some(core), _) if core.active => {
-                    Span::styled("● active", Style::new().fg(GREEN).bold())
+                (Some(core), _) if core.active => Span::styled(
+                    format!("● {}", fl!("tui-active")),
+                    Style::new().fg(GREEN).bold(),
+                ),
+                (Some(_), _) => {
+                    Span::styled(format!("✓ {}", fl!("tui-stored")), Style::new().fg(BLUE))
                 }
-                (Some(_), _) => Span::styled("✓ stored", Style::new().fg(BLUE)),
                 (None, Some(v)) => dim(fmt_bytes(v.size)),
-                (None, None) => dim("no build"),
+                (None, None) => dim(fl!("tui-no-build")),
             };
             Row::new(vec![
                 Cell::from(version),
@@ -847,7 +864,15 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(11),
         ],
     )
-    .header(Row::new(["Version", "Published", "Variant", "State"]).style(theme::header_row()))
+    .header(
+        Row::new([
+            fl!("col-version"),
+            fl!("col-published"),
+            fl!("col-variant"),
+            fl!("col-state"),
+        ])
+        .style(theme::header_row()),
+    )
     .block(block)
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
@@ -858,16 +883,21 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.core.focus == CoreFocus::Installed;
     let total: u64 = app.core.installed.iter().map(|c| c.size).sum();
     let block = panel(
-        &format!("Installed · {}", app.core.installed.len()),
+        &fl!("tui-panel-installed", count = app.core.installed.len()),
         focused,
     )
-    .title_top(Line::from(dim(format!(" {} on disk ", fmt_bytes(total)))).right_aligned());
+    .title_top(
+        Line::from(dim(format!(
+            " {} ",
+            fl!("tui-on-disk", size = fmt_bytes(total))
+        )))
+        .right_aligned(),
+    );
     if app.core.installed.is_empty() {
         frame.render_widget(
-            Paragraph::new(dim(
-                "nothing stored yet — releases you switch to or download (i) appear here",
-            ))
-            .block(block),
+            Paragraph::new(dim(fl!("tui-store-empty")))
+                .wrap(Wrap { trim: true })
+                .block(block),
             area,
         );
         return;
@@ -890,21 +920,20 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
                         Style::new()
                     },
                 )),
+                Cell::from(Span::styled(core.source_label(), Style::new().fg(ACCENT))),
                 Cell::from(Span::styled(
-                    core.source_name.clone(),
-                    Style::new().fg(ACCENT),
-                )),
-                Cell::from(Span::styled(
-                    variant_label(&core.variant).to_owned(),
+                    variant_label(&core.variant),
                     Style::new().fg(BLUE),
                 )),
                 Cell::from(dim(fmt_bytes(core.size))),
                 Cell::from(match core.checksum {
-                    Checksum::None => Span::styled("⚠ unverified", Style::new().fg(YELLOW)),
-                    other => Span::styled(
-                        format!("✓ {}", checksum_text(other)),
-                        Style::new().fg(GREEN),
+                    Checksum::None => Span::styled(
+                        format!("⚠ {}", core.checksum.label()),
+                        Style::new().fg(YELLOW),
                     ),
+                    verified => {
+                        Span::styled(format!("✓ {}", verified.label()), Style::new().fg(GREEN))
+                    }
                 }),
                 Cell::from(dim(local_date(core.installed_at))),
             ])
@@ -924,13 +953,13 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
     )
     .header(
         Row::new([
-            "",
-            "Version",
-            "Source",
-            "Variant",
-            "Size",
-            "Checksum",
-            "Installed",
+            String::new(),
+            fl!("col-version"),
+            fl!("col-source"),
+            fl!("col-variant"),
+            fl!("col-size"),
+            fl!("col-checksum"),
+            fl!("col-installed"),
         ])
         .style(theme::header_row()),
     )
@@ -941,29 +970,29 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Footer hints for the Core tab, depending on the focused pane.
-pub fn hints(app: &App) -> &'static [(&'static str, &'static str)] {
+pub fn hints(app: &App) -> Vec<(&'static str, String)> {
     match app.core.focus {
-        CoreFocus::Sources => &[
-            ("←→", "pane"),
-            ("↑↓", "source"),
-            ("a", "add"),
-            ("d", "remove"),
-            ("I", "import"),
+        CoreFocus::Sources => vec![
+            ("←→", fl!("key-pane")),
+            ("↑↓", fl!("key-source")),
+            ("a", fl!("key-add")),
+            ("d", fl!("key-remove")),
+            ("I", fl!("key-import")),
         ],
-        CoreFocus::Releases => &[
-            ("←→", "pane"),
-            ("⏎", "switch"),
-            ("v", "variant"),
-            ("i", "download"),
-            ("p", "stable"),
-            ("n", "more"),
-            ("f", "refresh"),
+        CoreFocus::Releases => vec![
+            ("←→", fl!("key-pane")),
+            ("⏎", fl!("key-switch")),
+            ("v", fl!("key-variant")),
+            ("i", fl!("key-download")),
+            ("p", fl!("key-stable")),
+            ("n", fl!("key-more")),
+            ("f", fl!("key-refresh")),
         ],
-        CoreFocus::Installed => &[
-            ("←→", "pane"),
-            ("⏎", "switch"),
-            ("d", "delete"),
-            ("I", "import"),
+        CoreFocus::Installed => vec![
+            ("←→", fl!("key-pane")),
+            ("⏎", fl!("key-switch")),
+            ("d", fl!("key-delete")),
+            ("I", fl!("key-import")),
         ],
     }
 }

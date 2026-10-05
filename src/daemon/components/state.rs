@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::fl;
 use crate::protocol::Component;
 pub use crate::util::{random_token, write_atomic};
 
@@ -40,11 +41,12 @@ pub struct HttpMetaState {
 impl State {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(content) => {
-                serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
-            }
+            Ok(content) => serde_json::from_str(&content)
+                .with_context(|| fl!("err-parse", path = path.display().to_string())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+            Err(err) => {
+                Err(err).with_context(|| fl!("err-read", path = path.display().to_string()))
+            }
         }
     }
 

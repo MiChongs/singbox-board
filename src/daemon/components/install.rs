@@ -21,6 +21,7 @@ use super::state::{Layout, State, write_atomic};
 use crate::config::DaemonConfig;
 use crate::daemon::github::{GitHub, parse_sha256sums, verify_sha256};
 use crate::daemon::logs::LogHub;
+use crate::i18n::{self, fl, fl_log};
 
 /// Oldest Node.js major accepted from PATH; older ones trigger a download.
 pub const MIN_NODE_MAJOR: u32 = 22;
@@ -46,13 +47,14 @@ impl Installer<'_> {
             .as_ref()
             .filter(|p| !p.as_os_str().is_empty())
         {
-            let (major, version) = node_version(node)
-                .await
-                .with_context(|| format!("components.node = {}", node.display()))?;
+            let (major, version) = node_version(node).await.with_context(|| {
+                fl!("install-node-configured", path = node.display().to_string())
+            })?;
             if major < MIN_NODE_MAJOR {
-                self.logs.warn(format!(
-                    "{} is Node.js {version}; Sub-Store is tested with v24",
-                    node.display()
+                self.logs.warn(fl_log!(
+                    "install-node-old",
+                    path = node.display().to_string(),
+                    version = version
                 ));
             }
             return Ok(node.clone());
@@ -89,18 +91,19 @@ impl Installer<'_> {
                 .fetch(&format!("{mirror}/index.json"), 16 * 1024 * 1024)
                 .await?,
         )
-        .context("parse Node.js release index")?;
+        .context(fl!("install-node-index"))?;
         let platform = format!("linux-{arch}");
         let release = index
             .iter()
             .find(|r| r.lts != serde_json::Value::Bool(false) && r.files.contains(&platform))
-            .ok_or_else(|| {
-                anyhow!("no Node.js LTS build for {platform}; install node and set components.node")
-            })?;
+            .ok_or_else(|| anyhow!(fl!("install-node-no-lts", platform = platform.clone())))?;
         let version = release.version.clone();
         let name = format!("node-{version}-{platform}.tar.gz");
-        self.logs
-            .info(format!("downloading Node.js {version} ({platform})"));
+        self.logs.info(fl_log!(
+            "install-node-downloading",
+            version = version.clone(),
+            platform = platform.clone()
+        ));
         let sums = String::from_utf8(
             self.github
                 .fetch(&format!("{mirror}/{version}/SHASUMS256.txt"), 1024 * 1024)
@@ -108,7 +111,7 @@ impl Installer<'_> {
         )?;
         let expected = parse_sha256sums(&sums)
             .remove(&name)
-            .ok_or_else(|| anyhow!("SHASUMS256.txt has no entry for {name}"))?;
+            .ok_or_else(|| anyhow!(fl!("install-no-checksum-entry", name = name.clone())))?;
         let archive = self
             .github
             .fetch(
@@ -122,8 +125,9 @@ impl Installer<'_> {
         blocking(move || extract_tar_member(&archive, &member, &dest)).await?;
         node_version(&self.layout.node())
             .await
-            .context("downloaded Node.js does not run on this system")?;
-        self.logs.info(format!("installed Node.js {version}"));
+            .context(fl!("install-node-not-runnable"))?;
+        self.logs
+            .info(fl_log!("install-node-installed", version = version.clone()));
         Ok(version)
     }
 
@@ -141,9 +145,10 @@ impl Installer<'_> {
         if !bundle.is_file()
             || state.sub_store.backend_version.as_deref() != Some(backend.version())
         {
-            self.logs.info(format!(
-                "downloading Sub-Store backend {}",
-                backend.version()
+            self.logs.info(fl_log!(
+                "install-downloading",
+                part = "backend",
+                version = backend.version()
             ));
             let data = self
                 .github
@@ -159,9 +164,10 @@ impl Installer<'_> {
         if !web.join("index.html").is_file()
             || state.sub_store.frontend_version.as_deref() != Some(frontend.version())
         {
-            self.logs.info(format!(
-                "downloading Sub-Store web UI {}",
-                frontend.version()
+            self.logs.info(fl_log!(
+                "install-downloading",
+                part = "frontend",
+                version = frontend.version()
             ));
             let data = self
                 .github
@@ -187,8 +193,11 @@ impl Installer<'_> {
             || !self.layout.meta_template().is_file()
             || state.http_meta.version.as_deref() != Some(release.version())
         {
-            self.logs
-                .info(format!("downloading http-meta {}", release.version()));
+            self.logs.info(fl_log!(
+                "install-downloading",
+                part = "http-meta",
+                version = release.version()
+            ));
             let bundle = self
                 .github
                 .download(release.require("http-meta.bundle.js")?, MAX_ASSET_BYTES)
@@ -217,15 +226,16 @@ impl Installer<'_> {
                     mihomo.asset(&format!("mihomo-linux-{arch}-{}.gz", mihomo.tag_name))
                 })
                 .ok_or_else(|| {
-                    anyhow!(
-                        "mihomo {} has no build for {}; set http_meta.mihomo_arch",
-                        mihomo.tag_name,
-                        std::env::consts::ARCH
-                    )
+                    anyhow!(fl!(
+                        "install-mihomo-no-build",
+                        version = mihomo.tag_name.clone(),
+                        arch = std::env::consts::ARCH
+                    ))
                 })?;
-            self.logs.info(format!(
-                "downloading mihomo {} ({})",
-                mihomo.tag_name, asset.name
+            self.logs.info(fl_log!(
+                "install-downloading",
+                part = "mihomo",
+                version = format!("{} ({})", mihomo.tag_name, asset.name)
             ));
             let compressed = self.github.download(asset, MAX_ASSET_BYTES).await?;
             let dest = self.layout.mihomo();
@@ -234,7 +244,7 @@ impl Installer<'_> {
                 flate2::read::GzDecoder::new(&compressed[..])
                     .take(256 * 1024 * 1024)
                     .read_to_end(&mut binary)
-                    .context("decompress mihomo")?;
+                    .context(fl!("install-mihomo-decompress"))?;
                 write_atomic(&dest, &binary, 0o755)
             })
             .await?;
@@ -245,7 +255,7 @@ impl Installer<'_> {
                 .await;
             if !output.as_ref().is_ok_and(|o| o.status.success()) {
                 let _ = std::fs::remove_file(self.layout.mihomo());
-                bail!("downloaded mihomo does not run on this system; set http_meta.mihomo_arch");
+                bail!(fl!("install-mihomo-not-runnable"));
             }
             state.http_meta.mihomo_version = Some(mihomo.tag_name.clone());
             changed = true;
@@ -254,10 +264,12 @@ impl Installer<'_> {
     }
 }
 
+/// Runs `f` on the blocking pool, with messages in the caller's language.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f)
+    let lang = i18n::current();
+    tokio::task::spawn_blocking(move || i18n::in_language(lang, f))
         .await
-        .context("background task panicked")?
+        .context(fl!("err-task-panicked"))?
 }
 
 /// `node --version` → (major, "v24.21.0").
@@ -270,9 +282,17 @@ pub async fn node_version(node: &Path) -> Result<(u32, String)> {
             .output(),
     )
     .await
-    .map_err(|_| anyhow!("{} --version timed out", node.display()))??;
+    .map_err(|_| {
+        anyhow!(fl!(
+            "install-node-version-timeout",
+            path = node.display().to_string()
+        ))
+    })??;
     if !output.status.success() {
-        bail!("{} --version failed", node.display());
+        bail!(fl!(
+            "install-node-version-failed",
+            path = node.display().to_string()
+        ));
     }
     let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let major = version
@@ -280,7 +300,12 @@ pub async fn node_version(node: &Path) -> Result<(u32, String)> {
         .split('.')
         .next()
         .and_then(|m| m.parse().ok())
-        .ok_or_else(|| anyhow!("unexpected Node.js version {version:?}"))?;
+        .ok_or_else(|| {
+            anyhow!(fl!(
+                "install-node-version-unexpected",
+                version = version.clone()
+            ))
+        })?;
     Ok((major, version))
 }
 
@@ -298,9 +323,7 @@ fn node_arch() -> Result<&'static str> {
         "aarch64" => "arm64",
         "powerpc64" if cfg!(target_endian = "little") => "ppc64le",
         "s390x" => "s390x",
-        other => {
-            bail!("no official Node.js build for {other}; install node and set components.node")
-        }
+        other => bail!(fl!("install-node-no-official", arch = other)),
     })
 }
 
@@ -336,13 +359,13 @@ fn extract_tar_member(archive: &[u8], member: &str, dest: &Path) -> Result<()> {
         }
         return write_atomic(dest, &data, 0o755);
     }
-    bail!("archive does not contain {member}")
+    bail!(fl!("err-archive-missing", name = member))
 }
 
 /// Unpacks a zip into a fresh directory and swaps it in for `dest`. A single
 /// top-level directory (Sub-Store's `dist/`) is stripped.
 fn replace_dir_from_zip(data: &[u8], dest: &Path) -> Result<()> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).context("open zip")?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).context(fl!("err-open-zip"))?;
     let names: Vec<PathBuf> = (0..zip.len())
         .filter_map(|i| zip.by_index(i).ok()?.enclosed_name())
         .collect();
@@ -373,12 +396,12 @@ fn replace_dir_from_zip(data: &[u8], dest: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let mut out = std::fs::File::create(&target)
-            .with_context(|| format!("create {}", target.display()))?;
+            .with_context(|| fl!("err-create", path = target.display().to_string()))?;
         std::io::copy(&mut file.by_ref().take(MAX_ASSET_BYTES as u64), &mut out)?;
     }
     if !staging.join("index.html").is_file() {
         let _ = std::fs::remove_dir_all(&staging);
-        bail!("web UI archive has no index.html");
+        bail!(fl!("install-webui-no-index"));
     }
     let old = sibling(dest, ".old");
     let _ = std::fs::remove_dir_all(&old);
