@@ -1,0 +1,75 @@
+# singbox-board daemon configuration
+# Default location: /etc/singbox-board/daemon.toml
+# Every key is optional; the values below are the built-in defaults.
+
+# Control socket used by `singbox-board` (TUI / CLI) to talk to the daemon.
+socket = "/run/singbox-board/daemon.sock"
+
+# Members of this group may use the control socket in addition to root.
+# The socket is chmod 0660 root:<group> when the group exists, 0600 otherwise.
+socket_group = "singbox-board"
+
+# Additional user ids that are allowed to use the control socket.
+allowed_uids = []
+
+# Number of log lines kept in memory for clients.
+log_buffer = 2000
+
+# Echo sing-box output to the daemon's stderr (picked up by journald).
+forward_core_logs = true
+
+[core]
+# sing-box binary. `singbox-board update` installs it here when missing.
+binary = "/usr/local/bin/sing-box"
+# Passed as `-c <file>`; relative paths are resolved against `working_dir`.
+config = ["/etc/sing-box/config.json"]
+# Passed as `-C <dir>`; every *.json file inside is merged by sing-box.
+config_dir = []
+# Passed as `-D <dir>` (cache.db, rule sets, providers ...).
+working_dir = "/var/lib/sing-box"
+# Extra arguments appended after `run`.
+extra_args = []
+# Start sing-box as soon as the daemon starts.
+auto_start = true
+# Run `sing-box check` before every start and reload.
+check_before_start = true
+# Seconds to wait after SIGTERM before sending SIGKILL.
+stop_timeout_secs = 10
+
+# Extra environment variables for sing-box.
+[core.env]
+# ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS = "true"
+
+[restart]
+# "always", "on-failure" or "never"
+policy = "on-failure"
+initial_backoff_ms = 1000
+max_backoff_secs = 60
+# A process that ran this long resets the backoff.
+stable_after_secs = 60
+
+# The Clash API endpoint is read from `experimental.clash_api` in the sing-box
+# configuration. Set these to override the detected values.
+[clash_api]
+# url = "http://127.0.0.1:9090"
+# secret = ""
+
+[update]
+# GitHub repository that publishes the sing-box release archives.
+repo = "MiChongs/sing-box"
+api_url = "https://api.github.com"
+# Release asset variant suffix, e.g. "ebpf", "v3-ebpf", "easytier".
+variant = ""
+# Override the detected architecture (amd64, arm64, 386, arm-v7, riscv64,
+# loong64, mipsle-softfloat, mips64le-softfloat ...).
+# arch = "amd64"
+# Include pre-releases (-alpha / -beta / -rc) when looking for the latest one.
+prerelease = false
+# Proxy used for GitHub requests, e.g. "http://127.0.0.1:7890" or "socks5h://127.0.0.1:1080".
+# proxy = ""
+# Download mirror prefixed to github.com asset URLs, e.g. "https://ghfast.top/".
+# mirror = ""
+# Personal access token to raise the GitHub API rate limit.
+# github_token = ""
+# Restart sing-box after a successful update when it is running.
+restart_after_update = true

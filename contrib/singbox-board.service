@@ -1,0 +1,22 @@
+[Unit]
+Description=singbox-board root daemon (sing-box supervisor)
+Documentation=https://github.com/MiChongs/sing-box
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/singbox-board daemon --config /etc/singbox-board/daemon.toml
+# Validates the sing-box configuration, then hot-reloads it (SIGHUP).
+ExecReload=/bin/kill -HUP $MAINPID
+# The daemon stops sing-box itself on SIGTERM; anything left gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+RuntimeDirectory=singbox-board
+StateDirectory=sing-box
+
+[Install]
+WantedBy=multi-user.target
