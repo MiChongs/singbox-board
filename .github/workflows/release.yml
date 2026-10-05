@@ -140,8 +140,10 @@ jobs:
           One-click (systemd or OpenRC, amd64 / arm64 / armv7 / 386 / riscv64 / loong64):
 
           \`\`\`sh
-          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sudo sh -s -- --version ${GITHUB_REF_NAME}
+          sudo sh -c "\$(curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh)" install.sh --version ${GITHUB_REF_NAME}
           \`\`\`
+
+          (\`curl ... | sudo sh\` also works but cannot ask about the optional components; run \`sudo singbox-board setup\` afterwards.)
 
           Or a package: \`sudo apt install ./singbox-board_*.deb\`, \`sudo dnf install ./singbox-board-*.rpm\`,
           \`sudo apk add --allow-untrusted ./singbox-board_*.apk\`, \`sudo pacman -U ./singbox-board-*.pkg.tar.zst\`.

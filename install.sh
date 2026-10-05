@@ -1,8 +1,9 @@
 #!/bin/sh
 # singbox-board one-click installer, upgrader and uninstaller.
 #
-#   curl -fsSL https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh | sudo sh
-#   curl -fsSL .../install.sh | sudo sh -s -- --mirror https://ghfast.top/
+#   sudo sh -c "$(curl -fsSL https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh)"
+#   sudo sh -c "$(curl -fsSL .../install.sh)" install.sh --mirror https://ghfast.top/
+#   curl -fsSL .../install.sh | sudo sh     # non-interactive: no first-run question
 #   sudo sh install.sh --uninstall [--purge]
 #
 # Installs the static binary from the latest GitHub release (verified against
@@ -242,8 +243,11 @@ wait_for_daemon() {
 	return 1
 }
 
+# Only ask when our own stdin is a terminal. With `curl ... | sudo sh` stdin is
+# the pipe, and /dev/tty may be a pty that sudo (sudo-rs, use_pty) never feeds
+# keyboard input into, so reading it would hang and Ctrl-C would not help.
 can_prompt() {
-	{ : </dev/tty; } 2>/dev/null
+	[ -t 0 ] && [ -t 1 ]
 }
 
 post_start() {
@@ -265,9 +269,10 @@ post_start() {
 	elif "$BIN" status --json | grep -q '"setup_required": true'; then
 		if can_prompt; then
 			echo
-			"$BIN" setup </dev/tty || warn "component setup failed; retry with: sudo singbox-board setup"
+			"$BIN" setup || warn "component setup failed; retry with: sudo singbox-board setup"
 		else
-			say "optional components (Sub-Store, http-meta): run 'sudo singbox-board setup' or open the dashboard"
+			say "optional components (Sub-Store, http-meta) not chosen yet:"
+			echo "      sudo singbox-board setup      # or open the dashboard: singbox-board"
 		fi
 	fi
 }

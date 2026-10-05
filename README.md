@@ -29,8 +29,10 @@
 ### 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh | sudo sh
+sudo sh -c "$(curl -fsSL https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh)"
 ```
+
+也可以用 `curl -fsSL …/install.sh | sudo sh`，但这种方式的标准输入是管道，脚本不会提问，Sub-Store / http-meta 的选择留到之后执行 `sudo singbox-board setup` 或打开面板时再做。之所以要这样处理：Ubuntu 25.10 起默认的 sudo-rs 会把命令放在新的伪终端里运行，用管道调用时键盘输入根本到不了脚本，脚本若提问就会卡住，连 Ctrl-C 也无效。
 
 脚本会依次完成以下步骤：
 
@@ -46,8 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/MiChongs/singbox-board/main/install
 访问 GitHub 较慢时可以使用下载镜像。镜像地址同时会写入 `daemon.toml`，之后 sing-box 和各组件的下载也会经过它：
 
 ```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh \
-  | sudo sh -s -- --mirror https://ghfast.top/
+sudo sh -c "$(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.sh)" \
+  install.sh --mirror https://ghfast.top/
 ```
 
 常用参数（完整列表见 `sh install.sh --help`）：
