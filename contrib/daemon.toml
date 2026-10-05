@@ -107,7 +107,10 @@ frontend_repo = "sub-store-org/Sub-Store-Front-End"
 # produce_cron = "0 */2 * * *,sub,a"
 # default_proxy = "http://127.0.0.1:7890"
 
-# Extra SUB_STORE_* environment variables.
+# Extra SUB_STORE_* environment variables. SUB_STORE_CORS_ALLOWED_ORIGINS
+# defaults to upstream's list plus the origins the frontend is served on
+# (derived from host/port); set it when reaching the UI through a hostname or a
+# reverse proxy, e.g. "https://sub.example.com" ("*" allows any origin).
 [sub_store.env]
 
 [http_meta]

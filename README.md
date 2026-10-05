@@ -244,6 +244,7 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 | `components.node` / `components.node_mirror` | 指定 Node.js 路径 / Node.js 下载源（国内可用 `https://npmmirror.com/mirrors/node`） |
 | `sub_store.host` / `sub_store.port` | Sub-Store 监听地址，默认 `127.0.0.1:3001` |
 | `sub_store.sync_cron` / `produce_cron` / `default_proxy` / `env` | 对应 `SUB_STORE_*` 环境变量 |
+| `sub_store.env.SUB_STORE_CORS_ALLOWED_ORIGINS` | Sub-Store 允许的跨域来源。默认在上游列表之外自动加入前端自身的地址（按 `host`/`port` 推出）；通过域名或反向代理访问 Web 界面时需在此补上对应来源，否则保存会返回 `403 CORS origin not allowed` |
 | `http_meta.host` / `http_meta.port` / `authorization` | http-meta 监听地址（默认 `127.0.0.1:9876`）与访问凭据 |
 | `http_meta.mihomo_arch` | 指定 mihomo 构建，例如 `amd64-v3` |
 

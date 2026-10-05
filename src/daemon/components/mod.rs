@@ -10,6 +10,7 @@ mod state;
 pub use state::{random_token, write_atomic};
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -487,6 +488,10 @@ impl Manager {
                         format!("/{}", self.state.sub_store.backend_path),
                     ),
                     ("SUB_STORE_DATA_BASE_PATH", path_str(&data)),
+                    (
+                        "SUB_STORE_CORS_ALLOWED_ORIGINS",
+                        sub_store_origins(&cfg.host, cfg.port),
+                    ),
                     ("HOME", path_str(&data)),
                 ];
                 let optional = [
@@ -625,6 +630,65 @@ fn local_host(host: &str) -> String {
     }
 }
 
+/// Upstream's default `SUB_STORE_CORS_ALLOWED_ORIGINS`, kept so the hosted
+/// frontends keep working.
+const SUB_STORE_DEFAULT_ORIGINS: [&str; 3] = [
+    "https://sub-store.vercel.app",
+    "http://substore.stash",
+    "https://substore.stash",
+];
+
+/// `SUB_STORE_CORS_ALLOWED_ORIGINS` for a frontend served on `host:port`.
+///
+/// Sub-Store answers 403 to any request whose `Origin` is not listed, and
+/// browsers send `Origin` on the frontend's own same-origin POST/PATCH calls,
+/// so the origins it is reachable under have to be allowed explicitly.
+fn sub_store_origins(host: &str, port: u16) -> String {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let wildcard = matches!(bare, "" | "0.0.0.0" | "::");
+    let loopback = wildcard
+        || bare == "localhost"
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let mut hosts = Vec::new();
+    if loopback {
+        hosts.extend(["127.0.0.1", "localhost", "[::1]"].map(str::to_owned));
+    }
+    if wildcard {
+        hosts.extend(interface_addresses().into_iter().map(|ip| match ip {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        }));
+    } else {
+        hosts.push(local_host(bare));
+    }
+    let mut origins: Vec<String> = SUB_STORE_DEFAULT_ORIGINS.map(str::to_owned).into();
+    for host in hosts {
+        let origin = format!("http://{host}:{port}");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins.join(",")
+}
+
+/// Addresses of the local interfaces a browser can put in a URL.
+fn interface_addresses() -> Vec<IpAddr> {
+    let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    addrs
+        .filter_map(|ifa| {
+            let addr = ifa.address?;
+            if let Some(v4) = addr.as_sockaddr_in() {
+                return Some(IpAddr::V4(v4.ip()));
+            }
+            // Link-local IPv6 needs a zone id, which browsers do not accept.
+            let v6 = addr.as_sockaddr_in6()?.ip();
+            (!v6.is_unicast_link_local()).then_some(IpAddr::V6(v6))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +699,27 @@ mod tests {
         assert_eq!(local_host("::"), "[::1]");
         assert_eq!(local_host("fd00::1"), "[fd00::1]");
         assert_eq!(local_host("192.168.1.2"), "192.168.1.2");
+    }
+
+    #[test]
+    fn sub_store_origins_cover_the_frontend() {
+        let defaults = SUB_STORE_DEFAULT_ORIGINS.join(",");
+        assert_eq!(
+            sub_store_origins("127.0.0.1", 3001),
+            format!("{defaults},http://127.0.0.1:3001,http://localhost:3001,http://[::1]:3001")
+        );
+        assert_eq!(
+            sub_store_origins("192.168.1.2", 3001),
+            format!("{defaults},http://192.168.1.2:3001")
+        );
+        assert_eq!(
+            sub_store_origins("fd00::1", 80),
+            format!("{defaults},http://[fd00::1]:80")
+        );
+        let wildcard = sub_store_origins("0.0.0.0", 3001);
+        assert!(wildcard.starts_with(&defaults));
+        assert!(wildcard.contains("http://localhost:3001"));
+        assert_eq!(wildcard.matches("http://127.0.0.1:3001").count(), 1);
     }
 
     #[test]
