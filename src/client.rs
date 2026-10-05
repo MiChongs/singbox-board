@@ -41,10 +41,17 @@ impl DaemonClient {
                 "daemon is not running (no socket at {socket}); \
                  start it with `systemctl start singbox-board` or `sudo singbox-board daemon`"
             ),
-            io::ErrorKind::PermissionDenied => anyhow!(
-                "permission denied on {socket}; run as root or join the socket group \
-                 (`sudo usermod -aG singbox-board $USER`, then log in again)"
-            ),
+            io::ErrorKind::PermissionDenied => match stale_session_group(&self.socket) {
+                Some(group) => anyhow!(
+                    "permission denied on {socket}: you are in the `{group}` group, but this \
+                     login session started before you were added. Run `newgrp {group}` (or \
+                     `sg {group} -c singbox-board`), or log out and back in"
+                ),
+                None => anyhow!(
+                    "permission denied on {socket}; run as root or join the socket group \
+                     (`sudo usermod -aG singbox-board $USER`, then log in again)"
+                ),
+            },
             _ => anyhow!("connect {socket}: {err}"),
         }
     }
@@ -116,6 +123,25 @@ impl LogStream {
             other => Err(unexpected(&other)),
         }
     }
+}
+
+/// The socket's group when the user is a member in the group database but
+/// the current process credentials (fixed at login) do not include it yet.
+fn stale_session_group(socket: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::unistd::{Gid, Group, Uid, User, getgrouplist, getgroups};
+
+    let gid = Gid::from_raw(std::fs::metadata(socket).ok()?.gid());
+    if Gid::effective() == gid || getgroups().ok()?.contains(&gid) {
+        return None;
+    }
+    let user = User::from_uid(Uid::current()).ok()??;
+    let member = getgrouplist(&CString::new(user.name).ok()?, user.gid)
+        .ok()?
+        .contains(&gid);
+    member.then(|| Group::from_gid(gid).ok().flatten().map(|g| g.name))?
 }
 
 fn timeout_for(request: &Request) -> Duration {
