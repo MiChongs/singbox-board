@@ -136,7 +136,12 @@ pub fn from_locale() -> Option<Lang> {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
     let locale = var("LC_ALL")
         .or_else(|| var("LC_MESSAGES"))
-        .or_else(|| var("LANG"))?;
+        .or_else(|| var("LANG"));
+    // Windows has no locale variables (unless set by hand or by a Unix-like
+    // shell); the user's display language decides there.
+    #[cfg(windows)]
+    let locale = locale.or_else(crate::win::user_locale);
+    let locale = locale?;
     let posix = locale == "C" || locale == "POSIX" || locale.starts_with("C.");
     if !posix
         && let Some(lang) = var("LANGUAGE").and_then(|list| list.split(':').find_map(Lang::parse))

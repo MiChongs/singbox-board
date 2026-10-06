@@ -17,6 +17,7 @@ mod toml_editor;
 mod ui;
 
 use std::io::Write;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -36,6 +37,7 @@ use crate::protocol::{Container, Profile};
 /// What a session opens with besides the dashboard.
 enum Edit {
     Profile(Profile, String, bool),
+    #[cfg_attr(windows, allow(dead_code))]
     Container(Box<Container>, String, bool),
 }
 
@@ -55,6 +57,7 @@ pub async fn edit(
 }
 
 /// Opens one container's configuration in the editor; like [`edit`].
+#[cfg_attr(windows, allow(dead_code))]
 pub async fn edit_container(
     client: DaemonClient,
     container: Container,
@@ -177,6 +180,19 @@ fn run_editor(
 
 /// Hands the terminal to a shell in a container (or to sudo asking for a
 /// password first) and takes it back when it exits.
+#[cfg(windows)]
+fn run_shell(
+    _terminal: &mut ratatui::DefaultTerminal,
+    _shell: &ShellCommand,
+) -> Result<anyhow::Result<std::process::ExitStatus>> {
+    Ok(Err(anyhow::anyhow!(crate::i18n::fl!(
+        "win-containers-unsupported"
+    ))))
+}
+
+/// Hands the terminal to a shell in a container (or to sudo asking for a
+/// password first) and takes it back when it exits.
+#[cfg(unix)]
 fn run_shell(
     terminal: &mut ratatui::DefaultTerminal,
     shell: &ShellCommand,
@@ -251,6 +267,13 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// conhost ignores OSC 52; the clipboard API works everywhere.
+#[cfg(windows)]
+fn copy_with_tool(text: &str) {
+    crate::win::clipboard::set_text(text);
+}
+
+#[cfg(unix)]
 fn copy_with_tool(text: &str) {
     let mut tools: Vec<(&str, &[&str])> = Vec::new();
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {

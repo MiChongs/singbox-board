@@ -93,7 +93,10 @@ impl Layout {
     }
 
     pub fn node(&self) -> PathBuf {
-        self.root.join("runtime/node/bin/node")
+        #[cfg(unix)]
+        return self.root.join("runtime/node/bin/node");
+        #[cfg(windows)]
+        return self.root.join(r"runtime\node\node.exe");
     }
 
     pub fn sub_store(&self) -> PathBuf {
@@ -125,8 +128,9 @@ impl Layout {
         self.http_meta().join("meta")
     }
 
+    /// `http-meta`, or `http-meta.exe`, which Node finds for `http-meta`.
     pub fn mihomo(&self) -> PathBuf {
-        self.meta_folder().join("http-meta")
+        self.meta_folder().join(crate::util::exe_name("http-meta"))
     }
 
     pub fn meta_template(&self) -> PathBuf {
@@ -178,9 +182,12 @@ mod tests {
         let loaded = State::load(&path).unwrap();
         assert!(loaded.setup_done && loaded.sub_store.enabled);
         assert_eq!(loaded.sub_store.backend_path, state.sub_store.backend_path);
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

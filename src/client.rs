@@ -6,13 +6,25 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use crate::i18n::{self, fl};
 use crate::protocol::{
     Container, ContainerOverview, CoreReleasePage, CoreSource, Envelope, ExecResult, ImageList,
     LogEntry, Profile, ProfileList, Request, Response, Status, StoredCore, UpdateInfo,
 };
+
+/// A connection to the daemon: a Unix socket, or a named pipe on Windows.
+#[cfg(unix)]
+type Stream = tokio::net::UnixStream;
+#[cfg(windows)]
+type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+async fn connect(socket: &Path) -> io::Result<Stream> {
+    #[cfg(unix)]
+    return tokio::net::UnixStream::connect(socket).await;
+    #[cfg(windows)]
+    return crate::win::pipe::connect(socket).await;
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -28,8 +40,8 @@ impl DaemonClient {
         &self.socket
     }
 
-    async fn open(&self, request: &Request) -> Result<BufReader<UnixStream>> {
-        let mut stream = UnixStream::connect(&self.socket)
+    async fn open(&self, request: &Request) -> Result<BufReader<Stream>> {
+        let mut stream = connect(&self.socket)
             .await
             .map_err(|err| self.connect_error(err))?;
         // Replies come back in the language of this client.
@@ -46,9 +58,19 @@ impl DaemonClient {
     fn connect_error(&self, err: io::Error) -> anyhow::Error {
         let socket = self.socket.display().to_string();
         match err.kind() {
+            #[cfg(unix)]
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 anyhow!(fl!("client-daemon-not-running", socket = socket))
             }
+            #[cfg(windows)]
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                anyhow!(fl!("win-client-daemon-not-running", socket = socket))
+            }
+            #[cfg(windows)]
+            io::ErrorKind::PermissionDenied => {
+                anyhow!(fl!("win-client-permission-denied", socket = socket))
+            }
+            #[cfg(unix)]
             io::ErrorKind::PermissionDenied => match stale_session_group(&self.socket) {
                 Some(group) => anyhow!(fl!(
                     "client-permission-stale-group",
@@ -219,7 +241,7 @@ impl DaemonClient {
 }
 
 pub struct LogStream {
-    reader: BufReader<UnixStream>,
+    reader: BufReader<Stream>,
     line: String,
 }
 
@@ -240,6 +262,7 @@ impl LogStream {
 
 /// The socket's group when the user is a member in the group database but
 /// the current process credentials (fixed at login) do not include it yet.
+#[cfg(unix)]
 fn stale_session_group(socket: &Path) -> Option<String> {
     use std::ffi::CString;
     use std::os::unix::fs::MetadataExt;

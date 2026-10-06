@@ -11,6 +11,7 @@ on:
       - .github/workflows/release.yml
       - packaging/**
       - install.sh
+      - install.ps1
       - contrib/**
   workflow_dispatch:
 
@@ -117,9 +118,75 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  windows:
+    name: build windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, arch: amd64, runner: windows-latest }
+          - { target: aarch64-pc-windows-msvc, arch: arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ $GITHUB_REF == refs/tags/v* && ${GITHUB_REF#refs/tags/v} != "$version" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "singbox-board-windows-${{ matrix.arch }}"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path "$stage\contrib", dist | Out-Null
+          $release = "target\${{ matrix.target }}\release"
+          Copy-Item "$release\singbox-board.exe", "$release\singbox-board-tray.exe", README.md, install.ps1 $stage
+          Copy-Item contrib\daemon.windows.toml "$stage\contrib\"
+          Set-Content -Path "$stage\VERSION" -Value "${{ steps.version.outputs.version }}"
+          Compress-Archive -Path $stage -DestinationPath "dist\$name.zip" -Force
+          & "$stage\singbox-board.exe" --version
+          & "$stage\singbox-board.exe" daemon --print-default-config | Select-Object -First 3
+
+      - name: Install test (service, pipe, uninstall)
+        if: matrix.arch == 'amd64'
+        shell: powershell
+        run: |
+          .\install.ps1 -Local "dist\singbox-board-windows-amd64.zip" -NoCore -SubStore no -HttpMeta no
+          $service = Get-Service singbox-board
+          if ($service.Status -ne "Running") { throw "the service is $($service.Status)" }
+          & "$env:ProgramFiles\singbox-board\singbox-board.exe" status
+          if ($LASTEXITCODE -ne 0) { throw "status failed" }
+          if (-not (Test-Path "$env:ProgramData\singbox-board\daemon.toml")) { throw "no daemon.toml" }
+          .\install.ps1 -Uninstall -Purge
+          if (Get-Service singbox-board -ErrorAction SilentlyContinue) { throw "the service is still registered" }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: publish
-    needs: build
+    needs: [build, windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -134,7 +201,7 @@ jobs:
 
       - name: Checksums and notes
         run: |
-          cp install.sh dist/
+          cp install.sh install.ps1 dist/
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
           cat > notes.md <<EOF
           ## Install
@@ -149,6 +216,12 @@ jobs:
 
           Or a package: \`sudo apt install ./singbox-board_*.deb\`, \`sudo dnf install ./singbox-board-*.rpm\`,
           \`sudo apk add --allow-untrusted ./singbox-board_*.apk\`, \`sudo pacman -U ./singbox-board-*.pkg.tar.zst\`.
+          Windows 10/11 (amd64 / arm64), in PowerShell opened as administrator:
+
+          \`\`\`powershell
+          & ([scriptblock]::Create((irm https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.ps1))) -Version ${GITHUB_REF_NAME}
+          \`\`\`
+
           Every file is listed in \`SHA256SUMS\`.
           EOF
 

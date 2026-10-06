@@ -13,6 +13,8 @@ mod substore;
 mod tray;
 mod tui;
 mod util;
+#[cfg(windows)]
+mod win;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,9 +23,11 @@ use anyhow::Result;
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::client::DaemonClient;
-use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_SOCKET, DaemonConfig};
+use crate::config::DaemonConfig;
 use crate::i18n::{Lang, fl, fl_log};
-use crate::protocol::{Component, ComponentAction, ContainerAction, Request};
+#[cfg(unix)]
+use crate::protocol::ContainerAction;
+use crate::protocol::{Component, ComponentAction, Request};
 use crate::util::error_chain;
 
 #[derive(Parser)]
@@ -43,7 +47,7 @@ struct Cli {
         hide_env = true,
         value_name = "PATH",
         display_order = 100,
-        help = fl!("cli-socket")
+        help = fl!("cli-socket", default = config::default_socket().display().to_string())
     )]
     socket: Option<PathBuf>,
 
@@ -86,7 +90,8 @@ struct Cli {
 enum Cmd {
     #[command(about = fl!("cli-tui"))]
     Tui,
-    #[command(about = fl!("cli-tray"))]
+    #[cfg_attr(unix, command(about = fl!("cli-tray")))]
+    #[cfg_attr(windows, command(about = fl!("win-cli-tray")))]
     Tray,
     #[command(about = fl!("cli-daemon"))]
     Daemon {
@@ -96,6 +101,9 @@ enum Cmd {
         allow_non_root: bool,
         #[arg(long, help = fl!("cli-daemon-print-default-config"))]
         print_default_config: bool,
+        /// Started by the Windows service control manager.
+        #[arg(long, hide = true)]
+        service: bool,
     },
     #[command(about = fl!("cli-status"))]
     Status {
@@ -168,7 +176,8 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ProfileCmd>,
     },
-    #[command(about = fl!("cli-container"), visible_alias = "ct")]
+    // kurumi-containerd needs Linux.
+    #[command(about = fl!("cli-container"), visible_alias = "ct", hide = cfg!(windows))]
     Container {
         #[command(subcommand)]
         action: Option<ContainerCmd>,
@@ -540,44 +549,83 @@ fn main() -> ExitCode {
     i18n::set_language(initial_language());
     let cli = parse_cli();
     let explicit_lang = cli.lang.is_some();
+    #[cfg(windows)]
+    let tray = matches!(cli.command, Some(Cmd::Tray));
     let result = match cli.command.unwrap_or(Cmd::Tui) {
         Cmd::Daemon {
             config,
             allow_non_root,
             print_default_config,
+            service,
         } => {
             if print_default_config {
-                print!("{}", config::TEMPLATE);
+                print!("{}", config::template());
                 return ExitCode::SUCCESS;
             }
-            run_daemon(cli.socket, config, allow_non_root, explicit_lang)
+            #[cfg(windows)]
+            if service {
+                let socket = cli.socket;
+                win::service::dispatch(move || {
+                    run_daemon(socket, config, allow_non_root, explicit_lang, true)
+                })
+            } else {
+                run_daemon(cli.socket, config, allow_non_root, explicit_lang, false)
+            }
+            #[cfg(unix)]
+            run_daemon(cli.socket, config, allow_non_root, explicit_lang, service)
         }
         command => run_client(cli.socket, cli.lang, command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{}", fl!("error-line", message = error_chain(&err)));
+            let message = fl!("error-line", message = error_chain(&err));
+            // The tray runs detached, with nowhere to print to, when its
+            // launcher starts it from the Start menu or at sign-in.
+            #[cfg(windows)]
+            if tray && !win::has_stderr() {
+                win::message_box("singbox-board", &message, true);
+                return ExitCode::FAILURE;
+            }
+            eprintln!("{message}");
             ExitCode::FAILURE
         }
     }
 }
 
+/// `service`: started by the Windows service control manager, which gives
+/// the daemon no stderr; its output goes to `logs\daemon.log` next to
+/// daemon.toml instead.
 fn run_daemon(
     socket: Option<PathBuf>,
     config_path: Option<PathBuf>,
     allow_non_root: bool,
     explicit_lang: bool,
+    service: bool,
 ) -> Result<()> {
+    let explicit = config_path.is_some();
+    let path = config_path.unwrap_or_else(config::default_config_path);
+    #[cfg(windows)]
+    if service {
+        // Before the console: allocating one resets the standard handles.
+        win::process::ensure_console();
+        let log = path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("logs")
+            .join("daemon.log");
+        win::service::redirect_output(&log)?;
+    }
+    #[cfg(unix)]
+    let _ = service;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_ansi(!service)
         .with_writer(std::io::stderr)
         .init();
-    let explicit = config_path.is_some();
-    let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
     let (mut config, found) = DaemonConfig::load(&path, explicit)?;
     // `--lang` / SINGBOX_BOARD_LANG win over daemon.toml.
     if !explicit_lang {
@@ -604,6 +652,7 @@ fn run_daemon(
 }
 
 fn run_client(socket: Option<PathBuf>, lang: Option<String>, command: Cmd) -> Result<()> {
+    #[cfg(unix)]
     if !matches!(command, Cmd::Tui | Cmd::Tray) {
         // Behave like other CLI tools in pipes (`singbox-board core | head`):
         // exit quietly on a closed stdout instead of panicking. The daemon
@@ -620,7 +669,7 @@ fn run_client(socket: Option<PathBuf>, lang: Option<String>, command: Cmd) -> Re
         socket: socket.clone(),
         lang,
     };
-    let socket = socket.unwrap_or_else(default_socket);
+    let socket = socket.unwrap_or_else(client_socket);
     let client = DaemonClient::new(socket);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -644,6 +693,10 @@ fn run_client(socket: Option<PathBuf>, lang: Option<String>, command: Cmd) -> Re
             }
             Cmd::Core { action } => run_core(&client, action).await,
             Cmd::Profile { action } => run_profile(&client, action).await,
+            // kurumi-containerd needs Linux.
+            #[cfg(windows)]
+            Cmd::Container { .. } => Err(anyhow::anyhow!(fl!("win-containers-unsupported"))),
+            #[cfg(unix)]
             Cmd::Container { action } => run_container(&client, action).await,
             Cmd::Daemon { .. } => unreachable!("handled in main"),
         }
@@ -747,6 +800,7 @@ async fn run_profile(client: &DaemonClient, action: Option<ProfileCmd>) -> Resul
     }
 }
 
+#[cfg(unix)]
 async fn run_container(client: &DaemonClient, action: Option<ContainerCmd>) -> Result<()> {
     use crate::ctl_container as ct;
     match action.unwrap_or(ContainerCmd::List) {
@@ -830,10 +884,10 @@ async fn run_container(client: &DaemonClient, action: Option<ContainerCmd>) -> R
 }
 
 /// Clients follow a readable daemon.toml so a custom socket path just works.
-fn default_socket() -> PathBuf {
-    DaemonConfig::load(std::path::Path::new(DEFAULT_CONFIG_PATH), false)
+fn client_socket() -> PathBuf {
+    DaemonConfig::load(&config::default_config_path(), false)
         .map(|(config, _)| config.socket)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET))
+        .unwrap_or_else(|_| config::default_socket())
 }
 
 #[cfg(test)]

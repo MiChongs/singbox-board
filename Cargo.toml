@@ -5,6 +5,7 @@ edition = "2024"
 description = "Root daemon and TUI dashboard for MiChongs/sing-box (xiaobaf14g)"
 repository = "https://github.com/MiChongs/sing-box"
 publish = false
+default-run = "singbox-board"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -20,8 +21,7 @@ i18n-embed-fl = "0.10"
 json_comments = "0.2.2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
 lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "optimization", "xz"] }
-ksni = "0.3.6"
-nix = { version = "0.31.3", features = ["user", "signal", "process", "fs", "net"] }
+getrandom = "0.4"
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 ratatui-textarea = { version = "0.9", default-features = false }
 regex = "1"
@@ -38,8 +38,41 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
-zbus = { version = "5", default-features = false, features = ["tokio"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+ksni = "0.3.6"
+nix = { version = "0.31.3", features = ["user", "signal", "process", "fs", "net"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = true

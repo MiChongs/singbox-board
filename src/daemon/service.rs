@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -16,7 +18,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant as Deadline, timeout};
 
 use super::logs::LogHub;
-use super::process::{describe, first_line, isolate, pipe_to_logs, sleep_until_opt, wait_child};
+use super::process::{
+    adopt, describe, first_line, isolate, pipe_to_logs, request_stop, sleep_until_opt, wait_child,
+};
 use crate::config::{RestartConfig, RestartPolicy};
 use crate::i18n::{self, Lang, fl, fl_log};
 use crate::protocol::{CoreState, LogSource};
@@ -31,7 +35,8 @@ pub struct ServiceSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
-    /// uid/gid to drop to before exec.
+    /// uid/gid to drop to before exec (never set on Windows).
+    #[cfg_attr(windows, allow(dead_code))]
     pub user: Option<(u32, u32)>,
     /// Executable of detached grandchildren to kill after the service exits
     /// (http-meta starts mihomo in its own session).
@@ -251,6 +256,7 @@ impl Service {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
         if let Some((uid, gid)) = spec.user {
             command.uid(uid).gid(gid);
         }
@@ -258,6 +264,7 @@ impl Service {
         let mut child = command
             .spawn()
             .with_context(|| fl!("err-spawn", path = spec.program.display().to_string()))?;
+        adopt(&child);
         let pid = child.id().unwrap_or_default();
         self.pipes.clear();
         if let Some(stdout) = child.stdout.take() {
@@ -306,17 +313,12 @@ impl Service {
     async fn stop_child(&mut self) -> Option<String> {
         let mut child = self.child.take()?;
         self.set_state(CoreState::Stopping);
-        if let Some(pid) = child.id() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-        }
+        request_stop(&mut child);
         let status = match timeout(STOP_TIMEOUT, child.wait()).await {
             Ok(status) => status,
             Err(_) => {
-                self.logs.warn(fl_log!(
-                    "service-kill",
-                    name = self.title,
-                    seconds = STOP_TIMEOUT.as_secs()
-                ));
+                self.logs
+                    .warn(kill_line(self.title, STOP_TIMEOUT.as_secs()));
                 let _ = child.start_kill();
                 child.wait().await
             }
@@ -389,7 +391,27 @@ fn initial_backoff(restart: &RestartConfig) -> Duration {
     Duration::from_millis(restart.initial_backoff_ms.max(100))
 }
 
+fn kill_line(name: &str, seconds: u64) -> String {
+    #[cfg(unix)]
+    return fl_log!("service-kill", name = name, seconds = seconds);
+    #[cfg(windows)]
+    return fl_log!("win-service-kill", name = name, seconds = seconds);
+}
+
 /// Terminates every process whose executable is `exe`.
+#[cfg(windows)]
+fn reap(exe: &Path, logs: &LogHub) {
+    for pid in crate::win::process::kill_by_executable(exe) {
+        logs.info(fl_log!(
+            "service-reap",
+            path = exe.display().to_string(),
+            pid = pid.to_string()
+        ));
+    }
+}
+
+/// Terminates every process whose executable is `exe`.
+#[cfg(unix)]
 fn reap(exe: &Path, logs: &LogHub) {
     let deleted = format!("{} (deleted)", exe.display());
     let Ok(entries) = std::fs::read_dir("/proc") else {

@@ -1,10 +1,12 @@
 //! Child-process helpers shared by the sing-box supervisor and the component services.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+#[cfg(unix)]
 use nix::sys::signal::Signal;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
@@ -18,6 +20,7 @@ use crate::util::strip_ansi;
 
 /// Puts the child in its own process group and makes the kernel SIGTERM it
 /// when the daemon dies, so no unmanaged process is left behind.
+#[cfg(unix)]
 pub fn isolate(command: &mut Command) {
     // Keep terminal signals (Ctrl-C on a foreground daemon) away from the
     // child; the daemon stops it in an orderly way instead.
@@ -27,6 +30,37 @@ pub fn isolate(command: &mut Command) {
     unsafe {
         command
             .pre_exec(|| nix::sys::prctl::set_pdeathsig(Signal::SIGTERM).map_err(io::Error::from));
+    }
+}
+
+/// Puts the child in its own process group; [`adopt`] then ties it to the
+/// daemon's lifetime.
+#[cfg(windows)]
+pub fn isolate(command: &mut Command) {
+    command
+        .creation_flags(crate::win::process::CHILD_FLAGS)
+        .kill_on_drop(true);
+}
+
+/// Called right after spawning an [`isolate`]d child.
+pub fn adopt(child: &Child) {
+    #[cfg(windows)]
+    crate::win::process::adopt(child);
+    #[cfg(unix)]
+    let _ = child;
+}
+
+/// Asks a child to stop: SIGTERM, or CTRL_BREAK to its process group on
+/// Windows (terminating it right away when that cannot be delivered).
+pub fn request_stop(child: &mut Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    #[cfg(unix)]
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM);
+    #[cfg(windows)]
+    if !crate::win::process::request_stop(pid) {
+        let _ = child.start_kill();
     }
 }
 
@@ -64,6 +98,7 @@ pub fn pipe_to_logs<R: AsyncRead + Unpin + Send + 'static>(
 }
 
 /// How a process ended, in the current language.
+#[cfg(unix)]
 pub fn describe(status: &io::Result<ExitStatus>) -> String {
     match status {
         Ok(status) => match (status.code(), status.signal()) {
@@ -73,6 +108,20 @@ pub fn describe(status: &io::Result<ExitStatus>) -> String {
                 Err(_) => fl!("exit-signal", signal = signal.to_string()),
             },
             _ => fl!("exit-unknown"),
+        },
+        Err(err) => fl!("exit-wait-failed", error = err.to_string()),
+    }
+}
+
+/// How a process ended, in the current language. Exit codes that are
+/// NTSTATUS values (a crash, Ctrl-C) are shown in hex.
+#[cfg(windows)]
+pub fn describe(status: &io::Result<ExitStatus>) -> String {
+    match status {
+        Ok(status) => match status.code() {
+            Some(code) if code < 0 => fl!("exit-code", code = format!("{:#010X}", code as u32)),
+            Some(code) => fl!("exit-code", code = code),
+            None => fl!("exit-unknown"),
         },
         Err(err) => fl!("exit-wait-failed", error = err.to_string()),
     }

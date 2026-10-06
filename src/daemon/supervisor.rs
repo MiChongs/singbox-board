@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -25,7 +27,7 @@ use super::singbox_config::discover_clash_api;
 use crate::config::{CoreConfig, DaemonConfig, RestartPolicy};
 use crate::i18n::{self, Lang, fl, fl_log};
 use crate::protocol::{ClashApi, CoreState, LogSource, Response, Status};
-use crate::util::{error_chain, now_unix, point_symlink, strip_ansi};
+use crate::util::{error_chain, launch_path, now_unix, point_symlink, strip_ansi};
 
 /// A process still alive after this long is considered successfully started.
 const STARTUP_GRACE: Duration = Duration::from_millis(1500);
@@ -376,6 +378,26 @@ impl Supervisor {
         self.start().await
     }
 
+    /// sing-box on Windows has no SIGHUP to reload on, so a reload is a
+    /// restart there (after the same check).
+    #[cfg(windows)]
+    async fn reload(&mut self) -> Response {
+        if self.child.is_none() {
+            return Response::error(fl!("supervisor-not-running"));
+        }
+        if let Err(err) = self.check().await {
+            return Response::error(format!(
+                "{}\n{}",
+                fl!("supervisor-check-failed-reload"),
+                error_chain(&err)
+            ));
+        }
+        self.logs.info(fl_log!("win-supervisor-reload-restarts"));
+        self.stop_child().await;
+        self.start().await
+    }
+
+    #[cfg(unix)]
     async fn reload(&mut self) -> Response {
         let Some(pid) = self.child.as_ref().and_then(Child::id) else {
             return Response::error(fl!("supervisor-not-running"));
@@ -451,7 +473,7 @@ impl Supervisor {
         }
         self.clash_api = discover_clash_api(&core, &self.config.clash_api);
 
-        let mut command = Command::new(&core.binary);
+        let mut command = Command::new(launch_path(&core.binary));
         command
             .args(core.run_args())
             .envs(&core.env)
@@ -462,6 +484,7 @@ impl Supervisor {
         let mut child = command
             .spawn()
             .with_context(|| fl!("err-spawn", path = core.binary.display().to_string()))?;
+        process::adopt(&child);
         let pid = child.id().unwrap_or_default();
         self.pipes.clear();
         if let Some(stdout) = child.stdout.take() {
@@ -504,15 +527,16 @@ impl Supervisor {
     async fn stop_child(&mut self) -> Option<String> {
         let mut child = self.child.take()?;
         self.set_state(CoreState::Stopping);
-        if let Some(pid) = child.id() {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-        }
+        process::request_stop(&mut child);
         let grace = Duration::from_secs(self.config.core.stop_timeout_secs.max(1));
         let status = match timeout(grace, child.wait()).await {
             Ok(status) => status,
             Err(_) => {
-                self.logs
-                    .warn(fl_log!("supervisor-kill", seconds = grace.as_secs()));
+                #[cfg(unix)]
+                let line = fl_log!("supervisor-kill", seconds = grace.as_secs());
+                #[cfg(windows)]
+                let line = fl_log!("win-supervisor-kill", seconds = grace.as_secs());
+                self.logs.warn(line);
                 let _ = child.start_kill();
                 child.wait().await
             }
@@ -599,7 +623,7 @@ impl Supervisor {
         }
         let output = timeout(
             Duration::from_secs(10),
-            Command::new(binary)
+            Command::new(launch_path(binary))
                 .arg("version")
                 .kill_on_drop(true)
                 .output(),
@@ -845,7 +869,7 @@ impl Supervisor {
 pub async fn run_check(core: &CoreConfig, binary: &Path, args: Vec<String>) -> Result<()> {
     let output = timeout(
         CHECK_TIMEOUT,
-        Command::new(binary)
+        Command::new(launch_path(binary))
             .args(args)
             .envs(&core.env)
             .stdin(Stdio::null())

@@ -1,37 +1,45 @@
-//! System tray icon, published as a StatusNotifierItem over D-Bus.
+//! System tray icon. Like the TUI, the tray is a client of the daemon: it
+//! polls the status and turns menu clicks into requests.
 //!
-//! StatusNotifierItem does not depend on the display server, so the tray
-//! works on Wayland and X11 alike, in every host of the protocol: KDE
-//! Plasma, GNOME with the AppIndicator extension, Cinnamon, XFCE, LXQt, and
-//! the tray modules of Waybar and other bars. Like the TUI, the tray is a
-//! client of the daemon: it polls the status and turns menu clicks into
-//! requests.
+//! What the tray shows and offers is worked out here, independent of the
+//! platform; [`platform`] draws it:
+//!
+//! - Linux: a StatusNotifierItem over D-Bus, which does not depend on the
+//!   display server, so the tray works on Wayland and X11 alike, in every
+//!   host of the protocol: KDE Plasma, GNOME with the AppIndicator
+//!   extension, Cinnamon, XFCE, LXQt, and the tray modules of Waybar and
+//!   other bars.
+//! - Windows: an icon in the notification area (Shell_NotifyIcon) with a
+//!   native context menu that follows the system's dark mode, notifications
+//!   as balloons/toasts, a login item in the registry's Run key, and the
+//!   option to start the service when the daemon is not running.
 
+#[cfg(unix)]
 mod desktop;
 mod icon;
+#[cfg(unix)]
+#[path = "sni.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod platform;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
-use ksni::{MenuItem, ToolTip, TrayMethods};
-use tokio::signal::unix::{SignalKind, signal};
+use anyhow::{Context, Result};
 use tokio::sync::{Notify, mpsc};
 
-use self::desktop::Notifier;
 use self::icon::Tone;
+use self::platform::{Handle, Notifier};
 use crate::clash::ClashClient;
 use crate::client::DaemonClient;
 use crate::i18n::{self, fl};
 use crate::protocol::{ClashApi, Component, ContainerAction, CoreState, Request, Status};
 use crate::util::error_chain;
 
-/// Owned on the session bus while a tray runs, so that starting a second
-/// one in the same desktop session does not add a second icon.
-const BUS_NAME: &str = "io.github.MiChongs.SingboxBoard.Tray";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CLASH_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -42,23 +50,12 @@ pub struct Options {
 }
 
 pub async fn run(client: DaemonClient, options: Options) -> Result<()> {
-    let bus = zbus::Connection::session()
-        .await
-        .map_err(|err| anyhow!(fl!("tray-no-session-bus", error = err.to_string())))?;
-    match bus
-        .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())
-        .await
-    {
-        Ok(_) => {}
-        Err(zbus::Error::NameTaken) => bail!(fl!("tray-already-running")),
-        Err(err) => {
-            return Err(anyhow!(fl!("tray-no-session-bus", error = err.to_string())));
-        }
-    }
+    // One tray per desktop session, so a second start adds no second icon.
+    let session = platform::Session::open().await?;
     let exe = std::env::current_exe().context(fl!("tray-no-executable"))?;
-    let notifier = Notifier::new(bus);
+    let notifier = session.notifier();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let handle = spawn_tray(&tx).await?;
+    let handle = platform::spawn(|| BoardTray::new(tx.clone())).await?;
     let refresh = Arc::new(Notify::new());
     let poller = tokio::spawn(poll(
         client.clone(),
@@ -73,15 +70,12 @@ pub async fn run(client: DaemonClient, options: Options) -> Result<()> {
         notifier,
         refresh,
     };
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
+    let terminated = platform::terminated();
+    tokio::pin!(terminated);
     loop {
         let action = tokio::select! {
             action = rx.recv() => action,
-            _ = terminate.recv() => None,
-            _ = hangup.recv() => None,
-            _ = interrupt.recv() => None,
+            _ = &mut terminated => None,
         };
         match action {
             None | Some(Action::Quit) => break,
@@ -99,30 +93,41 @@ pub async fn run(client: DaemonClient, options: Options) -> Result<()> {
                     i18n::current().tag().into(),
                     "tui".into(),
                 ]);
-                if let Err(err) = desktop::open_terminal(&command) {
+                if let Err(err) = platform::open_dashboard(&command) {
                     worker.failed("dashboard", &err).await;
                 }
             }
             Some(Action::Open(url)) => {
                 let worker = worker.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = desktop::open_url(&url).await {
+                    if let Err(err) = platform::open_url(&url).await {
                         worker.failed("browser", &err).await;
                     }
                 });
             }
             Some(Action::Autostart(enable)) => {
-                let result = desktop::set_autostart(enable, &tray_command(&exe, &options));
-                let enabled = desktop::autostart_enabled();
-                handle.update(|tray| tray.autostart = enabled).await;
+                let command = platform::login_command(tray_command(&exe, &options));
+                let result = platform::set_autostart(enable, &command);
+                let enabled = platform::autostart_enabled();
+                handle.update(move |tray| tray.autostart = enabled).await;
                 if let Err(err) = result {
                     worker.failed("autostart", &err).await;
                 }
+            }
+            Some(Action::StartService) => {
+                let worker = worker.clone();
+                tokio::spawn(async move {
+                    match platform::start_service().await {
+                        Ok(()) => worker.refresh.notify_one(),
+                        Err(err) => worker.failed("service", &err).await,
+                    }
+                });
             }
         }
     }
     poller.abort();
     handle.shutdown().await;
+    drop(session);
     Ok(())
 }
 
@@ -139,28 +144,11 @@ fn tray_command(exe: &std::path::Path, options: &Options) -> Vec<OsString> {
     command
 }
 
-async fn spawn_tray(tx: &mpsc::UnboundedSender<Action>) -> Result<ksni::Handle<BoardTray>> {
-    match BoardTray::new(tx.clone()).spawn().await {
-        Ok(handle) => Ok(handle),
-        Err(err @ (ksni::Error::Watcher(_) | ksni::Error::WontShow)) => {
-            // Started before the panel (at login), or on a desktop without a
-            // tray: wait for one to appear instead of giving up.
-            eprintln!("{}", fl!("tray-waiting-host", reason = err.to_string()));
-            BoardTray::new(tx.clone())
-                .assume_sni_available(true)
-                .spawn()
-                .await
-                .map_err(|err| anyhow!(fl!("tray-start-failed", error = err.to_string())))
-        }
-        Err(err) => Err(anyhow!(fl!("tray-start-failed", error = err.to_string()))),
-    }
-}
-
 /// Everything an action needs once it left the menu.
 #[derive(Clone)]
 struct Worker {
     client: DaemonClient,
-    handle: ksni::Handle<BoardTray>,
+    handle: Handle,
     notifier: Notifier,
     refresh: Arc<Notify>,
 }
@@ -208,6 +196,9 @@ enum Action {
     Dashboard,
     Open(String),
     Autostart(bool),
+    /// Start the daemon's service (Windows).
+    #[cfg_attr(unix, allow(dead_code))]
+    StartService,
     Refresh,
     Quit,
 }
@@ -328,7 +319,7 @@ struct Mode {
 /// Polls the daemon and the Clash API and hands changes to the tray.
 async fn poll(
     client: DaemonClient,
-    handle: ksni::Handle<BoardTray>,
+    handle: Handle,
     refresh: Arc<Notify>,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<Action>,
@@ -453,12 +444,83 @@ struct BoardTray {
     actions: mpsc::UnboundedSender<Action>,
 }
 
+/// A menu entry, independent of how the platform draws menus. Labels are
+/// plain text; the platform escapes its access-key marks.
+#[derive(Clone, Debug, PartialEq)]
+enum Entry {
+    Separator,
+    /// A command, or a disabled line of text when there is none.
+    Item {
+        label: String,
+        enabled: bool,
+        /// Freedesktop icon name, for hosts that show icons in menus.
+        icon: &'static str,
+        command: Option<Command>,
+    },
+    Check {
+        label: String,
+        checked: bool,
+        enabled: bool,
+        command: Command,
+    },
+    /// One choice of a group of consecutive radio items; picking the
+    /// checked one does nothing.
+    Radio {
+        label: String,
+        checked: bool,
+        enabled: bool,
+        command: Option<Command>,
+    },
+    Sub {
+        label: String,
+        icon: &'static str,
+        items: Vec<Entry>,
+    },
+}
+
+/// What a menu entry does.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    Start,
+    Stop,
+    Restart,
+    Profile(String),
+    UpdateProfiles,
+    Mode(ClashApi, String),
+    Container(String, ContainerAction),
+    Dashboard,
+    Open(String),
+    Autostart(bool),
+    StartService,
+    Quit,
+}
+
+impl Entry {
+    fn label(text: String) -> Self {
+        Entry::Item {
+            label: text,
+            enabled: false,
+            icon: "",
+            command: None,
+        }
+    }
+
+    fn item(label: String, enabled: bool, icon: &'static str, command: Command) -> Self {
+        Entry::Item {
+            label,
+            enabled,
+            icon,
+            command: Some(command),
+        }
+    }
+}
+
 impl BoardTray {
     fn new(actions: mpsc::UnboundedSender<Action>) -> Self {
         Self {
             view: View::default(),
             busy: None,
-            autostart: desktop::autostart_enabled(),
+            autostart: platform::autostart_enabled(),
             actions,
         }
     }
@@ -474,11 +536,50 @@ impl BoardTray {
         }
     }
 
+    /// Carries out a menu entry's command.
+    fn invoke(&mut self, command: Command) {
+        match command {
+            Command::Start => self.start(Op::Start, Job::Daemon(Request::Start)),
+            Command::Stop => self.start(Op::Stop, Job::Daemon(Request::Stop)),
+            Command::Restart => self.start(Op::Restart, Job::Daemon(Request::Restart)),
+            Command::Profile(id) => {
+                let request = Request::ProfileActivate { id, force: false };
+                self.start(Op::Profile, Job::Daemon(request));
+            }
+            Command::UpdateProfiles => {
+                let request = Request::ProfileUpdate {
+                    id: None,
+                    force: false,
+                };
+                self.start(Op::Update, Job::Daemon(request));
+            }
+            Command::Mode(api, mode) => self.start(Op::Mode, Job::Mode(api, mode)),
+            Command::Container(id, action) => {
+                let request = Request::ContainerControl { id, action };
+                self.start(Op::Container, Job::Daemon(request));
+            }
+            Command::Dashboard => self.send(Action::Dashboard),
+            Command::Open(url) => self.send(Action::Open(url)),
+            Command::Autostart(enable) => self.send(Action::Autostart(enable)),
+            Command::StartService => self.send(Action::StartService),
+            Command::Quit => self.send(Action::Quit),
+        }
+    }
+
     fn core(&self) -> Option<&Core> {
         match &self.view.link {
             Link::Up(core) => Some(core),
             _ => None,
         }
+    }
+
+    /// sing-box failed and nobody is doing anything about it yet.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn needs_attention(&self) -> bool {
+        self.busy.is_none()
+            && self
+                .core()
+                .is_some_and(|core| core.state == CoreState::Failed)
     }
 
     fn tone(&self) -> Tone {
@@ -553,81 +654,44 @@ impl BoardTray {
         lines
     }
 
-    fn profile_menu(&self, idle: bool) -> MenuItem<Self> {
+    fn profile_menu(&self, idle: bool) -> Entry {
         let profiles = &self.view.profiles;
         let active = profiles.iter().position(|p| p.active);
         let label = match active {
             Some(index) => detail(fl!("ctl-label-profile"), profiles[index].name.clone()),
             None => fl!("ctl-label-profile"),
         };
-        let mut submenu = Vec::new();
-        if profiles.is_empty() {
-            submenu.push(
-                StandardItem {
-                    label: fl!("tray-no-profiles"),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else {
-            let ids: Vec<String> = profiles.iter().map(|p| p.id.clone()).collect();
-            submenu.push(
-                RadioGroup {
-                    selected: active.unwrap_or(usize::MAX),
-                    select: Box::new(move |tray: &mut Self, index| {
-                        if Some(index) != active
-                            && let Some(id) = ids.get(index)
-                        {
-                            let request = Request::ProfileActivate {
-                                id: id.clone(),
-                                force: false,
-                            };
-                            tray.start(Op::Profile, Job::Daemon(request));
-                        }
-                    }),
-                    options: profiles
-                        .iter()
-                        .map(|p| RadioItem {
-                            label: mnemonic_free(&p.name),
-                            enabled: idle,
-                            ..Default::default()
-                        })
-                        .collect(),
-                }
-                .into(),
-            );
+        let mut items: Vec<Entry> = profiles
+            .iter()
+            .map(|p| Entry::Radio {
+                label: p.name.clone(),
+                checked: p.active,
+                enabled: idle,
+                command: (!p.active).then(|| Command::Profile(p.id.clone())),
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(Entry::label(fl!("tray-no-profiles")));
         }
         if profiles.iter().any(|p| p.remote) {
-            submenu.push(MenuItem::Separator);
-            submenu.push(
-                StandardItem {
-                    label: fl!("tray-update-profiles"),
-                    enabled: idle,
-                    icon_name: "download".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        let request = Request::ProfileUpdate {
-                            id: None,
-                            force: false,
-                        };
-                        tray.start(Op::Update, Job::Daemon(request));
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
+            items.push(Entry::Separator);
+            items.push(Entry::item(
+                fl!("tray-update-profiles"),
+                idle,
+                "download",
+                Command::UpdateProfiles,
+            ));
         }
-        SubMenu {
-            label: mnemonic_free(&label),
-            submenu,
-            ..Default::default()
+        Entry::Sub {
+            label,
+            icon: "",
+            items,
         }
-        .into()
     }
 
     /// One checkbox per container: checked while it runs, a click starts
     /// or stops it.
-    fn container_menu(&self, idle: bool) -> Option<MenuItem<Self>> {
+    fn container_menu(&self, idle: bool) -> Option<Entry> {
         let containers = &self.view.containers;
         if containers.is_empty() {
             return None;
@@ -636,235 +700,135 @@ impl BoardTray {
             .iter()
             .filter(|c| c.state == CoreState::Running)
             .count();
-        let submenu = containers
+        let items = containers
             .iter()
             .map(|c| {
-                let id = c.id.clone();
                 let on = c.state == CoreState::Running;
                 let settled = matches!(
                     c.state,
                     CoreState::Running | CoreState::Stopped | CoreState::Failed
                 );
-                CheckmarkItem {
-                    label: mnemonic_free(&c.name),
+                let action = if on {
+                    ContainerAction::Stop
+                } else {
+                    ContainerAction::Start
+                };
+                Entry::Check {
+                    label: c.name.clone(),
                     checked: on,
                     enabled: idle && settled && (on || c.ready),
-                    activate: Box::new(move |tray: &mut Self| {
-                        let action = if on {
-                            ContainerAction::Stop
-                        } else {
-                            ContainerAction::Start
-                        };
-                        let request = Request::ContainerControl {
-                            id: id.clone(),
-                            action,
-                        };
-                        tray.start(Op::Container, Job::Daemon(request));
-                    }),
-                    ..Default::default()
+                    command: Command::Container(c.id.clone(), action),
                 }
-                .into()
             })
             .collect();
-        Some(
-            SubMenu {
-                label: mnemonic_free(&detail(
-                    fl!("ctl-label-containers"),
-                    fl!(
-                        "ctl-containers-summary",
-                        running = running,
-                        total = containers.len()
-                    ),
-                )),
-                icon_name: "utilities-system-monitor".into(),
-                submenu,
-                ..Default::default()
-            }
-            .into(),
-        )
+        Some(Entry::Sub {
+            label: detail(
+                fl!("ctl-label-containers"),
+                fl!(
+                    "ctl-containers-summary",
+                    running = running,
+                    total = containers.len()
+                ),
+            ),
+            icon: "utilities-system-monitor",
+            items,
+        })
     }
 
-    fn mode_menu(&self, idle: bool) -> Option<MenuItem<Self>> {
+    fn mode_menu(&self, idle: bool) -> Option<Entry> {
         let mode = self.view.mode.as_ref().filter(|mode| mode.all.len() > 1)?;
-        let selected = mode
+        let items = mode
             .all
             .iter()
-            .position(|m| m.eq_ignore_ascii_case(&mode.current));
-        let api = mode.api.clone();
-        let modes = mode.all.clone();
-        let radio = RadioGroup {
-            selected: selected.unwrap_or(usize::MAX),
-            select: Box::new(move |tray: &mut Self, index| {
-                if Some(index) != selected
-                    && let Some(mode) = modes.get(index)
-                {
-                    tray.start(Op::Mode, Job::Mode(api.clone(), mode.clone()));
-                }
-            }),
-            options: mode
-                .all
-                .iter()
-                .map(|m| RadioItem {
-                    label: mnemonic_free(m),
+            .map(|m| {
+                let checked = m.eq_ignore_ascii_case(&mode.current);
+                Entry::Radio {
+                    label: m.clone(),
+                    checked,
                     enabled: idle,
-                    ..Default::default()
-                })
-                .collect(),
-        };
-        Some(
-            SubMenu {
-                label: mnemonic_free(&detail(fl!("tray-label-mode"), mode.current.clone())),
-                submenu: vec![radio.into()],
-                ..Default::default()
-            }
-            .into(),
-        )
+                    command: (!checked).then(|| Command::Mode(mode.api.clone(), m.clone())),
+                }
+            })
+            .collect();
+        Some(Entry::Sub {
+            label: detail(fl!("tray-label-mode"), mode.current.clone()),
+            icon: "",
+            items,
+        })
+    }
+
+    fn menu(&self) -> Vec<Entry> {
+        let idle = self.busy.is_none();
+        let mut items = vec![Entry::label(self.headline()), Entry::Separator];
+        if let Some(core) = self.core() {
+            let stopped = matches!(core.state, CoreState::Stopped | CoreState::Failed);
+            let stopping = core.state == CoreState::Stopping;
+            items.push(if stopped {
+                Entry::item(
+                    fl!("tray-start"),
+                    idle,
+                    "media-playback-start",
+                    Command::Start,
+                )
+            } else {
+                Entry::item(
+                    fl!("tray-stop"),
+                    idle && !stopping,
+                    "media-playback-stop",
+                    Command::Stop,
+                )
+            });
+            items.push(Entry::item(
+                fl!("tray-restart"),
+                idle && !stopped && !stopping,
+                "view-refresh",
+                Command::Restart,
+            ));
+            items.push(Entry::Separator);
+            items.push(self.profile_menu(idle));
+            items.extend(self.mode_menu(idle));
+            items.extend(self.container_menu(idle));
+            items.push(Entry::Separator);
+        } else if cfg!(windows) && matches!(self.view.link, Link::Down(_)) {
+            items.push(Entry::item(
+                fl!("tray-start-service"),
+                true,
+                "",
+                Command::StartService,
+            ));
+            items.push(Entry::Separator);
+        }
+        items.push(Entry::item(
+            fl!("tray-open-dashboard"),
+            true,
+            "utilities-terminal",
+            Command::Dashboard,
+        ));
+        if let Some(url) = self.core().and_then(|core| core.sub_store.clone()) {
+            items.push(Entry::item(
+                fl!("tray-open-sub-store"),
+                true,
+                "internet-web-browser",
+                Command::Open(url),
+            ));
+        }
+        items.extend([
+            Entry::Separator,
+            Entry::Check {
+                label: fl!("tray-autostart"),
+                checked: self.autostart,
+                enabled: true,
+                command: Command::Autostart(!self.autostart),
+            },
+            Entry::item(fl!("tray-quit"), true, "application-exit", Command::Quit),
+        ]);
+        items
     }
 }
 
 /// `label: value` in the current language.
 fn detail(label: String, value: String) -> String {
     fl!("tray-detail", label = label, value = value)
-}
-
-/// Menu hosts read `_` as the mark of an access key; `__` is a literal one.
-fn mnemonic_free(text: &str) -> String {
-    text.replace('_', "__")
-}
-
-impl ksni::Tray for BoardTray {
-    fn id(&self) -> String {
-        "singbox-board".into()
-    }
-
-    fn title(&self) -> String {
-        "singbox-board".into()
-    }
-
-    fn status(&self) -> ksni::Status {
-        // Hosts move items that need attention out of the overflow area.
-        match self.core() {
-            Some(core) if core.state == CoreState::Failed && self.busy.is_none() => {
-                ksni::Status::NeedsAttention
-            }
-            _ => ksni::Status::Active,
-        }
-    }
-
-    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        icon::pixmaps(self.tone())
-    }
-
-    fn tool_tip(&self) -> ToolTip {
-        ToolTip {
-            title: self.headline(),
-            description: self.details().join("\n"),
-            ..Default::default()
-        }
-    }
-
-    /// A left click opens the dashboard.
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.send(Action::Dashboard);
-    }
-
-    fn menu_about_to_show(&mut self) {
-        self.send(Action::Refresh);
-    }
-
-    fn menu(&self) -> Vec<MenuItem<Self>> {
-        let idle = self.busy.is_none();
-        let mut items: Vec<MenuItem<Self>> = vec![
-            StandardItem {
-                label: mnemonic_free(&self.headline()),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-        ];
-        if let Some(core) = self.core() {
-            let stopped = matches!(core.state, CoreState::Stopped | CoreState::Failed);
-            let stopping = core.state == CoreState::Stopping;
-            items.extend([
-                StandardItem {
-                    label: fl!("tray-start"),
-                    visible: stopped,
-                    enabled: idle,
-                    icon_name: "media-playback-start".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        tray.start(Op::Start, Job::Daemon(Request::Start));
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                StandardItem {
-                    label: fl!("tray-stop"),
-                    visible: !stopped,
-                    enabled: idle && !stopping,
-                    icon_name: "media-playback-stop".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        tray.start(Op::Stop, Job::Daemon(Request::Stop));
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                StandardItem {
-                    label: fl!("tray-restart"),
-                    enabled: idle && !stopped && !stopping,
-                    icon_name: "view-refresh".into(),
-                    activate: Box::new(|tray: &mut Self| {
-                        tray.start(Op::Restart, Job::Daemon(Request::Restart));
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-                MenuItem::Separator,
-                self.profile_menu(idle),
-            ]);
-            items.extend(self.mode_menu(idle));
-            items.extend(self.container_menu(idle));
-            items.push(MenuItem::Separator);
-        }
-        items.push(
-            StandardItem {
-                label: fl!("tray-open-dashboard"),
-                icon_name: "utilities-terminal".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Action::Dashboard)),
-                ..Default::default()
-            }
-            .into(),
-        );
-        if let Some(url) = self.core().and_then(|core| core.sub_store.clone()) {
-            items.push(
-                StandardItem {
-                    label: fl!("tray-open-sub-store"),
-                    icon_name: "internet-web-browser".into(),
-                    activate: Box::new(move |tray: &mut Self| tray.send(Action::Open(url.clone()))),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        items.extend([
-            MenuItem::Separator,
-            CheckmarkItem {
-                label: fl!("tray-autostart"),
-                checked: self.autostart,
-                activate: Box::new(|tray: &mut Self| tray.send(Action::Autostart(!tray.autostart))),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: fl!("tray-quit"),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Action::Quit)),
-                ..Default::default()
-            }
-            .into(),
-        ]);
-        items
-    }
 }
 
 #[cfg(test)]
@@ -949,20 +913,26 @@ mod tests {
                 ready: false,
             },
         ];
-        let Some(MenuItem::SubMenu(menu)) = tray.container_menu(true) else {
+        let Some(Entry::Sub { label, items, .. }) = tray.container_menu(true) else {
             panic!("no container menu");
         };
-        assert!(menu.label.contains("1"));
-        let MenuItem::Checkmark(first) = &menu.submenu[0] else {
+        assert!(label.contains("1"));
+        let Entry::Check {
+            label,
+            checked,
+            enabled,
+            command,
+        } = &items[0]
+        else {
             panic!("not a checkbox");
         };
-        assert!(first.checked && first.enabled);
-        assert_eq!(first.label, "dev__box");
-        let MenuItem::Checkmark(second) = &menu.submenu[1] else {
+        assert!(*checked && *enabled);
+        assert_eq!(label, "dev_box");
+        let Entry::Check { enabled, .. } = &items[1] else {
             panic!("not a checkbox");
         };
-        assert!(!second.enabled, "no root filesystem yet");
-        (first.activate)(&mut tray);
+        assert!(!enabled, "no root filesystem yet");
+        tray.invoke(command.clone());
         assert!(matches!(
             rx.try_recv(),
             Ok(Action::Run(
@@ -977,8 +947,89 @@ mod tests {
     }
 
     #[test]
-    fn underscores_are_not_access_keys() {
-        assert_eq!(mnemonic_free("home_lab"), "home__lab");
+    fn menu_follows_the_state() {
+        let running = tray(core(CoreState::Running));
+        let menu = running.menu();
+        assert!(menu.contains(&Entry::item(
+            fl!("tray-stop"),
+            true,
+            "media-playback-stop",
+            Command::Stop
+        )));
+        let Some(Entry::Sub { items, .. }) = menu
+            .iter()
+            .find(|e| matches!(e, Entry::Sub { label, .. } if label.contains("home_lab") || label == &fl!("ctl-label-profile")))
+        else {
+            panic!("no profile menu: {menu:?}");
+        };
+        assert_eq!(items, &[Entry::label(fl!("tray-no-profiles"))]);
+        let stopped = tray(core(CoreState::Stopped)).menu();
+        assert!(stopped.iter().any(|e| matches!(
+            e,
+            Entry::Item {
+                command: Some(Command::Start),
+                ..
+            }
+        )));
+        let down = tray(Link::Down("no socket".into())).menu();
+        assert_eq!(
+            down.iter().any(|e| matches!(
+                e,
+                Entry::Item {
+                    command: Some(Command::StartService),
+                    ..
+                }
+            )),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn picking_the_active_profile_does_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tray = tray(core(CoreState::Running));
+        tray.actions = tx;
+        tray.view.profiles = vec![
+            Choice {
+                id: "a".into(),
+                name: "home".into(),
+                active: true,
+                remote: false,
+            },
+            Choice {
+                id: "b".into(),
+                name: "office".into(),
+                active: false,
+                remote: true,
+            },
+        ];
+        let Entry::Sub { items, .. } = tray.profile_menu(true) else {
+            panic!("not a submenu");
+        };
+        assert!(matches!(
+            &items[0],
+            Entry::Radio {
+                checked: true,
+                command: None,
+                ..
+            }
+        ));
+        let Entry::Radio {
+            command: Some(command),
+            ..
+        } = &items[1]
+        else {
+            panic!("no command for the other profile");
+        };
+        tray.invoke(command.clone());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Run(Op::Profile, Job::Daemon(Request::ProfileActivate { ref id, .. }))) if id == "b"
+        ));
+        assert!(
+            items.contains(&Entry::Separator),
+            "remote profiles can be updated"
+        );
     }
 
     #[test]

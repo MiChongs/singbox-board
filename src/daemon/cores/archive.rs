@@ -2,9 +2,11 @@
 //!
 //! Forks name their archives `sing-box-<version>-linux-<arch>[-<variant>].<ext>`
 //! with slightly different architecture spellings (`armv7` vs `arm-v7`) and
-//! variants (`glibc`, `musl`, `ebpf`, `v3-glibc`, ...).
+//! variants (`glibc`, `musl`, `ebpf`, `v3-glibc`, ...). Windows builds are
+//! `sing-box-<version>-windows-<arch>[-<variant>]` (`v3`, `legacy-windows-7`).
 
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,15 @@ use crate::util::fmt_bytes;
 
 const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 const ARCHIVE_SUFFIXES: [&str; 4] = [".tar.gz", ".tgz", ".zip", ".gz"];
+
+/// Operating system in the asset names of builds for this machine.
+pub const OS: &str = if cfg!(windows) { "windows" } else { "linux" };
+/// File name of the core in a store directory.
+pub const CORE: &str = if cfg!(windows) {
+    "sing-box.exe"
+} else {
+    "sing-box"
+};
 
 /// Architecture spellings used in release assets for this machine.
 pub fn arch_tokens(configured: Option<&str>) -> Vec<String> {
@@ -41,6 +52,15 @@ pub fn arch_tokens(configured: Option<&str>) -> Vec<String> {
 /// `(variant, asset)` for every core build of this release for `tokens`;
 /// the plain build has the variant "" and comes first.
 pub fn match_assets<'a>(assets: &'a [Asset], tokens: &[String]) -> Vec<(String, &'a Asset)> {
+    match_assets_for(assets, tokens, OS)
+}
+
+fn match_assets_for<'a>(
+    assets: &'a [Asset],
+    tokens: &[String],
+    os: &str,
+) -> Vec<(String, &'a Asset)> {
+    let separator = format!("-{os}-");
     let mut found: Vec<(String, &Asset)> = Vec::new();
     for asset in assets {
         let Some(stem) = asset.name.strip_prefix("sing-box-") else {
@@ -49,7 +69,7 @@ pub fn match_assets<'a>(assets: &'a [Asset], tokens: &[String]) -> Vec<(String, 
         let Some(stem) = ARCHIVE_SUFFIXES.iter().find_map(|s| stem.strip_suffix(s)) else {
             continue;
         };
-        let Some((_, platform)) = stem.split_once("-linux-") else {
+        let Some((_, platform)) = stem.split_once(separator.as_str()) else {
             continue;
         };
         let variant = tokens.iter().find_map(|token| {
@@ -102,7 +122,7 @@ fn detect(name: &str, data: &[u8]) -> Format {
 
 /// Unpacks a core into the empty directory `dir`: every regular file of the
 /// archive is placed directly in `dir` (directories are flattened), and the
-/// executable is named `sing-box`. Returns the unpacked file names.
+/// executable is named [`CORE`]. Returns the unpacked file names.
 pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let mut files: Vec<(String, bool)> = Vec::new();
@@ -126,8 +146,13 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
                 limit = fmt_bytes(MAX_UNPACKED_BYTES)
             ));
         }
-        let mode = if executable { 0o755 } else { 0o644 };
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        // Windows knows executables by their name, not by a mode.
+        let executable = if cfg!(windows) {
+            file_name.to_ascii_lowercase().ends_with(".exe")
+        } else {
+            executable
+        };
+        set_mode(&path, if executable { 0o755 } else { 0o644 })?;
         files.push((file_name.to_owned(), executable));
         Ok(())
     };
@@ -162,37 +187,45 @@ pub fn unpack(name: &str, data: &[u8], dir: &Path) -> Result<Vec<String>> {
             }
         }
         Format::Gzip => {
-            write("sing-box", &mut flate2::read::GzDecoder::new(data), true)?;
+            write(CORE, &mut flate2::read::GzDecoder::new(data), true)?;
         }
         Format::Raw => {
-            write("sing-box", &mut std::io::Cursor::new(data), true)?;
+            write(CORE, &mut std::io::Cursor::new(data), true)?;
         }
     }
 
     // The core: `sing-box` itself, else the first `sing-box*` executable.
     let main = files
         .iter()
-        .find(|(n, _)| n == "sing-box")
+        .find(|(n, _)| n == CORE)
         .or_else(|| {
             files
                 .iter()
                 .find(|(n, exec)| n.starts_with("sing-box") && *exec)
         })
-        .or_else(|| files.iter().find(|(n, _)| is_elf(&dir.join(n))))
+        .or_else(|| files.iter().find(|(n, _)| is_native(&dir.join(n))))
         .map(|(n, _)| n.clone());
     let Some(main) = main else {
         bail!(fl!("archive-no-binary", name = name));
     };
-    if main != "sing-box" {
-        std::fs::rename(dir.join(&main), dir.join("sing-box"))?;
+    if main != CORE {
+        std::fs::rename(dir.join(&main), dir.join(CORE))?;
     }
-    std::fs::set_permissions(dir.join("sing-box"), std::fs::Permissions::from_mode(0o755))?;
+    set_mode(&dir.join(CORE), 0o755)?;
     let mut names: Vec<String> = files
         .into_iter()
-        .map(|(n, _)| if n == main { "sing-box".to_owned() } else { n })
+        .map(|(n, _)| if n == main { CORE.to_owned() } else { n })
         .collect();
     names.sort();
     Ok(names)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    #[cfg(windows)]
+    let _ = (path, mode);
+    Ok(())
 }
 
 fn base_name(path: &Path) -> String {
@@ -202,12 +235,17 @@ fn base_name(path: &Path) -> String {
         .to_owned()
 }
 
-fn is_elf(path: &PathBuf) -> bool {
+/// Whether `path` is an executable of this platform: ELF, or PE on Windows.
+fn is_native(path: &PathBuf) -> bool {
     let mut magic = [0u8; 4];
-    std::fs::File::open(path)
+    let read = std::fs::File::open(path)
         .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && magic == *b"\x7fELF"
+        .is_ok();
+    read && if cfg!(windows) {
+        magic.starts_with(b"MZ")
+    } else {
+        magic == *b"\x7fELF"
+    }
 }
 
 #[cfg(test)]
@@ -224,9 +262,13 @@ mod tests {
     }
 
     fn variants(names: &[&str], tokens: &[&str]) -> Vec<String> {
+        variants_for(names, tokens, "linux")
+    }
+
+    fn variants_for(names: &[&str], tokens: &[&str], os: &str) -> Vec<String> {
         let assets: Vec<Asset> = names.iter().map(|n| asset(n)).collect();
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_owned()).collect();
-        match_assets(&assets, &tokens)
+        match_assets_for(&assets, &tokens, os)
             .into_iter()
             .map(|(v, a)| format!("{v}={}", a.name))
             .collect()
@@ -279,6 +321,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_assets() {
+        let names = [
+            "sing-box-1.15.0-alpha.10-linux-amd64.tar.gz",
+            "sing-box-1.15.0-alpha.10-windows-amd64.zip",
+            "sing-box-1.15.0-alpha.10-windows-amd64-legacy-windows-7.zip",
+            "sing-box-1.15.0-alpha.10-windows-arm64.zip",
+            "sing-box-1.15.0-alpha.10-xiaobaf14g.10-windows-amd64-v3.tar.gz",
+        ];
+        assert_eq!(
+            variants_for(&names, &["amd64"], "windows"),
+            [
+                "=sing-box-1.15.0-alpha.10-windows-amd64.zip",
+                "legacy-windows-7=sing-box-1.15.0-alpha.10-windows-amd64-legacy-windows-7.zip",
+                "v3=sing-box-1.15.0-alpha.10-xiaobaf14g.10-windows-amd64-v3.tar.gz",
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unpack_finds_the_windows_executable() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, content) in [
+            ("sing-box-1.15.0-windows-amd64/LICENSE", &b"license"[..]),
+            ("sing-box-1.15.0-windows-amd64/libcronet.dll", b"MZdll"),
+            ("sing-box-1.15.0-windows-amd64/sing-box.exe", b"MZexe"),
+        ] {
+            writer.start_file(name, options).unwrap();
+            std::io::Write::write_all(&mut writer, content).unwrap();
+        }
+        let data = writer.finish().unwrap().into_inner();
+        let dir = temp("zip");
+        let files = unpack("sing-box-1.15.0-windows-amd64.zip", &data, &dir).unwrap();
+        assert_eq!(files, ["LICENSE", "libcronet.dll", "sing-box.exe"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn targz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -300,6 +381,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn unpack_keeps_companion_libraries() {
         let data = targz(&[
@@ -319,6 +401,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn unpack_renames_versioned_binary_and_raw_files() {
         let data = targz(&[(

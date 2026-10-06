@@ -125,7 +125,7 @@ cli-help-arguments = 参数：
 cli-help-options = 选项：
 cli-help = 显示帮助信息
 cli-version = 显示版本信息
-cli-socket = 守护进程的控制套接字。默认使用 daemon.toml 中的设置，未设置时为 /run/singbox-board/daemon.sock。也可通过环境变量 SINGBOX_BOARD_SOCKET 指定。
+cli-socket = 守护进程的控制套接字。默认使用 daemon.toml 中的设置，未设置时为 { $default }。也可通过环境变量 SINGBOX_BOARD_SOCKET 指定。
 cli-lang = 界面语言，可选 en 或 zh-CN，默认跟随系统区域设置。也可通过环境变量 SINGBOX_BOARD_LANG 指定。
 cli-lang-invalid = 不支持语言 { $value }，可选语言为 en、zh-CN
 cli-tui = 打开终端管理面板（默认）
@@ -1207,6 +1207,7 @@ tray-label-mode = 模式
 tray-start = 启动 sing-box
 tray-stop = 停止 sing-box
 tray-restart = 重启 sing-box
+tray-start-service = 启动 singbox-board 服务
 tray-no-profiles = 暂无配置
 tray-update-profiles = 更新全部订阅配置
 tray-open-dashboard = 打开终端管理面板
@@ -1224,6 +1225,7 @@ tray-failed = { $op ->
     [browser] 无法打开网页
     [autostart] 无法修改登录启动项
     [container] 无法启动或停止容器
+    [service] 无法启动服务
    *[other] 操作失败
     }
 tray-no-terminal = 未找到终端模拟器，请安装一个（例如 Konsole 或 GNOME 控制台），或设置 TERMINAL 环境变量
@@ -1554,3 +1556,31 @@ containers-install-untrusted-parent = kurumi-containerd 只会把根文件系统
 containers-install-untrusted-ancestor = 其他用户可以写入 { $path }，kurumi-containerd 拒绝在其下安装根文件系统；请改为仅 root 可写（chmod go-w）
 ctl-container-runtime-checking = 正在查找 kurumi-containerd 的最新发行版本。
 containers-linked-writable = 警告：root 以外的用户可以修改 { $path }，能编辑该配置的人就能决定以 root 身份在容器中运行的内容，请保持仅 root 可写。
+
+## Windows
+
+win-cli-tray = 在 Windows 通知区域（系统托盘）中显示 sing-box
+win-client-daemon-not-running = 守护进程未运行（{ $socket } 处没有命名管道）；请在以管理员身份打开的终端中运行 `Start-Service singbox-board`（或 `sc start singbox-board`）启动服务
+win-client-permission-denied = 无权访问 { $socket }；请以管理员身份运行，或加入 `singbox-board` 用户组（以管理员身份运行 `net localgroup singbox-board %USERNAME% /add`）后注销并重新登录
+win-containers-unsupported = 容器需要 Linux：kurumi-containerd 运行的是 Linux 系统容器，Windows 上不可用
+win-auth-uids-ignored = allowed_uids 在 Windows 上不起作用，请改为把用户加入套接字用户组
+win-auth-group-missing = 找不到套接字用户组“{ $group }”（{ $error }），只有管理员可以连接
+win-service-kill = { $name } 未在 { $seconds } 秒内退出，正在强制结束
+win-supervisor-kill = sing-box 未在 { $seconds } 秒内退出，正在强制结束
+win-supervisor-reload-restarts = Windows 上的 sing-box 无法原地重新加载配置，正在重启
+win-daemon-needs-admin = 守护进程必须以管理员身份运行（通常作为 singbox-board 服务运行），因为 TUN 与路由功能需要该权限；开发调试时可传入 --allow-non-root
+win-daemon-non-admin = 正在以非管理员身份运行，TUN 与路由功能将无法使用
+win-daemon-client-rejected = 已拒绝客户端连接（{ $user }，PID { $pid }）
+win-daemon-permission-denied = 拒绝访问，请以管理员身份运行，或加入守护进程的套接字用户组
+win-daemon-request = { $user } 请求执行 { $request }
+win-daemon-admin-only = { $action ->
+    [add-source] 添加内核发布源
+    [remove-source] 移除内核发布源
+   *[import] 导入自定义内核
+    }需要管理员权限，因为该操作决定守护进程以 SYSTEM 身份运行的程序；请在以管理员身份打开的终端中执行
+win-acl-failed = 无法限制 { $path } 的访问权限
+win-symlink-privilege = 无法创建符号链接 { $path }：Windows 仅允许管理员创建，开启开发人员模式后除外
+win-service-dispatch = 无法作为服务运行（{ $error }）；`daemon --service` 仅供服务控制管理器使用，请在终端中运行 `singbox-board daemon`
+win-tray-already-running = 托盘已在当前会话中运行
+win-service-start-failed = 无法启动服务 { $name }：{ $error }
+win-service-elevation-declined = 启动服务 { $name } 需要管理员权限

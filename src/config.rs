@@ -6,11 +6,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::fl;
 
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/singbox-board/daemon.toml";
-pub const DEFAULT_SOCKET: &str = "/run/singbox-board/daemon.sock";
-
 /// Commented configuration template, also printed by `daemon --print-default-config`.
-pub const TEMPLATE: &str = include_str!("../contrib/daemon.toml");
+#[cfg(unix)]
+const TEMPLATE: &str = include_str!("../contrib/daemon.toml");
+#[cfg(windows)]
+const TEMPLATE: &str = include_str!("../contrib/daemon.windows.toml");
+
+/// `/etc/singbox-board/daemon.toml`, `C:\ProgramData\singbox-board\daemon.toml`
+pub fn default_config_path() -> PathBuf {
+    #[cfg(unix)]
+    return PathBuf::from("/etc/singbox-board/daemon.toml");
+    #[cfg(windows)]
+    return crate::win::program_data().join(r"singbox-board\daemon.toml");
+}
+
+/// `/run/singbox-board/daemon.sock`; a named pipe on Windows.
+pub fn default_socket() -> PathBuf {
+    #[cfg(unix)]
+    return PathBuf::from("/run/singbox-board/daemon.sock");
+    #[cfg(windows)]
+    return PathBuf::from(r"\\.\pipe\singbox-board");
+}
+
+/// The configuration template with this machine's paths.
+pub fn template() -> String {
+    #[cfg(unix)]
+    return TEMPLATE.to_owned();
+    // The template is written for the usual location of ProgramData.
+    #[cfg(windows)]
+    return TEMPLATE.replace(
+        r"C:\ProgramData",
+        &crate::win::program_data().display().to_string(),
+    );
+}
+
+/// `path` below the machine-wide data directory of this platform.
+#[cfg(windows)]
+fn program_data(path: &str) -> PathBuf {
+    crate::win::program_data().join(path)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -38,7 +72,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             language: "auto".to_owned(),
-            socket: PathBuf::from(DEFAULT_SOCKET),
+            socket: default_socket(),
             socket_group: Some("singbox-board".to_owned()),
             allowed_uids: Vec::new(),
             log_buffer: 2000,
@@ -72,11 +106,23 @@ pub struct CoreConfig {
 
 impl Default for CoreConfig {
     fn default() -> Self {
+        #[cfg(unix)]
+        let (binary, config, working_dir) = (
+            PathBuf::from("/usr/local/bin/sing-box"),
+            PathBuf::from("/etc/sing-box/config.json"),
+            PathBuf::from("/var/lib/sing-box"),
+        );
+        #[cfg(windows)]
+        let (binary, config, working_dir) = (
+            program_data(r"sing-box\sing-box.exe"),
+            program_data(r"sing-box\config.json"),
+            program_data("sing-box"),
+        );
         Self {
-            binary: PathBuf::from("/usr/local/bin/sing-box"),
-            config: vec![PathBuf::from("/etc/sing-box/config.json")],
+            binary,
+            config: vec![config],
             config_dir: Vec::new(),
-            working_dir: Some(PathBuf::from("/var/lib/sing-box")),
+            working_dir: Some(working_dir),
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             auto_start: true,
@@ -233,16 +279,20 @@ pub struct ComponentsConfig {
     /// Where Node.js builds are downloaded from (`index.json` + `SHASUMS256.txt`).
     pub node_mirror: String,
     /// Unprivileged user the components run as when the daemon is root.
+    /// Not used on Windows.
     pub run_as: String,
 }
 
 impl Default for ComponentsConfig {
     fn default() -> Self {
         Self {
+            #[cfg(unix)]
             data_dir: PathBuf::from("/var/lib/singbox-board"),
+            #[cfg(windows)]
+            data_dir: program_data(r"singbox-board\data"),
             node: None,
             node_mirror: "https://nodejs.org/dist".to_owned(),
-            run_as: "nobody".to_owned(),
+            run_as: if cfg!(unix) { "nobody" } else { "" }.to_owned(),
         }
     }
 }
@@ -370,10 +420,11 @@ mod tests {
 
     #[test]
     fn template_matches_defaults() {
-        let parsed: DaemonConfig = toml::from_str(TEMPLATE).unwrap();
+        let parsed: DaemonConfig = toml::from_str(&template()).unwrap();
         assert_eq!(parsed, DaemonConfig::default());
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_args() {
         let core = CoreConfig {
@@ -409,6 +460,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn relative_paths_follow_working_dir() {
         let core = CoreConfig::default();

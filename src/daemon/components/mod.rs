@@ -15,7 +15,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
+#[cfg(unix)]
 use nix::unistd::{Uid, User, chown};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -539,7 +542,15 @@ impl Manager {
         })
     }
 
+    /// Windows has no unprivileged account to switch to without its
+    /// password; the components run as the daemon does.
+    #[cfg(windows)]
+    fn run_as(&self) -> Result<Option<(u32, u32)>> {
+        Ok(None)
+    }
+
     /// uid/gid of `components.run_as`; `None` when the daemon is not root.
+    #[cfg(unix)]
     fn run_as(&self) -> Result<Option<(u32, u32)>> {
         let name = self.config.components.run_as.trim();
         if !Uid::effective().is_root() || name.is_empty() || name == "root" {
@@ -602,10 +613,13 @@ fn merge_env(base: Vec<(&str, String)>, extra: &BTreeMap<String, String>) -> Vec
 fn writable_dir(dir: &Path, user: Option<(u32, u32)>) -> Result<()> {
     let shown = || dir.display().to_string();
     std::fs::create_dir_all(dir).with_context(|| fl!("err-create", path = shown()))?;
+    #[cfg(unix)]
     if let Some((uid, gid)) = user {
         chown(dir, Some(uid.into()), Some(gid.into()))
             .with_context(|| fl!("err-chown", path = shown()))?;
     }
+    #[cfg(windows)]
+    let _ = user;
     Ok(())
 }
 
@@ -671,6 +685,13 @@ fn sub_store_origins(host: &str, port: u16) -> String {
 }
 
 /// Addresses of the local interfaces a browser can put in a URL.
+#[cfg(windows)]
+fn interface_addresses() -> Vec<IpAddr> {
+    crate::win::net::interface_addresses()
+}
+
+/// Addresses of the local interfaces a browser can put in a URL.
+#[cfg(unix)]
 fn interface_addresses() -> Vec<IpAddr> {
     let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
         return Vec::new();

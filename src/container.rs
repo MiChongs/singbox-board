@@ -5,6 +5,8 @@
 //! check every configuration it stores); this module reads only what is
 //! needed to show and track a container, and leniently, so that a newer
 //! runtime with more settings still works.
+// Containers need Linux; on Windows only the editor's parts are used.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
@@ -241,11 +243,8 @@ pub fn with_uuid(content: &str) -> String {
 
 /// A random (version 4) UUID.
 pub fn random_uuid() -> String {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("read /dev/urandom");
+    getrandom::fill(&mut bytes).expect("system random number generator");
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex = hex::encode(bytes);
@@ -453,6 +452,7 @@ pub fn free_nat_address(taken: &[Ipv4Addr]) -> Ipv4Addr {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn template_parses_back() {
         let file = Path::new("/var/lib/singbox-board/containers/ab12cd34/container.toml");
@@ -477,6 +477,7 @@ mod tests {
         assert_eq!((host.network.as_str(), host.address), ("host", None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn settings_are_read_leniently() {
         let text = r#"
@@ -575,6 +576,7 @@ mod tests {
         assert_eq!(free_nat_address(&[]), DEFAULT_ADDRESS);
     }
 
+    #[cfg(unix)]
     #[test]
     fn paths_resolve_inside_the_rootfs() {
         let root = std::env::temp_dir().join(format!("sbb-rootfs-{}", std::process::id()));

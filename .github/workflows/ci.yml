@@ -29,6 +29,18 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  windows:
+    name: clippy, test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
   scripts:
     name: shell scripts
     runs-on: ubuntu-latest
@@ -38,3 +50,16 @@ jobs:
         run: |
           shellcheck install.sh packaging/package.sh packaging/scripts/*.sh
           shellcheck --shell=sh contrib/singbox-board.openrc
+
+  powershell:
+    name: PowerShell scripts
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: parse install.ps1 with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }

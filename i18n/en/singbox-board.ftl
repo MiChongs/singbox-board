@@ -121,7 +121,7 @@ cli-help-arguments = Arguments:
 cli-help-options = Options:
 cli-help = Print help
 cli-version = Print version
-cli-socket = Control socket of the daemon. Default: the socket set in daemon.toml, otherwise /run/singbox-board/daemon.sock. The SINGBOX_BOARD_SOCKET environment variable has the same effect.
+cli-socket = Control socket of the daemon. Default: the socket set in daemon.toml, otherwise { $default }. The SINGBOX_BOARD_SOCKET environment variable has the same effect.
 cli-lang = Interface language: en or zh-CN. Default: the system locale. The SINGBOX_BOARD_LANG environment variable has the same effect.
 cli-lang-invalid = unsupported language { $value }; supported languages: en, zh-CN
 cli-tui = Open the terminal dashboard (default)
@@ -1241,6 +1241,7 @@ tray-label-mode = Mode
 tray-start = Start sing-box
 tray-stop = Stop sing-box
 tray-restart = Restart sing-box
+tray-start-service = Start the singbox-board service
 tray-no-profiles = No profiles yet
 tray-update-profiles = Update the remote profiles
 tray-open-dashboard = Open the dashboard
@@ -1258,6 +1259,7 @@ tray-failed = { $op ->
     [browser] Could not open the web page
     [autostart] Could not change the login item
     [container] Could not start or stop the container
+    [service] Could not start the service
    *[other] The action failed
     }
 tray-no-terminal = no terminal emulator found; install one such as Konsole or GNOME Console, or set the TERMINAL environment variable
@@ -1597,3 +1599,31 @@ containers-install-untrusted-parent = kurumi-containerd only installs a root fil
 containers-install-untrusted-ancestor = kurumi-containerd refuses to install below { $path }, because other users can write to it; make it writable by root only (chmod go-w)
 ctl-container-runtime-checking = Looking for the newest kurumi-containerd release.
 containers-linked-writable = Warning: users other than root can change { $path }; whoever can edit this configuration decides what runs as root in the container. Keep it writable by root only.
+
+## Windows
+
+win-cli-tray = Show sing-box in the Windows notification area
+win-client-daemon-not-running = the daemon is not running (no pipe at { $socket }); start the service with `Start-Service singbox-board` (or `sc start singbox-board`) in a terminal opened as administrator
+win-client-permission-denied = access to { $socket } was denied; run as administrator, or join the `singbox-board` group (as administrator: `net localgroup singbox-board %USERNAME% /add`) and sign out and back in
+win-containers-unsupported = containers need Linux: kurumi-containerd runs Linux system containers and is not available on Windows
+win-auth-uids-ignored = allowed_uids has no effect on Windows; add users to the socket group instead
+win-auth-group-missing = The socket group "{ $group }" cannot be found ({ $error }); only administrators can connect
+win-service-kill = { $name } did not exit within { $seconds } seconds; terminating it
+win-supervisor-kill = sing-box did not exit within { $seconds } seconds; terminating it
+win-supervisor-reload-restarts = sing-box cannot reload its configuration in place on Windows; restarting it
+win-daemon-needs-admin = the daemon must run as administrator (normally as the singbox-board service), because TUN and routing require it; pass --allow-non-root for development
+win-daemon-non-admin = Running without administrator rights; TUN and routing features will fail
+win-daemon-client-rejected = Rejected a client ({ $user }, PID { $pid })
+win-daemon-permission-denied = access denied; run as administrator or join the socket group of the daemon
+win-daemon-request = { $user } requested { $request }
+win-daemon-admin-only = { $action ->
+    [add-source] adding a core source
+    [remove-source] removing a core source
+   *[import] importing a custom core
+    } requires administrator rights, because it decides which program the daemon runs as SYSTEM; use a terminal opened as administrator
+win-acl-failed = failed to restrict access to { $path }
+win-symlink-privilege = cannot create the symbolic link { $path }: Windows allows that to administrators only, unless Developer Mode is turned on
+win-service-dispatch = cannot run as a service ({ $error }); `daemon --service` is meant for the service control manager, run `singbox-board daemon` in a terminal instead
+win-tray-already-running = the tray is already running in this session
+win-service-start-failed = cannot start the service { $name }: { $error }
+win-service-elevation-declined = starting the service { $name } needs administrator rights

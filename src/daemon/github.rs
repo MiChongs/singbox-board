@@ -238,6 +238,7 @@ impl GitHub {
     /// Streams `url` into a new file at `path`, refusing bodies over
     /// `limit` bytes, and returns the SHA-256 of what was written.
     /// `progress` sees the bytes received so far and the announced size.
+    #[cfg_attr(windows, allow(dead_code))]
     pub async fn download_to_file(
         &self,
         url: &str,

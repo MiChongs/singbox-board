@@ -7,7 +7,8 @@
 - **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；内置全屏编辑器：语法高亮、输入时校验并标出错误位置、查找替换、按行号或 JSON 路径跳转，sing-box 校验失败时直接跳到出错的字段，并可随时切换到带模板的树形视图。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
 - **容器**：接入 [kurumi-containerd](https://github.com/Tools-cx-app/kurumi-containerd)（轻量 Linux 系统容器运行时）。守护进程自动下载并校验运行时，可从 Debian、Ubuntu、Alpine、Arch 等发行版镜像一键创建容器，启停、进入终端、执行命令、编辑 TOML 配置（保存前由 kurumi-containerd 严格校验），实时显示每个容器的 CPU、内存与进程数；容器在守护进程重启后继续运行，开机可自动启动。
-- **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，并可启停容器，Wayland 与 X11 下均可使用。
+- **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，并可启停容器，Wayland 与 X11 下均可使用；在 Windows 上是原生的通知区域图标。
+- **Windows**：支持 Windows 10/11（amd64、arm64）。守护进程作为 Windows 服务运行，通过命名管道与 TUI、命令行、托盘通信；内核、配置、Sub-Store 与 http-meta 的功能与 Linux 相同，容器除外（kurumi-containerd 只支持 Linux）。见 [Windows](#windows)。
 - **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置，在「容器」页管理容器。
 - **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component / core / profile / container`，便于脚本调用。
 
@@ -88,6 +89,57 @@ cargo build --release            # 产物：target/release/singbox-board（TLS �
 ```
 
 从 Release 的程序包手动安装时，解压后执行 `sudo sh install.sh --local .`，效果与一键安装相同，只是不再联网下载程序本身。
+
+### Windows
+
+在**以管理员身份打开**的 PowerShell 中执行：
+
+```powershell
+irm https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.ps1 | iex
+```
+
+需要传参数时（例如使用下载镜像，镜像地址同样会写入 `daemon.toml`）改用脚本块形式：
+
+```powershell
+& ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/MiChongs/singbox-board/main/install.ps1))) -Mirror https://ghfast.top/
+```
+
+脚本会依次完成以下步骤，重复执行即为升级：
+
+1. 下载 `singbox-board-windows-<amd64|arm64>.zip` 并用 `SHA256SUMS` 校验，安装到 `C:\Program Files\singbox-board` 并加入 `PATH`；
+2. 生成 `C:\ProgramData\singbox-board\daemon.toml`（已有配置会保留），把 `C:\ProgramData\singbox-board` 与 `C:\ProgramData\sing-box` 设为仅 SYSTEM 和管理员可写；
+3. 创建本地用户组 `singbox-board`，把当前用户加入该组（**注销并重新登录后**，不用管理员权限也能使用 TUI、命令行和托盘），并允许该组启动服务；
+4. 注册并启动 `singbox-board` 服务（开机自动启动，崩溃后自动重启）；
+5. 在开始菜单添加「singbox-board」（托盘）和「singbox-board dashboard」（终端管理面板）；
+6. 安装 sing-box 内核，并询问是否启用 Sub-Store 和 http-meta。
+
+常用参数：`-Version v0.2.0`、`-Mirror <URL>`、`-SubStore yes|no`、`-HttpMeta yes|no`、`-NoCore`、`-NoStart`、`-Local <解压目录或 zip>`、`-User <要加入用户组的账户>`、`-Uninstall [-Purge]`。用 `irm | iex` 时也可以通过环境变量 `SBB_VERSION`、`SBB_MIRROR`、`SBB_SUB_STORE`、`SBB_HTTP_META` 传入。
+
+| | Windows 上的位置 |
+|---|---|
+| 程序 | `C:\Program Files\singbox-board\singbox-board.exe`、`singbox-board-tray.exe` |
+| 守护进程配置 | `C:\ProgramData\singbox-board\daemon.toml`（模板见 [`contrib/daemon.windows.toml`](contrib/daemon.windows.toml)） |
+| 数据（内核、配置库、组件） | `C:\ProgramData\singbox-board\data` |
+| 守护进程日志 | `C:\ProgramData\singbox-board\logs\daemon.log`（超过 8 MiB 时轮转为 `daemon.log.1`） |
+| sing-box | `C:\ProgramData\sing-box\sing-box.exe`（指向当前内核的符号链接）、`config.json`，同时也是工作目录 |
+| 控制通道 | 命名管道 `\\.\pipe\singbox-board` |
+
+服务管理（管理员 PowerShell）：`Get-Service singbox-board`、`Restart-Service singbox-board`（修改 `daemon.toml` 后）、`Stop-Service singbox-board`。`sc control singbox-board paramchange` 相当于 Linux 上的 `systemctl reload`：校验后重启 sing-box（Windows 版 sing-box 不支持原地重载）。也可以不注册服务，在管理员终端中直接运行 `singbox-board daemon` 调试。
+
+与 Linux 版的差异：
+
+- 守护进程以 SYSTEM 身份运行，Sub-Store 与 http-meta 也以该身份运行（Windows 没有无需密码即可切换的低权限账户，`components.run_as` 不生效）。Node.js 与 mihomo 自动下载 Windows 构建。
+- 停止 sing-box 时向其进程组发送 CTRL_BREAK（Go 程序会像收到 SIGINT 一样正常退出），超时后强制结束；所有子进程都放在 Job 对象中，服务意外退出时会被系统一并结束。
+- 核心版本切换依赖符号链接，Windows 只允许管理员（或开启开发人员模式的用户）创建，服务本身满足这一条件。
+- 容器功能不可用，TUI 不显示「容器」页。
+
+### 手动安装（Windows）
+
+```powershell
+cargo build --release   # 产物：target\release\singbox-board.exe 与 singbox-board-tray.exe
+```
+
+把 Release 中的 zip 解压后，在管理员 PowerShell 中执行 `.\install.ps1 -Local .`，效果与一键安装相同。
 
 ### sing-box 配置
 
@@ -200,6 +252,14 @@ SINGBOX_BOARD_LANG=en singbox-board
 - **登录启动**：勾选「登录时启动」会写入 `~/.config/autostart/singbox-board.desktop`。安装包与一键安装脚本还会在应用菜单中添加「singbox-board」入口。
 
 托盘以普通用户身份运行，与 TUI 一样需要是套接字用户组成员；同一桌面会话中只运行一个托盘。登录时若面板尚未就绪，托盘会等待其出现后再显示图标。
+
+**Windows**：托盘是通知区域（Shell_NotifyIcon）中的原生图标，从开始菜单的「singbox-board」启动（即 `singbox-board-tray.exe`，它在后台启动 `singbox-board tray`，不会弹出控制台窗口）。
+
+- 左键单击打开终端管理面板（在新的控制台窗口中，Windows 11 上为默认终端应用），右键单击或在图标上按菜单键弹出菜单；菜单内容与 Linux 相同，单选与勾选标记为系统原生样式，并跟随系统的深色/浅色模式。
+- 守护进程无法连接时，菜单中提供「启动 singbox-board 服务」：安装脚本已允许 `singbox-board` 组启动服务，否则会弹出 UAC 提示。
+- 通知以通知区域气泡显示（Windows 10/11 上即 Toast 通知），遵循专注助手/免打扰；点击通知打开管理面板。
+- 「登录时启动」写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，并尊重「设置 → 应用 → 启动」中的开关。
+- 资源管理器重启或登录时任务栏尚未就绪，图标都会在任务栏出现后自动恢复；图标按系统 DPI 绘制，高分屏下保持清晰。
 
 ## 核心版本管理
 
@@ -346,6 +406,8 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 
 ## 容器（kurumi-containerd）
 
+> 仅 Linux：Windows 上 `container` 命令会直接报告不支持，TUI 也不显示「容器」页。
+
 [kurumi-containerd](https://github.com/Tools-cx-app/kurumi-containerd) 是用 Rust 编写的特权 Linux 系统容器运行时：mount、PID、UTS、IPC 与可选的网络命名空间，cgroup v1/v2 资源限制，绑定挂载与易失 OverlayFS，以及按 init 类型（systemd、OpenRC、runit 等）正确关机。singbox-board 把它完整接入守护进程、命令行、TUI 与托盘：
 
 - **运行时**：首次需要时，守护进程从 `Tools-cx-app/kurumi-containerd` 的 Release 下载适合本机的构建（x86_64、aarch64 为静态 musl 构建，armv7、riscv64 为 glibc 构建），用 `SHA256SUMS` 与 GitHub 摘要校验，确认 `--version` 可运行后原子替换。也可以用 `container runtime update` 主动安装或更新，用 `container runtime import` 导入自编译构建，或在 `daemon.toml` 中用 `containers.runtime` 指定系统已安装的程序。更新运行时不影响正在运行的容器。
@@ -409,7 +471,7 @@ sudo singbox-board container enter 开发机
 
 ## 配置
 
-完整的带注释配置见 [`contrib/daemon.toml`](contrib/daemon.toml)，也可以用 `singbox-board daemon --print-default-config` 输出。常用项：
+完整的带注释配置见 [`contrib/daemon.toml`](contrib/daemon.toml)（Windows：[`contrib/daemon.windows.toml`](contrib/daemon.windows.toml)），也可以用 `singbox-board daemon --print-default-config` 输出本平台的版本。常用项：
 
 | 键 | 说明 |
 |---|---|
@@ -442,15 +504,17 @@ sudo singbox-board container enter 开发机
 - sing-box 子进程运行在独立的进程组，并设置了 `PR_SET_PDEATHSIG`，守护进程退出后不会留下无人托管的 sing-box。
 - **`singbox-board` 组等同于 root**：组成员可以导入和编辑配置，而 sing-box 以 root 运行，配置能决定它读写哪些文件（例如 `log.output`、`external_ui`、本地规则集路径）。请只把可信用户加入该组。导入本地文件时由客户端以调用者自身的权限读取，守护进程不会替客户端读取任意路径。
 - 配置库目录仅 root 可访问，配置文件权限为 `0600`；订阅地址中的令牌不会写入日志。
+- **Windows**：控制通道是只接受本机连接的命名管道，DACL 只允许 SYSTEM、管理员与 `socket_group` 组成员打开，且客户端只被授予读写数据的权限（没有 `FILE_CREATE_PIPE_INSTANCE`），无法冒充守护进程创建同名管道。守护进程读取请求后模拟客户端令牌确认身份；添加内核源、导入内核等「决定以 SYSTEM 运行什么」的操作只接受已提升权限的管理员。守护进程启动时会把 `C:\ProgramData` 下自己使用的目录设为仅 SYSTEM 与管理员可写（ProgramData 默认允许所有用户创建文件），配置库与含密钥的文件仅 SYSTEM、管理员与所有者可读。
 - 容器的配置、根文件系统与运行时目录仅 root 可访问。决定容器内以 root 身份运行内容的请求（新建、编辑、安装、执行命令、导入运行时）只接受 root；客户端以 root 身份打开容器终端前，会确认守护进程报告的运行时程序属于 root 且其他用户不可写。删除容器的文件前会确认其下没有仍处于挂载状态的路径，原地登记的配置文件永远不会被删除。
 
 ## 发布
 
-- `.github/workflows/ci.yml`：每次 push 或 PR 时执行 `cargo fmt --check`、`clippy -D warnings`、`cargo test` 和 shellcheck。
+- `.github/workflows/ci.yml`：每次 push 或 PR 时执行 `cargo fmt --check`、`clippy -D warnings`、`cargo test` 和 shellcheck，并在 Windows 上执行 `clippy`、`cargo test` 与 `install.ps1` 的语法检查。
 - `.github/workflows/release.yml`：推送 `v*` 标签时，用 cargo-zigbuild 交叉编译 6 个 musl 目标，并完成以下工作：
   - 每个架构都用 qemu-user 实际运行一次；
   - amd64 额外实测脚本安装和 `.deb` 的安装与卸载；
   - 生成程序包、四种安装包和 `SHA256SUMS`，发布到 GitHub Release，同时附带 `install.sh`。
+  - 在 Windows 上构建 `x86_64-pc-windows-msvc` 与 `aarch64-pc-windows-msvc`，打包为 `singbox-board-windows-<arch>.zip`，amd64 额外实测 `install.ps1` 安装服务、连接命名管道与卸载，Release 同时附带 `install.ps1`；
   - 修改打包相关文件的 PR 也会触发构建（只构建，不发布）。
 
 发布新版本：
@@ -476,5 +540,15 @@ cargo test
 singbox-board daemon -c ./dev.toml --allow-non-root
 SINGBOX_BOARD_SOCKET=/path/to/daemon.sock singbox-board
 ```
+
+在 Linux 上也可以检查和测试 Windows 版：
+
+```bash
+rustup target add x86_64-pc-windows-gnu    # 另需 mingw-w64（ring 的 C 代码）
+cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --target x86_64-pc-windows-gnu
+```
+
+Wine 不解析符号链接、也不强制 `FILE_FLAG_FIRST_PIPE_INSTANCE`，相关断言在 Wine 下会跳过，以 Windows 上的 CI 为准。
 
 控制协议为单连接单请求的 NDJSON，例如 `{"cmd":"status"}`、`{"cmd":"logs","tail":100,"follow":true}`、`{"cmd":"profile_list"}`、`{"cmd":"container_control","id":"<ID>","action":"start"}`，单行请求上限 16 MiB（配置内容随请求传输），定义见 `src/protocol.rs`。

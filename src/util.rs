@@ -1,4 +1,5 @@
-use std::io::{Read, Write};
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -186,23 +187,44 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
-/// Writes `data` to a temporary sibling and renames it over `path`.
+/// Writes `data` to a temporary sibling and renames it over `path`. On
+/// Windows a `mode` without group or other bits makes the file readable by
+/// SYSTEM, administrators and its owner only.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    let mut file = options
         .open(&tmp)
         .with_context(|| fl!("err-create", path = tmp.display().to_string()))?;
+    #[cfg(windows)]
+    if mode & 0o077 == 0 {
+        crate::win::fs::restrict(&tmp, false)
+            .with_context(|| fl!("err-create", path = tmp.display().to_string()))?;
+    }
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)
         .with_context(|| fl!("err-replace", path = path.display().to_string()))
+}
+
+/// Makes a directory accessible to its owner (and on Windows SYSTEM and
+/// administrators) only, like `chmod 0700`.
+pub fn make_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    crate::win::fs::restrict(dir, true)?;
+    Ok(())
 }
 
 /// Atomically makes `link` a symlink to `target` (replacing a file or link).
@@ -214,11 +236,50 @@ pub fn point_symlink(link: &Path, target: &Path) -> Result<()> {
     tmp.push(".switching");
     let tmp = PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(target, &tmp)?;
-    std::fs::rename(&tmp, link).inspect_err(|_| {
+    #[cfg(windows)]
+    crate::win::fs::symlink_file(target, &tmp)?;
+    let renamed = std::fs::rename(&tmp, link);
+    // Windows cannot replace an executable that is running (a hand-placed
+    // sing-box.exe) but can move it out of the way first.
+    #[cfg(windows)]
+    let renamed = renamed.or_else(|err| {
+        if err.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(err);
+        }
+        let mut aside = link.as_os_str().to_owned();
+        aside.push(format!(".old-{}", random_token(6)));
+        std::fs::rename(link, &aside)?;
+        let result = std::fs::rename(&tmp, link);
+        if result.is_err() {
+            let _ = std::fs::rename(&aside, link);
+        } else {
+            let _ = std::fs::remove_file(&aside);
+        }
+        result
+    });
+    renamed.inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     Ok(())
+}
+
+/// The program to start for `path`: on Windows the target of a symlink, so
+/// that the DLLs shipped next to a core build are found; elsewhere `path`.
+pub fn launch_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Ok(target) = std::fs::read_link(path)
+        && target.is_absolute()
+    {
+        return target;
+    }
+    path.to_path_buf()
+}
+
+/// `name` with the executable suffix of this platform (`.exe` on Windows).
+pub fn exe_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// A URL without its query, shortened for display; queries often carry
@@ -258,10 +319,11 @@ pub fn edit_text_as(text: &str, name: &str, extension: &str) -> Result<String> {
         "singbox-board-{}-{name}.{extension}",
         random_token(6)
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&path)
         .with_context(|| fl!("err-create", path = path.display().to_string()))?;
     file.write_all(text.as_bytes())?;
@@ -292,6 +354,12 @@ fn editor_command() -> Result<(String, Vec<String>)> {
         if let Ok(value) = std::env::var(var) {
             let mut parts = value.split_whitespace().map(str::to_owned);
             if let Some(program) = parts.next() {
+                // Windows starts `code` as `code.cmd`, which only a lookup
+                // through PATHEXT finds.
+                #[cfg(windows)]
+                let program = find_program(&program)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or(program);
                 return Ok((program, parts.collect()));
             }
         }
@@ -305,6 +373,7 @@ pub fn external_editor_configured() -> bool {
 }
 
 /// An executable named `name` in `PATH`; a name with a slash is a path.
+#[cfg(unix)]
 pub fn find_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let executable = |path: &Path| {
@@ -321,13 +390,39 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         .find(|candidate| executable(candidate))
 }
 
-/// Alphanumeric token from the kernel CSPRNG.
+/// An executable named `name` in `PATH`, tried with every extension of
+/// `PATHEXT` unless it has one; a name with a slash is a path.
+#[cfg(windows)]
+pub fn find_program(name: &str) -> Option<PathBuf> {
+    let extensions: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let find = |base: PathBuf| -> Option<PathBuf> {
+        if base.extension().is_some() && base.is_file() {
+            return Some(base);
+        }
+        extensions.iter().find_map(|ext| {
+            let mut candidate = base.clone().into_os_string();
+            candidate.push(ext);
+            let candidate = PathBuf::from(candidate);
+            candidate.is_file().then_some(candidate)
+        })
+    };
+    if name.contains(['/', '\\']) {
+        return find(PathBuf::from(name));
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| find(dir.join(name)))
+}
+
+/// Alphanumeric token from the system CSPRNG.
 pub fn random_token(len: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut bytes = vec![0u8; len * 2];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .expect("read /dev/urandom");
+    getrandom::fill(&mut bytes).expect("system random number generator");
     // Rejection sampling keeps the distribution uniform (248 = 4 * 62).
     bytes
         .into_iter()

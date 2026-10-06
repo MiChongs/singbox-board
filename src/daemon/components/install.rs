@@ -65,7 +65,7 @@ impl Installer<'_> {
         {
             return Ok(bundled);
         }
-        if let Some(system) = find_in_path("node")
+        if let Some(system) = crate::util::find_program("node")
             && let Ok((major, _)) = node_version(&system).await
             && major >= MIN_NODE_MAJOR
         {
@@ -92,13 +92,19 @@ impl Installer<'_> {
                 .await?,
         )
         .context(fl!("install-node-index"))?;
-        let platform = format!("linux-{arch}");
+        // index.json lists Windows builds by package: "win-x64-zip".
+        #[cfg(unix)]
+        let (platform, listed, extension) =
+            (format!("linux-{arch}"), format!("linux-{arch}"), "tar.gz");
+        #[cfg(windows)]
+        let (platform, listed, extension) =
+            (format!("win-{arch}"), format!("win-{arch}-zip"), "zip");
         let release = index
             .iter()
-            .find(|r| r.lts != serde_json::Value::Bool(false) && r.files.contains(&platform))
+            .find(|r| r.lts != serde_json::Value::Bool(false) && r.files.contains(&listed))
             .ok_or_else(|| anyhow!(fl!("install-node-no-lts", platform = platform.clone())))?;
         let version = release.version.clone();
-        let name = format!("node-{version}-{platform}.tar.gz");
+        let name = format!("node-{version}-{platform}.{extension}");
         self.logs.info(fl_log!(
             "install-node-downloading",
             version = version.clone(),
@@ -120,9 +126,17 @@ impl Installer<'_> {
             )
             .await?;
         verify_sha256(&archive, &expected, &name)?;
-        let member = format!("node-{version}-{platform}/bin/node");
         let dest = self.layout.node();
-        blocking(move || extract_tar_member(&archive, &member, &dest)).await?;
+        #[cfg(unix)]
+        {
+            let member = format!("node-{version}-{platform}/bin/node");
+            blocking(move || extract_tar_member(&archive, &member, &dest)).await?;
+        }
+        #[cfg(windows)]
+        {
+            let member = format!("node-{version}-{platform}/node.exe");
+            blocking(move || extract_zip_member(&archive, |name| name == member, &dest)).await?;
+        }
         node_version(&self.layout.node())
             .await
             .context(fl!("install-node-not-runnable"))?;
@@ -220,10 +234,19 @@ impl Installer<'_> {
                 Some(arch) => vec![arch.to_owned()],
                 None => mihomo_arches().iter().map(|a| (*a).to_owned()).collect(),
             };
+            // A gzipped binary on Linux, a zip holding the .exe on Windows.
+            let (os, extension) = if cfg!(windows) {
+                ("windows", "zip")
+            } else {
+                ("linux", "gz")
+            };
             let asset = arches
                 .iter()
                 .find_map(|arch| {
-                    mihomo.asset(&format!("mihomo-linux-{arch}-{}.gz", mihomo.tag_name))
+                    mihomo.asset(&format!(
+                        "mihomo-{os}-{arch}-{}.{extension}",
+                        mihomo.tag_name
+                    ))
                 })
                 .ok_or_else(|| {
                     anyhow!(fl!(
@@ -239,6 +262,7 @@ impl Installer<'_> {
             ));
             let compressed = self.github.download(asset, MAX_ASSET_BYTES).await?;
             let dest = self.layout.mihomo();
+            #[cfg(unix)]
             blocking(move || {
                 let mut binary = Vec::new();
                 flate2::read::GzDecoder::new(&compressed[..])
@@ -246,6 +270,12 @@ impl Installer<'_> {
                     .read_to_end(&mut binary)
                     .context(fl!("install-mihomo-decompress"))?;
                 write_atomic(&dest, &binary, 0o755)
+            })
+            .await?;
+            #[cfg(windows)]
+            blocking(move || {
+                extract_zip_member(&compressed, |name| name.ends_with(".exe"), &dest)
+                    .context(fl!("install-mihomo-decompress"))
             })
             .await?;
             let output = Command::new(self.layout.mihomo())
@@ -309,18 +339,11 @@ pub async fn node_version(node: &Path) -> Result<(u32, String)> {
     Ok((major, version))
 }
 
-pub fn find_in_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_str()?
-        .split(':')
-        .map(|dir| Path::new(dir).join(name))
-        .find(|path| path.is_file())
-}
-
 fn node_arch() -> Result<&'static str> {
     Ok(match std::env::consts::ARCH {
         "x86_64" => "x64",
         "aarch64" => "arm64",
+        "x86" if cfg!(windows) => "x86",
         "powerpc64" if cfg!(target_endian = "little") => "ppc64le",
         "s390x" => "s390x",
         other => bail!(fl!("install-node-no-official", arch = other)),
@@ -344,7 +367,33 @@ fn mihomo_arches() -> &'static [&'static str] {
     }
 }
 
+/// Extracts the first file of a zip whose path `wanted` accepts to `dest`.
+#[cfg(any(windows, test))]
+fn extract_zip_member(archive: &[u8], wanted: impl Fn(&str) -> bool, dest: &Path) -> Result<()> {
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(archive)).context(fl!("err-open-zip"))?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        if file.is_dir() || !wanted(file.name()) {
+            continue;
+        }
+        let mut data = Vec::new();
+        file.by_ref()
+            .take(256 * 1024 * 1024)
+            .read_to_end(&mut data)?;
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        return write_atomic(dest, &data, 0o755);
+    }
+    bail!(fl!(
+        "err-archive-missing",
+        name = dest.display().to_string()
+    ))
+}
+
 /// Extracts one regular file from a `.tar.gz` to `dest` (mode 0755).
+#[cfg(any(unix, test))]
 fn extract_tar_member(archive: &[u8], member: &str, dest: &Path) -> Result<()> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     for entry in tar.entries()? {
@@ -497,6 +546,20 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"ELF");
         assert!(extract_tar_member(&archive, "node-v1/bin/npm", &dest).is_err());
         std::fs::remove_dir_all(dest.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn zip_member_extraction() {
+        let archive = zip_with(&[
+            ("node-v1-win-x64/README.md", b"readme"),
+            ("node-v1-win-x64/node.exe", b"MZ"),
+        ]);
+        let dest =
+            std::env::temp_dir().join(format!("sbb-zip-node-{}/node.exe", std::process::id()));
+        extract_zip_member(&archive, |n| n == "node-v1-win-x64/node.exe", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"MZ");
+        assert!(extract_zip_member(&archive, |n| n.ends_with(".dll"), &dest).is_err());
+        std::fs::remove_dir_all(dest.parent().unwrap()).unwrap();
     }
 
     #[test]

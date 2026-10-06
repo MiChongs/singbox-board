@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use self::archive::{arch_tokens, match_assets};
+use self::archive::{CORE, OS, arch_tokens, match_assets};
 use super::components::{random_token, write_atomic};
 use super::github::{
     Asset, GitHub, Release, parse_sha256sums, parse_version_output, verify_sha256,
@@ -228,7 +228,7 @@ impl CoreManager {
     }
 
     pub fn platform(&self) -> String {
-        format!("linux-{}", self.tokens()[0])
+        format!("{OS}-{}", self.tokens()[0])
     }
 
     async fn release_page(
@@ -313,11 +313,30 @@ impl CoreManager {
         if !valid {
             bail!(fl!("cores-invalid-id", id = id));
         }
-        Ok(self.root.join(id))
+        Ok(self.path_of(id))
+    }
+
+    /// The directory of `id`, joined part by part so that it uses the
+    /// platform's separator (the link target on Windows is read back as is).
+    fn path_of(&self, id: &str) -> PathBuf {
+        id.split('/')
+            .fold(self.root.clone(), |dir, part| dir.join(part))
+    }
+
+    /// The id of a store directory: its parts below the store joined by `/`,
+    /// whichever separator the path uses.
+    fn id_of(&self, dir: &Path) -> Option<String> {
+        let parts: Option<Vec<&str>> = dir
+            .strip_prefix(&self.root)
+            .ok()?
+            .components()
+            .map(|part| part.as_os_str().to_str())
+            .collect();
+        Some(parts?.join("/"))
     }
 
     pub fn binary_of(&self, core: &StoredCore) -> PathBuf {
-        self.root.join(&core.id).join("sing-box")
+        self.path_of(&core.id).join(CORE)
     }
 
     pub fn load(&self, id: &str) -> Option<StoredCore> {
@@ -326,14 +345,13 @@ impl CoreManager {
         let mut core: StoredCore = serde_json::from_str(&text).ok()?;
         core.id = id.to_owned();
         core.active = false;
-        dir.join("sing-box").is_file().then_some(core)
+        dir.join(CORE).is_file().then_some(core)
     }
 
     /// The stored core `core.binary` links to.
     pub fn active(&self) -> Option<StoredCore> {
         let target = std::fs::read_link(&self.config.core.binary).ok()?;
-        let relative = target.parent()?.strip_prefix(&self.root).ok()?;
-        let mut core = self.load(relative.to_str()?)?;
+        let mut core = self.load(&self.id_of(target.parent()?)?)?;
         core.active = true;
         Some(core)
     }
@@ -360,12 +378,7 @@ impl CoreManager {
         for source in level(&self.root) {
             for tag in level(&source) {
                 for variant in level(&tag) {
-                    let Some(id) = variant
-                        .strip_prefix(&self.root)
-                        .ok()
-                        .and_then(|p| p.to_str())
-                        .map(str::to_owned)
-                    else {
+                    let Some(id) = self.id_of(&variant) else {
                         continue;
                     };
                     if let Some(mut core) = self.load(&id) {
@@ -493,7 +506,7 @@ impl CoreManager {
             .await
             .with_context(|| fl!("err-read", path = binary.display().to_string()))?;
         let core = self
-            .store_local("sing-box", data, ADOPTED_NAME, Checksum::None)
+            .store_local(CORE, data, ADOPTED_NAME, Checksum::None)
             .await?;
         self.logs.info(fl_log!(
             "cores-adopted",
@@ -552,7 +565,7 @@ impl CoreManager {
                 return Err(err);
             }
         };
-        let version = match core_version(&staging.join("sing-box")).await {
+        let version = match core_version(&staging.join(CORE)).await {
             Ok(version) => version,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&staging);
@@ -743,10 +756,25 @@ mod tests {
         (CoreManager::new(config, logs), dir)
     }
 
+    #[cfg(unix)]
     fn fake_core(version: &str) -> Vec<u8> {
         format!("#!/bin/sh\necho 'sing-box version {version}'\n").into_bytes()
     }
 
+    #[test]
+    fn ids_and_paths_round_trip() {
+        let (cores, dir) = manager("ids");
+        let id = "SagerNet_sing-box/v1.12.0/default";
+        let path = cores.dir_of(id).unwrap();
+        assert_eq!(
+            path.components().count(),
+            dir.join("cores").components().count() + 3
+        );
+        assert_eq!(cores.id_of(&path).as_deref(), Some(id));
+        assert_eq!(cores.id_of(&dir.join("elsewhere")), None);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_adopt_activate_remove() {
         let (cores, dir) = manager("flow");
@@ -786,5 +814,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 }

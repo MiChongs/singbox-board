@@ -11,7 +11,6 @@
 //! (unless forced), and sing-box is reloaded afterwards.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,7 +28,9 @@ use crate::config::DaemonConfig;
 use crate::i18n::{self, fl, fl_log};
 use crate::profile::{self, MAX_PROFILE_BYTES};
 use crate::protocol::{CoreState, Profile, ProfileList, ProfileUsage, Response};
-use crate::util::{error_chain, fmt_bytes, now_unix, point_symlink, random_token, write_atomic};
+use crate::util::{
+    error_chain, fmt_bytes, make_private_dir, now_unix, point_symlink, random_token, write_atomic,
+};
 
 const INDEX: &str = "index.json";
 /// Wait after a failed automatic download before the next attempt.
@@ -147,7 +148,7 @@ impl ProfileManager {
     fn ensure_root(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| fl!("err-create", path = self.root.display().to_string()))?;
-        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        make_private_dir(&self.root)?;
         Ok(())
     }
 
@@ -1064,6 +1065,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_resolve_adopt_save_remove() {
+        #[cfg(windows)]
+        if crate::win::under_wine() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("sbb-profiles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("etc")).unwrap();

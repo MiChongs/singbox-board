@@ -153,8 +153,15 @@ impl ContainersView {
 
 /// This client runs as root: everything that changes what runs in a
 /// container is reserved to root by the daemon.
+#[cfg(unix)]
 fn root() -> bool {
     nix::unistd::Uid::effective().is_root()
+}
+
+/// Containers need Linux; the tab is not shown on Windows.
+#[cfg(windows)]
+fn root() -> bool {
+    false
 }
 
 impl App {
@@ -1161,6 +1168,7 @@ impl App {
 
 /// An interactive program the event loop runs in the terminal.
 #[derive(Debug, Clone)]
+#[cfg_attr(windows, allow(dead_code))]
 pub struct ShellCommand {
     pub program: String,
     pub args: Vec<String>,

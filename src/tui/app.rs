@@ -109,7 +109,8 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    #[cfg(unix)]
+    pub const ALL: &[Tab] = &[
         Tab::Overview,
         Tab::Proxies,
         Tab::Connections,
@@ -118,6 +119,17 @@ impl Tab {
         Tab::Core,
         Tab::Profiles,
         Tab::Containers,
+    ];
+    /// Containers need Linux.
+    #[cfg(windows)]
+    pub const ALL: &[Tab] = &[
+        Tab::Overview,
+        Tab::Proxies,
+        Tab::Connections,
+        Tab::Logs,
+        Tab::SubStore,
+        Tab::Core,
+        Tab::Profiles,
     ];
 
     pub fn title(self) -> String {

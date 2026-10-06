@@ -1,10 +1,12 @@
 //! Tray icons: a cube in the colour of the core's state, drawn at the sizes
-//! tray hosts pick from, so no image files or decoders are needed.
+//! tray hosts pick from (or the size Windows asks for), so no image files
+//! or decoders are needed.
 //! `contrib/singbox-board.svg` is the same cube in the application colour.
 
+#[cfg(unix)]
 use std::sync::LazyLock;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tone {
     Running,
     /// Starting, stopping, restarting or a request in progress.
@@ -15,6 +17,7 @@ pub enum Tone {
 }
 
 impl Tone {
+    #[cfg(unix)]
     const ALL: [Tone; 4] = [Tone::Running, Tone::Busy, Tone::Stopped, Tone::Error];
 
     /// Breeze's positive, neutral, inactive and negative colours.
@@ -29,9 +32,11 @@ impl Tone {
 }
 
 /// Sizes of the panel icons; hosts scale the closest one.
+#[cfg(unix)]
 const SIZES: [u32; 7] = [16, 22, 24, 32, 44, 48, 64];
 
 /// The icon in every size, as StatusNotifierItem pixmaps.
+#[cfg(unix)]
 pub fn pixmaps(tone: Tone) -> Vec<ksni::Icon> {
     static ICONS: LazyLock<Vec<Vec<ksni::Icon>>> = LazyLock::new(|| {
         Tone::ALL
@@ -189,6 +194,7 @@ mod tests {
         assert!(pixel(&data, size, 32, 50)[3] < 128);
     }
 
+    #[cfg(unix)]
     #[test]
     fn pixmaps_are_argb_in_every_size() {
         let icons = pixmaps(Tone::Error);

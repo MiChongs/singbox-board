@@ -1,6 +1,10 @@
 //! Command-line front-end for containers: `singbox-board container`.
+// `container` commands need Linux; the TUI's container tab is not shown on
+// Windows either.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::io::{IsTerminal, Write};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -441,9 +445,12 @@ pub fn enter_command(overview: &ContainerOverview, container: &Container) -> Res
     // anyone but root could have replaced.
     let meta =
         std::fs::metadata(&binary).with_context(|| fl!("err-read", path = binary.clone()))?;
+    #[cfg(unix)]
     if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
         bail!(fl!("ctl-container-runtime-unsafe", path = binary));
     }
+    #[cfg(windows)]
+    let _ = meta;
     Ok(EnterCommand {
         binary,
         home: overview.home.clone(),
@@ -453,6 +460,7 @@ pub fn enter_command(overview: &ContainerOverview, container: &Container) -> Res
 
 /// `container enter`: replaces this process with an interactive login in
 /// the container. Needs root, like the runtime itself.
+#[cfg(unix)]
 pub async fn enter(client: &DaemonClient, query: &str, user: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let (container, _) = client.container(query).await?;
