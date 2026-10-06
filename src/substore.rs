@@ -61,11 +61,30 @@ struct Env {
     version: String,
 }
 
+/// Sub-Store writes the display name twice, as `displayName` and as
+/// `display-name` for older clients; either may be missing or null.
+#[derive(Deserialize)]
+struct DisplayName {
+    #[serde(default, rename = "displayName")]
+    camel: Option<String>,
+    #[serde(default, rename = "display-name")]
+    kebab: Option<String>,
+}
+
+impl DisplayName {
+    fn into_string(self) -> String {
+        self.camel
+            .filter(|name| !name.is_empty())
+            .or(self.kebab)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Deserialize)]
 struct Subscription {
     name: String,
-    #[serde(default, rename = "displayName", alias = "display-name")]
-    display_name: String,
+    #[serde(flatten)]
+    display_name: DisplayName,
     #[serde(default)]
     source: String,
     #[serde(default)]
@@ -75,8 +94,8 @@ struct Subscription {
 #[derive(Deserialize)]
 struct Collection {
     name: String,
-    #[serde(default, rename = "displayName", alias = "display-name")]
-    display_name: String,
+    #[serde(flatten)]
+    display_name: DisplayName,
     #[serde(default)]
     subscriptions: Vec<String>,
 }
@@ -148,7 +167,7 @@ impl SubStoreClient {
                 } else {
                     s.url.lines().next().unwrap_or_default().to_owned()
                 },
-                display_name: s.display_name,
+                display_name: s.display_name.into_string(),
                 name: s.name,
             })
             .collect();
@@ -156,7 +175,7 @@ impl SubStoreClient {
             kind: EntryKind::Collection,
             singbox_url: self.singbox_url(EntryKind::Collection, &c.name),
             detail: c.subscriptions.join(", "),
-            display_name: c.display_name,
+            display_name: c.display_name.into_string(),
             name: c.name,
         }));
         Ok(Overview {
@@ -234,9 +253,31 @@ mod tests {
             r#"{"status":"success","data":[{"name":"a","displayName":"A","source":"remote","url":"https://x"}]}"#,
         )
         .unwrap();
-        assert_eq!(subs.data.unwrap()[0].display_name, "A");
+        assert_eq!(subs.data.unwrap().remove(0).display_name.into_string(), "A");
         let failed: Envelope<Vec<Subscription>> =
             serde_json::from_str(r#"{"status":"failed","error":{"message":"boom"}}"#).unwrap();
         assert_eq!(failed.error.unwrap().message, "boom");
+    }
+
+    #[test]
+    fn display_name_in_either_or_both_spellings() {
+        let names = |json: &str| -> Vec<String> {
+            serde_json::from_str::<Vec<Collection>>(json)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.display_name.into_string())
+                .collect()
+        };
+        // Current Sub-Store sends both keys.
+        assert_eq!(
+            names(r#"[{"name":"a","displayName":"A","display-name":"A","subscriptions":["x"]}]"#),
+            ["A"]
+        );
+        assert_eq!(
+            names(
+                r#"[{"name":"a","display-name":"Old"},{"name":"b","displayName":"","display-name":"B"},{"name":"c","displayName":null},{"name":"d"}]"#
+            ),
+            ["Old", "B", "", ""]
+        );
     }
 }
