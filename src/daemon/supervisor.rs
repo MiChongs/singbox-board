@@ -318,6 +318,7 @@ impl Supervisor {
             components: Vec::new(),
             active_core: None,
             active_profile: None,
+            containers: None,
         });
     }
 
@@ -894,5 +895,6 @@ fn placeholder_status() -> Status {
         components: Vec::new(),
         active_core: None,
         active_profile: None,
+        containers: None,
     }
 }

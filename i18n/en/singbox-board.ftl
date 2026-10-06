@@ -315,6 +315,8 @@ tui-panel-traffic = Traffic
 tui-panel-groups = Groups
 tui-panel-groups-count = Groups ({ $count })
 tui-panel-connections = Connections ({ $count })
+tui-panel-connections-filtered = Connections ({ $shown } of { $count })
+tui-panel-connection-details = Connection details
 tui-panel-logs = Logs ({ $count })
 tui-panel-components = Components
 tui-panel-subscriptions = sing-box subscriptions
@@ -343,9 +345,10 @@ col-destination = Destination
 col-network = Net
 col-chain = Chain
 col-rule = Rule
-col-upload = Up
-col-download = Down
 col-age = Age
+col-process = Process
+col-rate = Rate
+col-traffic = Total
 col-component = Component
 col-state = State
 col-versions = Versions
@@ -368,6 +371,14 @@ key-test-one = Test node
 key-move = Move
 key-close = Close
 key-close-all = Close all
+key-close-shown = Close shown
+key-details = Details
+key-hide = Hide details
+key-filter = Filter
+key-sort = Sort
+key-pause = Pause
+key-resume = Resume
+key-copy-target = Copy target
 key-scroll = Scroll
 key-page = Page
 key-follow = Follow
@@ -447,6 +458,53 @@ tui-no-releases = No releases
 tui-on-disk = { $size } on disk
 tui-store-empty = The version store is empty. Releases that you switch to or download with i appear here.
 
+## Terminal dashboard: the Connections tab
+
+conn-card-connections = Connections
+conn-card-download = Download
+conn-card-upload = Upload
+conn-card-outbounds = Outbounds
+conn-card-busiest = Busiest
+conn-memory = memory { $bytes }
+conn-active = { $count ->
+    [one] 1 transferring
+   *[other] { $count } transferring
+    }
+conn-idle = All idle
+conn-sort-label = Sort: { $key }
+conn-sort-newest = newest
+conn-sort-rate = rate
+conn-sort-traffic = traffic
+conn-sort-host = host
+conn-filter-label = Filter: { $filter }
+conn-paused = PAUSED
+conn-sniffed = sniffed
+conn-inbound = inbound
+conn-lasted = open for { $age }
+conn-field-target = Target
+conn-field-address = Address
+conn-field-source = Source
+conn-field-process = Process
+conn-field-chain = Chain
+conn-field-rule = Rule
+conn-field-started = Started
+conn-field-traffic = Traffic
+conn-empty = No active connections
+conn-empty-hint = Traffic that passes through sing-box shows up here as it happens.
+conn-no-match = No connection matches "{ $filter }"
+conn-no-match-hint = Press / to change the filter or Esc to clear it.
+conn-no-api = The Clash API is not enabled
+conn-no-api-hint =
+    Connections are read from the Clash API. Add experimental.clash_api to the profile,
+    for example "external_controller": "127.0.0.1:9090", then press R to reload.
+conn-not-running = sing-box is not running
+conn-not-running-hint = Press s to start it; its connections show up here.
+conn-api-error = The Clash API cannot be reached
+conn-api-error-hint = Retrying every second.
+conn-filter-title = Filter connections
+conn-filter-hint = Matches the target, addresses, process, chain, rule and inbound as you type. Separate words to require all of them; leave it empty to show everything.
+conn-filter-placeholder = e.g. google udp
+
 ## Terminal dashboard: notifications and progress
 
 tui-title-error = Error
@@ -455,7 +513,15 @@ tui-hint-close = Esc to close
 tui-hint-copy-close = y to copy, Esc to close
 tui-confirm-stop = Stop sing-box?
 tui-confirm-restart = Restart sing-box?
-tui-confirm-close-all = Close all connections?
+tui-confirm-close-all = { $count ->
+    [one] Close the only connection?
+   *[other] Close all { $count } connections?
+    }
+tui-confirm-close-filtered = { $count ->
+    [one] Close the connection that matches "{ $filter }"?
+   *[other] Close the { $count } connections that match "{ $filter }"?
+    }
+tui-close-connections-note = Applications reconnect on their own when they need to.
 tui-confirm-update =
     Install sing-box { $version }?
     Installed version: { $current }
@@ -488,6 +554,11 @@ tui-no-subscription-selected = No subscription is selected
 tui-snippet-title = sing-box provider for { $name }
 tui-connections-closed = All connections have been closed
 tui-connection-closed = Closed the connection to { $target }
+tui-connections-closed-count = { $count ->
+    [one] Closed 1 connection
+   *[other] Closed { $count } connections
+    }
+tui-copied-target = Copied { $target }
 tui-clash-api-missing = The Clash API is not configured (experimental.clash_api)
 tui-mode-list-unavailable = The mode list is not available yet
 tui-single-mode = Only one Clash mode is configured
@@ -537,8 +608,14 @@ help-proxies = Proxies
 help-groups-nodes = Groups and nodes
 help-select-node = Select the node
 help-delay-test = Test the group or the node
-help-connections-logs = Connections and logs
-help-close-connections = Close one or all
+help-connections = Connections
+help-conn-details = Show or hide the details
+help-conn-filter = Filter as you type; Esc clears it
+help-conn-sort = Next sort order; reverse it
+help-conn-pause = Pause or resume updates
+help-conn-copy = Copy the target
+help-close-connections = Close one, or all shown
+help-logs = Logs
 help-scroll = Scroll; End follows
 help-store-panes = Components or subscriptions
 help-store-enter = Actions or provider snippet
@@ -1180,9 +1257,343 @@ tray-failed = { $op ->
     [dashboard] Could not open the dashboard
     [browser] Could not open the web page
     [autostart] Could not change the login item
+    [container] Could not start or stop the container
    *[other] The action failed
     }
 tray-no-terminal = no terminal emulator found; install one such as Konsole or GNOME Console, or set the TERMINAL environment variable
 tray-open-failed = xdg-open could not open { $url } ({ $status })
 tray-no-home = neither XDG_CONFIG_HOME nor HOME is set
 tray-desktop-comment = sing-box status and controls in the system tray
+
+## Containers (kurumi-containerd): states and runtime
+
+runtime-origin-release = downloaded release
+runtime-origin-imported = imported build
+runtime-origin-configured = daemon.toml
+runtime-origin-system = system (PATH)
+busy-container-starting = starting
+busy-container-stopping = stopping
+busy-container-restarting = restarting
+busy-container-installing = installing
+busy-container-removing = removing
+busy-container-downloading = downloading { $percent }%
+busy-container-downloading-unknown = downloading
+
+## Containers: configurations
+
+containers-config-too-large = the configuration exceeds { $limit }
+containers-config-invalid-toml = invalid TOML at line { $line }, column { $column }: { $error }
+containers-config-invalid-toml-plain = invalid TOML: { $error }
+containers-config-not-table = { $key } must be a table
+containers-config-missing = { $key } is missing
+containers-config-bad-name = container.name "{ $name }" may only contain ASCII letters, digits, ".", "_" and "-"
+containers-config-rootfs = set exactly one of container.rootfs and container.rootfs_image
+containers-config-init = container.init must be an absolute path inside the container, not "{ $init }"
+containers-config-network = unknown network mode "{ $network }" (valid: { $valid })
+containers-config-broken = the configuration of { $name } cannot be used: { $error }
+containers-config-rejected = kurumi-containerd rejects the configuration: { $error }
+containers-check-passed = kurumi-containerd accepts the configuration.
+containers-check-later = kurumi-containerd checks the configuration once the root filesystem is installed.
+containers-check-warning = Warning: { $error }
+containers-default-name = container
+containers-template-network = unknown network mode "{ $network }" for a new container (host, nat or none)
+containers-created-hint = Next, install a root filesystem into { $rootfs }, for example with `singbox-board container install <name> debian/trixie`.
+containers-name-taken = another registered container is already named "{ $name }" (container.name)
+containers-display-name-taken = another container is already called "{ $name }"
+containers-empty-name = the name must not be empty
+containers-rename-running = stop { $name } before changing its container.name
+containers-save-rejected = the configuration was not saved (--force saves it anyway)
+containers-add-file-and-content = give either a file to register or content to store, not both
+containers-add-relative = the configuration path must be absolute
+containers-already-registered = { $path } is already registered
+
+## Containers: daemon replies and log
+
+containers-registry-ignored = Ignoring the unreadable container registry { $path }: { $error }
+containers-not-found = no container matches "{ $query }"
+containers-none = no containers are registered
+containers-need-root-daemon = containers need the daemon to run as root
+containers-root-only = only root may do this ({ $action }), because it decides what runs as root in a container; use sudo
+containers-busy = container { $name } is busy ({ $action })
+containers-runtime-missing = kurumi-containerd is not installed; install it with `singbox-board container runtime update`
+containers-runtime-auto-install = kurumi-containerd is not installed yet; downloading the newest release
+containers-runtime-configured = containers.runtime in daemon.toml selects { $path }; downloaded releases are not used while it is set
+containers-runtime-lookup-failed = could not look up the kurumi-containerd releases of { $repo }
+containers-runtime-downloading = Downloading kurumi-containerd { $tag } from { $repo }
+containers-runtime-installed-log = Installed kurumi-containerd { $version } ({ $checksum })
+containers-runtime-installed = Installed kurumi-containerd { $version } ({ $checksum })
+containers-runtime-unsupported = kurumi-containerd publishes no Linux build for this architecture ({ $arch }); import one with `singbox-board container runtime import`
+containers-runtime-no-asset = release { $tag } has no build for { $target }
+containers-runtime-import-location = give an absolute path or an http(s) URL
+containers-runtime-not-runnable = this kurumi-containerd build does not run on this system
+containers-runtime-version-timeout = kurumi-containerd --version did not answer in time
+containers-runtime-version-failed = kurumi-containerd --version failed: { $error }
+containers-runtime-not-binary = { $name } is neither a kurumi-containerd binary nor an archive containing one
+containers-command-timeout = kurumi-containerd did not finish within { $seconds } seconds
+containers-already-running = Container { $name } is already running (PID { $pid })
+containers-foreground = { $name } is configured with container.foreground = true; the daemon runs containers in the background only, so set it to false
+containers-not-installed = { $name } has no root filesystem at { $rootfs } yet; install one first (`singbox-board container install`)
+containers-starting-log = Starting container { $name }
+containers-start-failed-log = Container { $name } failed to start: { $error }
+containers-start-failed = container { $name } failed to start: { $error }
+containers-started = Container { $name } started (PID { $pid })
+containers-not-running = Container { $name } is not running
+containers-stopping-log = Stopping container { $name }
+containers-stop-failed = container { $name } could not be stopped: { $error }
+containers-stopped = Container { $name } stopped
+containers-exec-empty = no command given
+containers-exec-log = Running in container { $name }: { $command }
+containers-install-size = { $name } uses an ext4 image (container.rootfs_image); give its size, for example 8G
+containers-install-size-directory = a size only applies to ext4 images (container.rootfs_image)
+containers-install-exists = { $name } already has a root filesystem at { $rootfs }; replace it with --force
+containers-install-running = stop { $name } before installing a root filesystem
+containers-install-source = "{ $source }" is neither an absolute path, an http(s) URL nor an image such as debian/trixie
+containers-install-failed = installing the root filesystem of { $name } failed: { $error }
+containers-installing-log = Installing the root filesystem of { $name } from { $source }, { $size }
+containers-installed = Installed the root filesystem of { $name } from { $source } into { $rootfs }
+containers-downloading-log = Downloading the root filesystem of { $name } from { $source }
+containers-download-progress = { $name }: downloaded { $percent }% ({ $received } of { $total })
+containers-download-unverified = The root filesystem of { $name } from { $source } was not verified, because no SHA-256 was given
+containers-image-unknown = the image server has no image { $image } for { $arch }; list the images with `singbox-board container images`
+containers-image-unknown-release = the image server has no { $image }; available: { $releases }
+containers-image-no-checksum = { $url } lists no checksum for rootfs.tar.xz
+containers-added-log = Registered container { $name } ({ $id }): { $file }
+containers-added = Registered container { $name } ({ $id }, container.name { $container })
+containers-saved-log = Saved the configuration of container { $name }: { $file }
+containers-saved = Saved the configuration of { $name }
+containers-restart-to-apply = The container is running; restart it to apply the change.
+containers-autostart-on = { $name } starts with the daemon
+containers-autostart-off = { $name } no longer starts with the daemon
+containers-renamed = Renamed to { $name }
+containers-remove-running = stop { $name } before removing it
+containers-remove-mounted = { $path } is still mounted; unmount it before deleting the container's files
+containers-removed-purged = Removed container { $name } and deleted its files
+containers-removed-kept = Removed container { $name }; its files are kept in { $path }
+containers-removed-linked = Removed container { $name }; its configuration { $path } is left where it is
+containers-removed-log = Removed container { $name } ({ $id })
+containers-adopted = { $count ->
+    [one] Registered 1 container
+   *[other] Registered { $count } containers
+    }
+containers-adopted-line = { $name }: { $file }
+containers-adopt-skipped = { $name } skipped: { $error }
+containers-autostart-failed = Could not start container { $name } at boot: { $error }
+containers-left-running = { $count ->
+    [one] 1 container keeps running; it is not stopped with the daemon
+   *[other] { $count } containers keep running; they are not stopped with the daemon
+    }
+
+## Containers: command line
+
+cli-container = Manage containers run by kurumi-containerd
+cli-container-list = List the containers (default)
+cli-container-show = Show a container's details
+cli-container-show-config = Print its TOML configuration instead
+cli-container-new = Create a container from the template
+cli-container-name = Name shown for the container
+cli-container-id = Container name or id
+cli-container-network = Network of the new container: host (default; shares sing-box's TUN), nat or none
+cli-container-new-image = Install this image as the root filesystem, e.g. debian/trixie (see `container images`)
+cli-container-new-edit = Open the configuration in the editor before installing
+cli-container-new-start = Start the container once it is ready
+cli-container-add = Register a kurumi-containerd TOML configuration (a copy, or the file in place with --link)
+cli-container-add-file = TOML file, or - for standard input
+cli-container-add-link = Keep using the file where it is instead of storing a copy
+cli-container-adopt = Register the containers of a kurumi-containerd registry (root's ~/.kurumi-containerd/config.json by default)
+cli-container-adopt-registry = The registry file to read
+cli-container-edit = Edit a container's configuration in the built-in editor
+cli-container-force-save = Save even if kurumi-containerd rejects the configuration
+cli-container-start = Start a container
+cli-container-stop = Stop a container
+cli-container-restart = Restart a container
+cli-container-install = Install a root filesystem into a container
+cli-container-install-source = A local tar or ZIP archive, an http(s) URL or an image such as debian/trixie
+cli-container-install-size = Size of a new ext4 image (rootfs_image), e.g. 8G
+cli-container-install-sha256 = Expected SHA-256 checksum of the archive
+cli-container-install-force = Replace an existing root filesystem
+cli-container-exec = Run a command in a running container and print its output
+cli-container-exec-timeout = Seconds to wait for the command (default 60)
+cli-container-exec-command = The command and its arguments; no shell is involved (use sh -c for pipes)
+cli-container-enter = Open an interactive shell in a running container (needs root)
+cli-container-enter-user = User to log in as (default root)
+cli-container-autostart = Choose whether a container starts with the daemon
+cli-container-autostart-value = on or off
+cli-container-rename = Rename a container
+cli-container-remove = Unregister a stopped container
+cli-container-remove-purge = Also delete its files in the store, root filesystem included
+cli-container-images = List the root filesystem images available for this machine
+cli-container-images-filter = Show only distributions whose name contains this
+cli-container-check = Check that this host can run containers
+cli-container-scan = Recover the state of containers that are still running
+cli-container-runtime = Show the kurumi-containerd runtime
+cli-container-runtime-update = Install kurumi-containerd or update it to the newest release
+cli-container-runtime-tag = Install this release instead of the newest, e.g. v0.2.3
+cli-container-runtime-import = Use a kurumi-containerd build from a file or URL (root only)
+cli-container-runtime-location = Absolute path or http(s) URL of a binary or release archive
+ctl-label-containers = Containers
+ctl-containers-summary = { $running } of { $total } running
+ctl-label-name = Name
+ctl-label-state = State
+ctl-label-process = Process
+ctl-label-usage = Usage
+ctl-label-reboots = Reboots
+ctl-label-config-error = Configuration
+ctl-label-autostart = Autostart
+ctl-label-config = Configuration
+ctl-label-last-error = Last error
+ctl-label-hostname = Hostname
+ctl-label-rootfs = Root filesystem
+ctl-label-init = Init
+ctl-label-network = Network
+ctl-label-ports = Ports
+ctl-label-mount = Mount
+ctl-label-limits = Limits
+ctl-label-options = Options
+ctl-label-release = Release
+ctl-label-release-build = Release build
+ctl-label-registry = Registry
+ctl-container-via = via { $bridge }
+ctl-container-live = PID { $pid }, up { $uptime }, { $processes } processes, { $memory }
+ctl-container-process = init PID { $pid } ({ $init }), monitor PID { $monitor }, up { $uptime }
+ctl-container-usage = { $processes } processes, { $memory } resident, { $cpu } s CPU
+ctl-container-linked = { $file } (registered in place)
+ctl-container-image-file = ext4 image
+ctl-container-no-rootfs = no root filesystem yet
+ctl-container-autostart = starts with the daemon
+ctl-container-limit-memory = memory { $memory }
+ctl-container-limit-cpu = { $cpus } CPUs
+ctl-container-limit-pids = { $pids } processes
+ctl-container-flag-volatile = volatile (changes are discarded)
+ctl-container-flag-userns = nested user namespaces allowed
+ctl-container-flag-foreground = foreground (not supported by the daemon)
+ctl-container-runtime-version = { $version } ({ $origin })
+ctl-container-runtime-unknown-version = installed ({ $origin }), version unknown
+ctl-container-runtime-missing = not installed; it is downloaded when the first container starts
+ctl-container-runtime-unsupported = not installed, and no release build fits this machine
+ctl-container-runtime-no-build = none for this machine
+ctl-container-runtime-downloading = kurumi-containerd is downloaded first; this may take a moment.
+ctl-container-runtime-unsafe = refusing to run { $path } as root: it is not owned by root or is writable by others
+ctl-containers-empty = No containers yet.
+ctl-container-hint-new = New: singbox-board container new <name> --image debian/trixie --start
+ctl-container-hint-use = Use: singbox-board container start|stop|enter|exec <name>; details: singbox-board container show <name>
+ctl-container-installing = Installing the root filesystem; downloading and unpacking may take a few minutes.
+ctl-container-output-truncated = (output truncated)
+ctl-container-enter-needs-root = opening a shell in a container needs root; run: { $command }
+ctl-container-enter-needs-terminal = an interactive shell needs a terminal; use `singbox-board container exec` for commands
+ctl-container-edit-needs-terminal = the built-in editor needs a terminal; use --external with $VISUAL or $EDITOR
+ctl-container-images-title = Images on { $server } for { $arch }
+ctl-container-images-empty = No images match.
+ctl-container-images-hint = Install one: singbox-board container new <name> --image <distro/release>, or container install <name> <distro/release>
+
+## Containers: terminal dashboard
+
+tab-containers = Containers
+col-uptime = Uptime
+ctl-label-processes = Processes
+tui-panel-containers = Containers ({ $count })
+tui-panel-container-details = Container
+tui-header-containers = containers { $running }/{ $total }
+tui-runtime-ready = READY
+tui-runtime-missing = NOT INSTALLED
+tui-runtime-details = { $binary }, registry in { $home }
+tui-runtime-download-note = kurumi-containerd is downloaded and verified when the first container starts, or now with U.
+tui-containers-not-root = Running without root: containers can be started and stopped; creating, editing and installing need sudo singbox-board.
+tui-containers-empty = No containers yet.
+tui-containers-empty-hint = Press n to create one from a distribution image (Debian, Ubuntu, Alpine, Arch, ...), or Enter for more, such as registering existing kurumi-containerd configurations.
+tui-containers-loading-images = Loading the image list
+tui-containers-pick-image = Root filesystem for { $name }
+tui-containers-pick-image-body = Images for { $arch } from { $server }, downloaded and verified with SHA256SUMS.
+tui-container-new-title = New container
+tui-container-new-hint = A name for the container. Its configuration is created from the template; the root filesystem is chosen next.
+tui-container-new-placeholder = e.g. Debian dev
+tui-container-network-title = Network of { $name }
+tui-container-register-title = Register a configuration
+tui-container-register-hint = Absolute path of a kurumi-containerd TOML file. It stays where it is.
+tui-container-install-title = Install into { $name }
+tui-container-install-hint = A local tar or ZIP archive (path on this machine) or an http(s) URL. Image targets (rootfs_image) also need a size: path 8G.
+tui-container-install-size = this container uses an ext4 image; add its size after the source, e.g. 8G
+tui-container-install-hint-short = No root filesystem yet; press i to install one.
+tui-container-exec-title = Run in { $name }
+tui-container-exec-hint = The command runs as root without a shell; quote words with spaces, or use sh -c '...' for pipes.
+tui-container-exec-quotes = a quote is not closed
+tui-container-exec-result = { $command } in { $name } (exit status { $code })
+tui-container-exec-no-output = The command printed nothing.
+tui-container-remove-title = Remove { $name }?
+tui-container-shell-entering = Opening a shell in { $name }; exit it to return to the dashboard.
+tui-container-shell-closed = Closed the shell of { $name }
+tui-container-shell-failed = The shell of { $name } ended with { $status }
+tui-container-reboots = { $count ->
+    [one] rebooted once
+   *[other] rebooted { $count } times
+    }
+tui-container-load-graph = CPU load
+tui-confirm-container-stop = Stop container { $name }?
+tui-confirm-container-restart = Restart container { $name }?
+tui-confirm-runtime-install = Download and install kurumi-containerd now?
+tui-confirm-runtime-update = Update kurumi-containerd { $version } to the newest release?
+tui-copied-path = Copied { $path }
+tui-toml-title = Configuration of { $name }
+tui-toml-running = running, restart to apply
+tui-toml-status-ok = Valid configuration. Ctrl+S saves after kurumi-containerd checks it; F10 lists every command.
+tui-toml-fix-first = Fix this first: { $error }
+tui-toml-save-anyway-detail = the container may fail to start with it
+busy-container-action = { $action ->
+    [start] Starting { $name }
+    [stop] Stopping { $name }
+    [restart] Restarting { $name }
+   *[remove] Removing { $name }
+    }
+busy-creating-container = Creating the container
+busy-installing-rootfs = Installing the root filesystem of { $name }
+busy-running-command = Running a command in { $name }
+busy-registering = Registering
+busy-checking-host = Checking the host
+busy-downloading-runtime = Downloading kurumi-containerd
+menu-container-shell = Open a shell
+menu-container-exec = Run a command
+menu-container-edit = Edit the configuration
+menu-container-install = Install a root filesystem
+menu-container-reinstall = Replace the root filesystem
+menu-container-install-file = From a file or URL
+menu-container-install-file-detail = tar, tar.gz, tar.xz, tar.zst, ZIP
+menu-container-install-later = Later
+menu-container-autostart-on = Start with the daemon
+menu-container-autostart-off = Do not start with the daemon
+menu-container-copy-path = Copy the root filesystem path
+menu-container-remove = Remove
+menu-container-remove-purge = Remove and delete its files
+menu-container-remove-purge-detail = configuration and root filesystem
+menu-container-remove-keep = Remove, keep its files
+menu-container-remove-keep-detail = they stay in the store directory
+menu-container-remove-linked = Remove the registration
+menu-container-new = New container
+menu-container-register = Register a TOML configuration
+menu-container-adopt = Register root's kurumi-containerd containers
+menu-container-check = Check the host
+menu-container-runtime = Install or update kurumi-containerd
+menu-network-host = Host network
+menu-network-host-detail = shares the host's network and sing-box's TUN
+menu-network-nat = NAT
+menu-network-nat-detail = own address behind kurumi-br0
+menu-network-none = None
+menu-network-none-detail = loopback only
+key-start-stop = Start/stop
+key-shell = Shell
+key-run = Run
+key-install = Install
+key-comment = Comment
+key-problem = Problem
+help-containers = Containers
+help-containers-menu = All actions; new container
+help-containers-run = Start or stop, shell, run a command
+help-containers-edit = Edit (built-in, $EDITOR), install a root filesystem
+help-containers-delete = Autostart, remove
+help-containers-host = Check the host, update the runtime, register root's containers
+tui-container-state-detail = PID { $pid }, up { $uptime }
+tui-container-hostname = hostname { $hostname }
+ctl-label-identity = Identity
+tray-busy-container = Starting or stopping a container
+containers-install-untrusted-parent = kurumi-containerd only installs a root filesystem into a directory that root owns and only root can write to; { $path } is not (fix it with chown root:root and chmod go-w)
+containers-install-untrusted-ancestor = kurumi-containerd refuses to install below { $path }, because other users can write to it; make it writable by root only (chmod go-w)
+ctl-container-runtime-checking = Looking for the newest kurumi-containerd release.
+containers-linked-writable = Warning: users other than root can change { $path }; whoever can edit this configuration decides what runs as root in the container. Keep it writable by root only.

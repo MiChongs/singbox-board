@@ -1228,7 +1228,7 @@ fn text_line(
 }
 
 /// Terminal columns a character takes when it starts at column `at`.
-fn char_width(c: char, at: usize) -> usize {
+pub(super) fn char_width(c: char, at: usize) -> usize {
     match c {
         '\t' => TAB_WIDTH - at % TAB_WIDTH,
         c if c.is_control() => 1,
@@ -1237,14 +1237,14 @@ fn char_width(c: char, at: usize) -> usize {
 }
 
 /// Terminal column of a character column.
-fn display_col(line: &str, col: usize) -> usize {
+pub(super) fn display_col(line: &str, col: usize) -> usize {
     line.chars()
         .take(col)
         .fold(0, |at, c| at + char_width(c, at))
 }
 
 /// Character column at a terminal column; past the end gives the length.
-fn col_at_display(line: &str, target: usize) -> usize {
+pub(super) fn col_at_display(line: &str, target: usize) -> usize {
     let mut at = 0;
     for (col, c) in line.chars().enumerate() {
         let width = char_width(c, at);

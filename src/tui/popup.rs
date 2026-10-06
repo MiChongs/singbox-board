@@ -5,7 +5,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use super::code::CodeCommand;
+use super::containers::{ContainerMenu, ContainersGlobal};
 use super::editor::{InsertTarget, Path};
+use super::toml_editor::TomlCommand;
 use crate::protocol::{Component, ComponentAction};
 
 /// What a text field is for.
@@ -25,6 +27,16 @@ pub enum InputPurpose {
     /// Name of a new object member; its value is chosen next.
     NewKey(InsertTarget),
     Search,
+    /// The filter of the connections; holds the one to restore on Esc.
+    ConnectionFilter(String),
+    NewContainer,
+    /// The path of a kurumi-containerd TOML file to register in place.
+    RegisterContainer,
+    RenameContainer(String),
+    /// A root filesystem archive or URL for a container.
+    ContainerInstall(String),
+    /// A command to run in a container.
+    ContainerExec(String),
     /// A field drawn inside a view (the code editor's find bar), never
     /// submitted as a popup.
     Inline,
@@ -176,6 +188,22 @@ pub struct ExternalEdit {
     pub name: String,
     pub active: bool,
     pub text: String,
+    /// A container's TOML configuration rather than a profile.
+    pub container: bool,
+}
+
+impl InputPurpose {
+    /// Fields of the Containers tab.
+    pub fn for_containers(&self) -> bool {
+        matches!(
+            self,
+            InputPurpose::NewContainer
+                | InputPurpose::RegisterContainer
+                | InputPurpose::RenameContainer(_)
+                | InputPurpose::ContainerInstall(_)
+                | InputPurpose::ContainerExec(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +232,46 @@ pub enum MenuAction {
     EditAgain(ExternalEdit),
     /// A command of the code editor.
     Code(CodeCommand),
+    Container(String, ContainerMenu),
+    ContainersGlobal(ContainersGlobal),
+    /// Create a container with this network.
+    ContainerNetwork {
+        name: String,
+        network: String,
+    },
+    /// Install an image (`distro/release`) as a container's root filesystem.
+    ContainerImage {
+        id: String,
+        image: String,
+    },
+    ContainerRemove {
+        id: String,
+        purge: bool,
+    },
+    /// Store a configuration kurumi-containerd rejected.
+    ContainerSaveAnyway {
+        id: String,
+        content: String,
+    },
+    /// A command of the configuration editor.
+    Toml(TomlCommand),
     Dismiss,
+}
+
+impl MenuAction {
+    /// Entries of the Containers tab and its editor.
+    pub fn for_containers(&self) -> bool {
+        matches!(
+            self,
+            MenuAction::Container(..)
+                | MenuAction::ContainersGlobal(_)
+                | MenuAction::ContainerNetwork { .. }
+                | MenuAction::ContainerImage { .. }
+                | MenuAction::ContainerRemove { .. }
+                | MenuAction::ContainerSaveAnyway { .. }
+                | MenuAction::Toml(_)
+        )
+    }
 }
 
 pub struct MenuItem {

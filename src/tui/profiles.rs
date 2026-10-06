@@ -27,7 +27,7 @@ use crate::i18n::fl;
 use crate::profile::{self, Summary, interval_label, item_label, local_time, usage_label};
 use crate::protocol::{Profile, ProfileList, Request};
 use crate::util::{
-    error_chain, external_editor_configured, fmt_bytes, join_list, now_unix, text_width,
+    error_chain, external_editor_configured, fmt_bytes, join_list, now_unix, truncate,
 };
 
 /// Seconds between list refreshes while the tab is open.
@@ -227,6 +227,7 @@ impl App {
                     name: profile.name,
                     active: profile.active,
                     text: content,
+                    container: false,
                 });
             }
             ContentPurpose::Duplicate => {
@@ -766,7 +767,15 @@ impl App {
                 }
                 editor.search = Some(trimmed);
             }
-            InputPurpose::AddSource | InputPurpose::ImportCore | InputPurpose::Inline => {}
+            InputPurpose::AddSource
+            | InputPurpose::ImportCore
+            | InputPurpose::ConnectionFilter(_)
+            | InputPurpose::NewContainer
+            | InputPurpose::RegisterContainer
+            | InputPurpose::RenameContainer(_)
+            | InputPurpose::ContainerInstall(_)
+            | InputPurpose::ContainerExec(_)
+            | InputPurpose::Inline => {}
         }
         Ok(())
     }
@@ -840,12 +849,24 @@ impl App {
             }
             MenuAction::EditAgain(edit) => self.external = Some(edit),
             MenuAction::Code(command) => self.code_command(command),
-            MenuAction::Component(..) | MenuAction::Dismiss => {}
+            MenuAction::Component(..)
+            | MenuAction::Container(..)
+            | MenuAction::ContainersGlobal(_)
+            | MenuAction::ContainerNetwork { .. }
+            | MenuAction::ContainerImage { .. }
+            | MenuAction::ContainerRemove { .. }
+            | MenuAction::ContainerSaveAnyway { .. }
+            | MenuAction::Toml(_)
+            | MenuAction::Dismiss => {}
         }
     }
 
-    /// `$EDITOR` returned: store the profile.
+    /// `$EDITOR` returned: store the profile (or the container).
     pub fn external_edit_done(&mut self, edit: ExternalEdit, result: anyhow::Result<String>) {
+        if edit.container {
+            self.container_external_done(edit, result);
+            return;
+        }
         let text = match result {
             Ok(text) => text,
             Err(err) => {
@@ -1250,21 +1271,6 @@ fn value_brief(value: &Value) -> String {
         Value::String(s) => format!("\"{}\"", truncate(s, 40)),
         other => other.to_string(),
     }
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    if text_width(text) <= width {
-        return text.to_owned();
-    }
-    let mut out = String::new();
-    for c in text.chars() {
-        if text_width(&out) + 2 > width {
-            break;
-        }
-        out.push(c);
-    }
-    out.push('…');
-    out
 }
 
 fn relative(unix: u64) -> String {

@@ -235,6 +235,62 @@ impl GitHub {
         Ok(data)
     }
 
+    /// Streams `url` into a new file at `path`, refusing bodies over
+    /// `limit` bytes, and returns the SHA-256 of what was written.
+    /// `progress` sees the bytes received so far and the announced size.
+    pub async fn download_to_file(
+        &self,
+        url: &str,
+        path: &std::path::Path,
+        limit: u64,
+        mut progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<String> {
+        use tokio::io::AsyncWriteExt;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| fl!("err-request", url = url))?
+            .error_for_status()
+            .with_context(|| fl!("err-request", url = url))?;
+        let total = response.content_length();
+        let too_large = || {
+            anyhow!(fl!(
+                "err-too-large",
+                url = url,
+                limit = crate::util::fmt_bytes(limit)
+            ))
+        };
+        if total.is_some_and(|total| total > limit) {
+            return Err(too_large());
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+            .with_context(|| fl!("err-create", path = path.display().to_string()))?;
+        let mut hasher = Sha256::new();
+        let mut received = 0u64;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| fl!("err-download", url = url))?;
+            received += chunk.len() as u64;
+            if received > limit {
+                return Err(too_large());
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .with_context(|| fl!("err-create", path = path.display().to_string()))?;
+            progress(received, total);
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     /// Downloads a release asset (through the mirror when configured) and
     /// checks it against the digest GitHub publishes for it.
     pub async fn download(&self, asset: &Asset, limit: usize) -> Result<Vec<u8>> {

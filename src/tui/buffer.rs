@@ -38,6 +38,8 @@ pub struct Buffer {
     redo_groups: Vec<Group>,
     /// One level of indentation: spaces or a tab.
     pub indent: String,
+    /// What starts a line comment: `//` in JSON with comments, `#` in TOML.
+    pub comment: &'static str,
 }
 
 impl Buffer {
@@ -63,6 +65,7 @@ impl Buffer {
             undo_groups: Vec::new(),
             redo_groups: Vec::new(),
             indent,
+            comment: "//",
         }
     }
 
@@ -744,9 +747,11 @@ impl Buffer {
         );
     }
 
-    /// Comments the touched lines out with `//`, or back in when all of
-    /// them are comments.
+    /// Comments the touched lines out with [`Buffer::comment`], or back in
+    /// when all of them are comments.
     pub fn toggle_comment(&mut self) {
+        let marker = self.comment;
+        let width = marker.chars().count();
         let (first, last) = self.line_span();
         let filled: Vec<usize> = (first..=last)
             .filter(|&l| !self.line(l).trim().is_empty())
@@ -756,15 +761,15 @@ impl Buffer {
         }
         let uncomment = filled
             .iter()
-            .all(|&l| self.line(l).trim_start().starts_with("//"));
+            .all(|&l| self.line(l).trim_start().starts_with(marker));
         let edits: Vec<(usize, usize, usize)> = filled
             .iter()
             .map(|&l| {
                 let text = self.line(l);
                 let at = text.chars().take_while(|c| c.is_whitespace()).count();
                 if uncomment {
-                    let space = text.chars().nth(at + 2) == Some(' ');
-                    (l, at, if space { 3 } else { 2 })
+                    let space = text.chars().nth(at + width) == Some(' ');
+                    (l, at, if space { width + 1 } else { width })
                 } else {
                     (l, 0, 0)
                 }
@@ -788,7 +793,7 @@ impl Buffer {
                         b.area.delete_str(remove);
                     } else {
                         b.set_cursor(Pos::new(line, column), false);
-                        b.area.insert_str("// ");
+                        b.area.insert_str(format!("{marker} "));
                     }
                 }
             },
@@ -796,7 +801,9 @@ impl Buffer {
                 Some(&(_, at, remove)) if uncomment && pos.col >= at => {
                     Pos::new(pos.line, pos.col.saturating_sub(remove).max(at))
                 }
-                Some(_) if !uncomment && pos.col >= column => Pos::new(pos.line, pos.col + 3),
+                Some(_) if !uncomment && pos.col >= column => {
+                    Pos::new(pos.line, pos.col + width + 1)
+                }
                 _ => pos,
             },
         );

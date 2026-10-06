@@ -175,6 +175,105 @@ pub enum Request {
     },
     /// Moves the configuration sing-box uses now into the store.
     ProfileAdopt,
+    /// kurumi-containerd and the containers registered with the daemon.
+    ContainerList,
+    /// A container and its TOML configuration.
+    ContainerGet {
+        id: String,
+    },
+    /// Root only: registers a container. `file` keeps an existing TOML
+    /// configuration where it is, `content` stores a copy, and without
+    /// either a configuration is created from the template.
+    ContainerAdd {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        file: Option<String>,
+        /// Template only: "host", "nat" or "none".
+        #[serde(default)]
+        network: Option<String>,
+    },
+    /// Root only: replaces a container's configuration. kurumi-containerd
+    /// has to accept it unless `force` is set.
+    ContainerSave {
+        id: String,
+        content: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Renames a container or changes whether it starts with the daemon.
+    ContainerSet {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        autostart: Option<bool>,
+    },
+    /// Root only: unregisters a stopped container; `purge` also deletes its
+    /// files in the store, root filesystem included.
+    ContainerRemove {
+        id: String,
+        #[serde(default)]
+        purge: bool,
+    },
+    /// Root only: registers the entries of a kurumi-containerd registry
+    /// (`~/.kurumi-containerd/config.json`, root's when `path` is empty).
+    ContainerAdopt {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    ContainerControl {
+        id: String,
+        action: ContainerAction,
+    },
+    /// Root only: installs a root filesystem from a local archive (absolute
+    /// path), an http(s) URL or an image of the image server
+    /// (`distro/release`).
+    ContainerInstall {
+        id: String,
+        source: String,
+        /// Size of a new ext4 image (`rootfs_image` targets), e.g. "8G".
+        #[serde(default)]
+        size: Option<String>,
+        #[serde(default)]
+        sha256: Option<String>,
+        /// Replace an existing root filesystem.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Root only: runs a command in a running container.
+    ContainerExec {
+        id: String,
+        command: Vec<String>,
+        /// Seconds; 60 when absent.
+        #[serde(default)]
+        timeout: Option<u64>,
+    },
+    /// Root filesystem images of the image server for this machine.
+    ContainerImages {
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Probes the host with `kurumi-containerd check`.
+    ContainerCheck,
+    /// Root only: recovers the state of live containers (`kurumi-containerd scan`).
+    ContainerScan,
+    /// Installs kurumi-containerd, or updates it to the newest (or given) release.
+    ContainerRuntimeUpdate {
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Root only: uses a kurumi-containerd build from a local path or an
+    /// http(s) URL (binary or .tar.xz/.tar.gz/.zip archive).
+    ContainerRuntimeImport {
+        location: String,
+        #[serde(default)]
+        sha256: Option<String>,
+    },
 }
 
 /// Optional services the daemon can install and supervise next to sing-box.
@@ -226,6 +325,25 @@ pub enum ComponentAction {
     Update,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ContainerAction {
+    /// Selector for messages that phrase each action differently.
+    pub fn key(self) -> &'static str {
+        match self {
+            ContainerAction::Start => "start",
+            ContainerAction::Stop => "stop",
+            ContainerAction::Restart => "restart",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
@@ -254,6 +372,18 @@ pub enum Response {
         profile: Box<Profile>,
         message: String,
     },
+    Containers(Box<ContainerOverview>),
+    ContainerContent {
+        container: Box<Container>,
+        content: String,
+    },
+    /// A container was registered or its configuration replaced.
+    ContainerSaved {
+        container: Box<Container>,
+        message: String,
+    },
+    ContainerExec(ExecResult),
+    ContainerImages(ImageList),
     Error {
         message: String,
     },
@@ -350,6 +480,9 @@ pub struct Status {
     /// The profile the configuration file links to.
     #[serde(default)]
     pub active_profile: Option<Profile>,
+    /// Containers; `None` from daemons without container support.
+    #[serde(default)]
+    pub containers: Option<ContainerSummary>,
 }
 
 /// Release sources everyone may install from.
@@ -597,6 +730,8 @@ pub enum LogSource {
     Daemon,
     SubStore,
     HttpMeta,
+    /// kurumi-containerd, run for container operations.
+    Containers,
 }
 
 impl LogSource {
@@ -607,6 +742,7 @@ impl LogSource {
             LogSource::Daemon => fl!("log-source-daemon"),
             LogSource::SubStore => "sub-store".to_owned(),
             LogSource::HttpMeta => "http-meta".to_owned(),
+            LogSource::Containers => "kurumi".to_owned(),
         }
     }
 }
@@ -618,6 +754,228 @@ pub struct LogEntry {
     pub ts: u64,
     pub source: LogSource,
     pub line: String,
+}
+
+/// Containers at a glance, part of [`Status`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerSummary {
+    pub total: usize,
+    pub running: usize,
+    /// kurumi-containerd is installed.
+    pub runtime: bool,
+}
+
+/// kurumi-containerd and the containers registered with the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerOverview {
+    pub runtime: ContainerRuntime,
+    pub containers: Vec<Container>,
+    /// HOME kurumi-containerd runs with; its registry is
+    /// `<home>/.kurumi-containerd/config.json`.
+    pub home: String,
+}
+
+/// Where the kurumi-containerd executable in use comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOrigin {
+    /// A release the daemon downloaded.
+    Release,
+    /// Imported by hand (`container runtime import`).
+    Imported,
+    /// `containers.runtime` in daemon.toml.
+    Configured,
+    /// Found in PATH, e.g. from the distribution's package.
+    System,
+}
+
+impl RuntimeOrigin {
+    pub fn label(self) -> String {
+        match self {
+            RuntimeOrigin::Release => fl!("runtime-origin-release"),
+            RuntimeOrigin::Imported => fl!("runtime-origin-imported"),
+            RuntimeOrigin::Configured => fl!("runtime-origin-configured"),
+            RuntimeOrigin::System => fl!("runtime-origin-system"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerRuntime {
+    /// The executable in use; `None` until one is installed.
+    pub binary: Option<String>,
+    /// As reported by `kurumi-containerd --version`.
+    pub version: Option<String>,
+    pub origin: Option<RuntimeOrigin>,
+    /// Release tag of a downloaded runtime.
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub checksum: Checksum,
+    /// "installing" or "updating" while a download runs.
+    pub busy: Option<String>,
+    /// Release build that fits this machine, e.g.
+    /// "x86_64-unknown-linux-musl"; `None` when there is none.
+    pub target: Option<String>,
+    /// Why containers cannot run here.
+    pub problem: Option<String>,
+}
+
+/// A container registered with the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Container {
+    pub id: String,
+    pub name: String,
+    /// The TOML configuration.
+    pub file: String,
+    /// The configuration lives in the daemon's store; otherwise it was
+    /// registered where it is.
+    pub managed: bool,
+    pub autostart: bool,
+    /// Unix seconds.
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub state: CoreState,
+    /// A long operation in progress, see [`Container::busy_label`].
+    pub busy: Option<String>,
+    /// Why the last start, stop or install failed.
+    pub last_error: Option<String>,
+    pub spec: Option<ContainerSpec>,
+    /// Why the configuration could not be read.
+    pub spec_error: Option<String>,
+    /// Present while the container runs.
+    pub live: Option<ContainerLive>,
+}
+
+impl Container {
+    /// Text for the operation in progress, e.g. "downloading 42%".
+    pub fn busy_label(&self) -> Option<String> {
+        self.busy.as_deref().map(container_busy_label)
+    }
+
+    pub fn running(&self) -> bool {
+        self.live.is_some()
+    }
+}
+
+/// Text for a container operation in progress as the daemon reports it:
+/// "starting", "stopping", "installing" or "downloading:<percent>".
+pub fn container_busy_label(busy: &str) -> String {
+    match busy.split_once(':') {
+        Some(("downloading", percent)) => fl!("busy-container-downloading", percent = percent),
+        _ => match busy {
+            "starting" => fl!("busy-container-starting"),
+            "stopping" => fl!("busy-container-stopping"),
+            "restarting" => fl!("busy-container-restarting"),
+            "installing" => fl!("busy-container-installing"),
+            "removing" => fl!("busy-container-removing"),
+            "downloading" => fl!("busy-container-downloading-unknown"),
+            other => other.to_owned(),
+        },
+    }
+}
+
+/// What a container's TOML configuration says.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContainerSpec {
+    /// `container.name`, the identity kurumi-containerd tracks it by.
+    pub name: String,
+    pub hostname: String,
+    pub uuid: Option<String>,
+    /// Absolute path of the root filesystem directory or image.
+    pub rootfs: String,
+    /// `rootfs_image`: an ext4 image instead of a directory.
+    pub image: bool,
+    /// The root filesystem exists.
+    pub installed: bool,
+    pub init: String,
+    /// "host", "none", "nat", "gateway" or "dhcp".
+    pub network: String,
+    /// `address/prefix` in nat mode.
+    pub address: Option<String>,
+    /// The bridge the container is attached to (nat, gateway, dhcp).
+    pub bridge: Option<String>,
+    pub ports: Vec<PortForward>,
+    pub mounts: Vec<BindMount>,
+    pub memory_limit: Option<u64>,
+    /// CPU limit in thousandths of a CPU.
+    pub cpu_limit: Option<u64>,
+    pub pids_limit: Option<u64>,
+    pub foreground: bool,
+    pub volatile: bool,
+    pub user_namespaces: bool,
+    pub stop_timeout: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortForward {
+    pub host: u16,
+    pub container: u16,
+    /// "tcp" or "udp".
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// A running container, from kurumi-containerd's state and procfs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerLive {
+    pub init_pid: i32,
+    pub monitor_pid: i32,
+    /// "systemd", "openrc", "sysvinit", "runit", ... as detected.
+    pub init_system: String,
+    /// Unix seconds.
+    pub started_at: u64,
+    /// Reboots inside the container since it was started.
+    pub generation: u64,
+    pub processes: u32,
+    /// Resident memory of all processes, in bytes.
+    pub memory: u64,
+    /// CPU time of all processes so far, in milliseconds; clients derive
+    /// the load from successive values.
+    pub cpu_ms: u64,
+    /// Init is being replaced after a reboot inside the container.
+    #[serde(default)]
+    pub rebooting: bool,
+}
+
+/// Output of a command run in a container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Output beyond the capture limit was dropped.
+    pub truncated: bool,
+}
+
+/// Root filesystem images available for this machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageList {
+    pub server: String,
+    /// Architecture name on the image server, e.g. "amd64".
+    pub arch: String,
+    pub images: Vec<Image>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Image {
+    pub distro: String,
+    pub release: String,
+    /// Newest build, e.g. "20261006_05:24".
+    pub build: String,
+}
+
+impl Image {
+    /// `distro/release`, as `container install` takes it.
+    pub fn spec(&self) -> String {
+        format!("{}/{}", self.distro, self.release)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -767,6 +1125,55 @@ mod tests {
         )
         .unwrap();
         assert!(!profile.is_remote() && !profile.active && profile.usage.is_none());
+    }
+
+    #[test]
+    fn container_wire_format() {
+        let request: Request = serde_json::from_str(
+            r#"{"cmd":"container_control","id":"ab12cd34","action":"restart"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::ContainerControl {
+                action: ContainerAction::Restart,
+                ..
+            }
+        ));
+        let request: Request =
+            serde_json::from_str(r#"{"cmd":"container_add","name":"dev"}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::ContainerAdd {
+                content: None,
+                file: None,
+                network: None,
+                ..
+            }
+        ));
+        let json = serde_json::to_string(&Request::ContainerExec {
+            id: "x".to_owned(),
+            command: vec!["uname".to_owned(), "-a".to_owned()],
+            timeout: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"container_exec","id":"x","command":["uname","-a"],"timeout":null}"#
+        );
+        // Status from a daemon without containers.
+        let status: Option<ContainerSummary> =
+            serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert!(status.is_none());
+        assert_eq!(
+            Image {
+                distro: "debian".to_owned(),
+                release: "trixie".to_owned(),
+                build: String::new(),
+            }
+            .spec(),
+            "debian/trixie"
+        );
     }
 
     #[test]

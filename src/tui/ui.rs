@@ -7,12 +7,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Sparkline, Table, Wrap};
 
 use super::app::{App, Focus, Popup, StoreFocus, Tab};
+use super::connections as connections_view;
+use super::containers as containers_view;
 use super::core as core_view;
 use super::popup::{Input, Menu};
 use super::profiles as profiles_view;
 use super::theme::{
-    ACCENT, BLUE, CRUST, DIM, DOWN, GREEN, MARK, RED, SKY, SPINNER, SUBTEXT, SURFACE, TEXT, UP,
-    YELLOW, chip, delay_color, dim, field, header_row, key, label, panel, pill, selected,
+    ACCENT, BLUE, CRUST, DIM, DOWN, GREEN, MARK, RED, SKY, SPINNER, SUBTEXT, SURFACE, TEAL, TEXT,
+    UP, YELLOW, chip, delay_color, dim, field, header_row, key, label, panel, pill, selected,
     state_color, state_pill,
 };
 use crate::i18n::fl;
@@ -35,11 +37,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.tab {
         Tab::Overview => draw_overview(frame, body, app),
         Tab::Proxies => draw_proxies(frame, body, app),
-        Tab::Connections => draw_connections(frame, body, app),
+        Tab::Connections => connections_view::draw(frame, body, app),
         Tab::Logs => draw_logs(frame, body, app),
         Tab::SubStore => draw_sub_store(frame, body, app),
         Tab::Core => core_view::draw(frame, body, app),
         Tab::Profiles => profiles_view::draw(frame, body, app),
+        Tab::Containers => containers_view::draw(frame, body, app),
     }
     draw_footer(frame, footer, app);
 
@@ -94,6 +97,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             if let Some(profile) = &status.active_profile {
                 left.push(Span::raw("  "));
                 left.push(chip(profile.name.clone(), GREEN));
+            }
+            if let Some(containers) = status.containers.filter(|c| c.total > 0) {
+                left.push(Span::raw("  "));
+                left.push(chip(
+                    fl!(
+                        "tui-header-containers",
+                        running = containers.running,
+                        total = containers.total
+                    ),
+                    if containers.running > 0 { TEAL } else { DIM },
+                ));
             }
             if let Some(started) = status.started_at {
                 left.push(dim("  "));
@@ -166,11 +180,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("t", fl!("key-test")),
             ("T", fl!("key-test-one")),
         ],
-        Tab::Connections => vec![
-            ("↑↓", fl!("key-move")),
-            ("d", fl!("key-close")),
-            ("D", fl!("key-close-all")),
-        ],
+        Tab::Connections => connections_view::hints(app),
         Tab::Logs => vec![
             ("↑↓", fl!("key-scroll")),
             ("PgUp/Dn", fl!("key-page")),
@@ -184,10 +194,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         Tab::Core => core_view::hints(app),
         Tab::Profiles => profiles_view::hints(app),
+        Tab::Containers => containers_view::hints(app),
         Tab::Overview => Vec::new(),
     };
-    // The editor takes these keys itself.
-    let global = if app.tab == Tab::Profiles && app.profiles.code.is_some() {
+    // The editors take these keys themselves.
+    let global = if (app.tab == Tab::Profiles && app.profiles.code.is_some())
+        || (app.tab == Tab::Containers && app.containers.editor.is_some())
+    {
         Vec::new()
     } else {
         vec![
@@ -456,7 +469,7 @@ fn draw_clash_panel(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![
             label(&fl!("field-connections"), CLASH_FIELD),
             Span::styled(
-                app.connections.len().to_string(),
+                app.connections.live_len().to_string(),
                 Style::new().fg(TEXT).bold(),
             ),
             dim(format!("   {}  ", fl!("field-memory"))),
@@ -593,96 +606,6 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(table, members_area, &mut app.member_state);
 }
 
-// ----- connections --------------------------------------------------------------
-
-fn age(start: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(start)
-        .map(|t| {
-            let secs = chrono::Utc::now()
-                .signed_duration_since(t)
-                .num_seconds()
-                .max(0);
-            fmt_duration(secs as u64)
-        })
-        .unwrap_or_default()
-}
-
-fn draw_connections(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = panel(
-        &fl!("tui-panel-connections", count = app.connections.len()),
-        true,
-    )
-    .title_top(
-        Line::from(vec![
-            Span::styled(
-                format!(" ↑ {} ", fmt_speed(app.traffic.up_speed)),
-                Style::new().fg(UP),
-            ),
-            Span::styled(
-                format!("↓ {} ", fmt_speed(app.traffic.down_speed)),
-                Style::new().fg(DOWN),
-            ),
-        ])
-        .right_aligned(),
-    );
-    if let Some(err) = &app.clash_error {
-        frame.render_widget(Paragraph::new(first_line(err)).fg(RED).block(block), area);
-        return;
-    }
-    let rows: Vec<Row> = app
-        .connections
-        .iter()
-        .map(|c| {
-            Row::new(vec![
-                Cell::from(Span::styled(c.target(), Style::new().fg(TEXT))),
-                Cell::from(dim(c.metadata.network.clone())),
-                // sing-box lists the final node first; show group → node instead.
-                Cell::from(Span::styled(
-                    c.chains
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" → "),
-                    Style::new().fg(ACCENT),
-                )),
-                Cell::from(dim(c.rule.clone())),
-                Cell::from(Span::styled(fmt_bytes(c.upload), Style::new().fg(UP))),
-                Cell::from(Span::styled(fmt_bytes(c.download), Style::new().fg(DOWN))),
-                Cell::from(dim(age(&c.start))),
-            ])
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(3),
-            Constraint::Length(4),
-            Constraint::Fill(2),
-            Constraint::Fill(2),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(9),
-        ],
-    )
-    .header(
-        Row::new([
-            fl!("col-destination"),
-            fl!("col-network"),
-            fl!("col-chain"),
-            fl!("col-rule"),
-            fl!("col-upload"),
-            fl!("col-download"),
-            fl!("col-age"),
-        ])
-        .style(header_row()),
-    )
-    .block(block)
-    .row_highlight_style(selected(true))
-    .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
-    frame.render_stateful_widget(table, area, &mut app.conn_state);
-}
-
 // ----- logs -----------------------------------------------------------------------
 
 const LEVELS: [(&str, Color); 7] = [
@@ -733,6 +656,27 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
             ),
             Span::raw(line.clone()),
         ]),
+        LogSource::Containers => {
+            let mut spans = vec![
+                dim(fmt_clock(entry.ts)),
+                Span::styled(
+                    format!(" {} ", entry.source.label()),
+                    Style::new().fg(TEAL).bold(),
+                ),
+            ];
+            match find_level(line) {
+                Some((start, end, color)) => {
+                    spans.push(Span::raw(line[..start].to_owned()));
+                    spans.push(Span::styled(
+                        line[start..end].to_owned(),
+                        Style::new().fg(color).bold(),
+                    ));
+                    spans.push(Span::raw(line[end..].to_owned()));
+                }
+                None => spans.push(Span::raw(line.clone())),
+            }
+            Line::from(spans)
+        }
         LogSource::Core => match find_level(line) {
             Some((start, end, color)) => Line::from(vec![
                 dim(line[..start].to_owned()),
@@ -991,7 +935,7 @@ fn draw_help(frame: &mut Frame) {
     let blank = || ("", String::new());
     let left = help_lines(&[
         ("", fl!("help-global")),
-        ("1-7 / Tab", fl!("help-switch-tab")),
+        ("1-8 / Tab", fl!("help-switch-tab")),
         ("s / x / r", fl!("help-start-stop-restart")),
         ("R", fl!("help-reload")),
         ("c", fl!("help-check")),
@@ -1004,8 +948,15 @@ fn draw_help(frame: &mut Frame) {
         ("Enter", fl!("help-select-node")),
         ("t / T", fl!("help-delay-test")),
         blank(),
-        ("", fl!("help-connections-logs")),
+        ("", fl!("help-connections")),
+        ("Enter / i", fl!("help-conn-details")),
+        ("/ · Esc", fl!("help-conn-filter")),
+        ("o / O", fl!("help-conn-sort")),
+        ("p / Space", fl!("help-conn-pause")),
+        ("y", fl!("help-conn-copy")),
         ("d / D", fl!("help-close-connections")),
+        blank(),
+        ("", fl!("help-logs")),
         ("PgUp/Dn End", fl!("help-scroll")),
     ]);
     let right = help_lines(&[
@@ -1030,6 +981,13 @@ fn draw_help(frame: &mut Frame) {
         ("n / i", fl!("help-profiles-new")),
         ("f / F", fl!("help-profiles-update")),
         ("d / A", fl!("help-profiles-delete")),
+        blank(),
+        ("", fl!("help-containers")),
+        ("Enter / n", fl!("help-containers-menu")),
+        ("t / o / !", fl!("help-containers-run")),
+        ("e / E / i", fl!("help-containers-edit")),
+        ("a / d", fl!("help-containers-delete")),
+        ("C / U / A", fl!("help-containers-host")),
     ]);
     let height = left.len().max(right.len()) as u16 + 2;
     let area = popup_area(frame, 104, height);

@@ -2,7 +2,9 @@ mod clash;
 mod cli;
 mod client;
 mod config;
+mod container;
 mod ctl;
+mod ctl_container;
 mod daemon;
 mod i18n;
 mod profile;
@@ -21,7 +23,7 @@ use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::client::DaemonClient;
 use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_SOCKET, DaemonConfig};
 use crate::i18n::{Lang, fl, fl_log};
-use crate::protocol::{Component, ComponentAction, Request};
+use crate::protocol::{Component, ComponentAction, ContainerAction, Request};
 use crate::util::error_chain;
 
 #[derive(Parser)]
@@ -165,6 +167,175 @@ enum Cmd {
     Profile {
         #[command(subcommand)]
         action: Option<ProfileCmd>,
+    },
+    #[command(about = fl!("cli-container"), visible_alias = "ct")]
+    Container {
+        #[command(subcommand)]
+        action: Option<ContainerCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContainerCmd {
+    #[command(about = fl!("cli-container-list"))]
+    List,
+    #[command(about = fl!("cli-container-show"))]
+    Show {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(long, help = fl!("cli-container-show-config"))]
+        config: bool,
+    },
+    #[command(about = fl!("cli-container-new"))]
+    New {
+        #[arg(help = fl!("cli-container-name"))]
+        name: String,
+        #[arg(
+            long,
+            value_parser = ["host", "nat", "none"],
+            hide_possible_values = true,
+            help = fl!("cli-container-network")
+        )]
+        network: Option<String>,
+        #[arg(long, value_name = "DISTRO/RELEASE", help = fl!("cli-container-new-image"))]
+        image: Option<String>,
+        #[arg(long, help = fl!("cli-container-new-edit"))]
+        edit: bool,
+        #[arg(long, help = fl!("cli-container-new-start"))]
+        start: bool,
+    },
+    #[command(about = fl!("cli-container-add"))]
+    Add {
+        #[arg(value_name = "FILE", help = fl!("cli-container-add-file"))]
+        file: String,
+        #[arg(long, help = fl!("cli-container-name"))]
+        name: Option<String>,
+        #[arg(long, help = fl!("cli-container-add-link"))]
+        link: bool,
+    },
+    #[command(about = fl!("cli-container-adopt"))]
+    Adopt {
+        #[arg(value_name = "CONFIG.JSON", help = fl!("cli-container-adopt-registry"))]
+        registry: Option<String>,
+    },
+    #[command(about = fl!("cli-container-edit"))]
+    Edit {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(long, help = fl!("cli-container-force-save"))]
+        force: bool,
+        #[arg(long, help = fl!("cli-profile-edit-external"))]
+        external: bool,
+    },
+    #[command(about = fl!("cli-container-start"))]
+    Start {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+    },
+    #[command(about = fl!("cli-container-stop"))]
+    Stop {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+    },
+    #[command(about = fl!("cli-container-restart"))]
+    Restart {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+    },
+    #[command(about = fl!("cli-container-install"))]
+    Install {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(value_name = "ARCHIVE|URL|DISTRO/RELEASE", help = fl!("cli-container-install-source"))]
+        source: String,
+        #[arg(long, help = fl!("cli-container-install-size"))]
+        size: Option<String>,
+        #[arg(long, help = fl!("cli-container-install-sha256"))]
+        sha256: Option<String>,
+        #[arg(long, help = fl!("cli-container-install-force"))]
+        force: bool,
+    },
+    #[command(about = fl!("cli-container-exec"), visible_alias = "run")]
+    Exec {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(long, value_name = "SECONDS", help = fl!("cli-container-exec-timeout"))]
+        timeout: Option<u64>,
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND",
+            help = fl!("cli-container-exec-command")
+        )]
+        command: Vec<String>,
+    },
+    #[command(about = fl!("cli-container-enter"), visible_alias = "shell")]
+    Enter {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(default_value = "root", hide_default_value = true, help = fl!("cli-container-enter-user"))]
+        user: String,
+    },
+    #[command(about = fl!("cli-container-autostart"))]
+    Autostart {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(
+            value_name = "on|off",
+            action = ArgAction::Set,
+            value_parser = clap::builder::BoolishValueParser::new(),
+            help = fl!("cli-container-autostart-value")
+        )]
+        enabled: bool,
+    },
+    #[command(about = fl!("cli-container-rename"))]
+    Rename {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(help = fl!("cli-container-name"))]
+        name: String,
+    },
+    #[command(about = fl!("cli-container-remove"))]
+    Remove {
+        #[arg(help = fl!("cli-container-id"))]
+        container: String,
+        #[arg(long, help = fl!("cli-container-remove-purge"))]
+        purge: bool,
+    },
+    #[command(about = fl!("cli-container-images"))]
+    Images {
+        #[arg(value_name = "DISTRO", help = fl!("cli-container-images-filter"))]
+        distro: Option<String>,
+        #[arg(long, help = fl!("cli-core-list-refresh"))]
+        refresh: bool,
+    },
+    #[command(about = fl!("cli-container-check"))]
+    Check,
+    #[command(about = fl!("cli-container-scan"))]
+    Scan,
+    #[command(about = fl!("cli-container-runtime"))]
+    Runtime {
+        #[command(subcommand)]
+        action: Option<RuntimeCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeCmd {
+    #[command(about = fl!("cli-container-runtime-update"))]
+    Update {
+        #[arg(long, help = fl!("cli-container-runtime-tag"))]
+        tag: Option<String>,
+        #[arg(long, help = fl!("cli-update-force"))]
+        force: bool,
+    },
+    #[command(about = fl!("cli-container-runtime-import"))]
+    Import {
+        #[arg(help = fl!("cli-container-runtime-location"))]
+        location: String,
+        #[arg(long, help = fl!("cli-core-import-sha256"))]
+        sha256: Option<String>,
     },
 }
 
@@ -473,6 +644,7 @@ fn run_client(socket: Option<PathBuf>, lang: Option<String>, command: Cmd) -> Re
             }
             Cmd::Core { action } => run_core(&client, action).await,
             Cmd::Profile { action } => run_profile(&client, action).await,
+            Cmd::Container { action } => run_container(&client, action).await,
             Cmd::Daemon { .. } => unreachable!("handled in main"),
         }
     })
@@ -575,9 +747,137 @@ async fn run_profile(client: &DaemonClient, action: Option<ProfileCmd>) -> Resul
     }
 }
 
+async fn run_container(client: &DaemonClient, action: Option<ContainerCmd>) -> Result<()> {
+    use crate::ctl_container as ct;
+    match action.unwrap_or(ContainerCmd::List) {
+        ContainerCmd::List => ct::list(client).await,
+        ContainerCmd::Show { container, config } => ct::show(client, &container, config).await,
+        ContainerCmd::New {
+            name,
+            network,
+            image,
+            edit,
+            start,
+        } => ct::new(client, name, network, image, edit, start).await,
+        ContainerCmd::Add { file, name, link } => ct::add(client, &file, name, link).await,
+        ContainerCmd::Adopt { registry } => {
+            ctl::command(client, Request::ContainerAdopt { path: registry }).await
+        }
+        ContainerCmd::Edit {
+            container,
+            force,
+            external,
+        } => ct::edit(client, &container, force, external).await,
+        ContainerCmd::Start { container } => {
+            ct::control(client, &container, ContainerAction::Start).await
+        }
+        ContainerCmd::Stop { container } => {
+            ct::control(client, &container, ContainerAction::Stop).await
+        }
+        ContainerCmd::Restart { container } => {
+            ct::control(client, &container, ContainerAction::Restart).await
+        }
+        ContainerCmd::Install {
+            container,
+            source,
+            size,
+            sha256,
+            force,
+        } => ct::install(client, &container, &source, size, sha256, force).await,
+        ContainerCmd::Exec {
+            container,
+            timeout,
+            command,
+        } => ct::exec(client, &container, timeout, command).await,
+        ContainerCmd::Enter { container, user } => ct::enter(client, &container, &user).await,
+        ContainerCmd::Autostart { container, enabled } => {
+            let request = Request::ContainerSet {
+                id: container,
+                name: None,
+                autostart: Some(enabled),
+            };
+            ctl::command(client, request).await
+        }
+        ContainerCmd::Rename { container, name } => {
+            let request = Request::ContainerSet {
+                id: container,
+                name: Some(name),
+                autostart: None,
+            };
+            ctl::command(client, request).await
+        }
+        ContainerCmd::Remove { container, purge } => {
+            ctl::command(
+                client,
+                Request::ContainerRemove {
+                    id: container,
+                    purge,
+                },
+            )
+            .await
+        }
+        ContainerCmd::Images { distro, refresh } => ct::images(client, distro, refresh).await,
+        ContainerCmd::Check => ctl::command(client, Request::ContainerCheck).await,
+        ContainerCmd::Scan => ctl::command(client, Request::ContainerScan).await,
+        ContainerCmd::Runtime { action } => match action {
+            None => ct::runtime(client).await,
+            Some(RuntimeCmd::Update { tag, force }) => ct::runtime_update(client, tag, force).await,
+            Some(RuntimeCmd::Import { location, sha256 }) => {
+                ct::runtime_import(client, location, sha256).await
+            }
+        },
+    }
+}
+
 /// Clients follow a readable daemon.toml so a custom socket path just works.
 fn default_socket() -> PathBuf {
     DaemonConfig::load(std::path::Path::new(DEFAULT_CONFIG_PATH), false)
         .map(|(config, _)| config.socket)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_is_well_formed() {
+        cli::localize(Cli::command()).debug_assert();
+    }
+
+    #[test]
+    fn container_commands_parse() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("singbox-board").chain(args.iter().copied()))
+        };
+        let cli = parse(&["container", "autostart", "dev", "off"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Container {
+                action: Some(ContainerCmd::Autostart { enabled: false, .. })
+            })
+        ));
+        let cli = parse(&["ct", "exec", "dev", "--", "ls", "-la"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Container {
+                action: Some(ContainerCmd::Exec { ref command, .. })
+            }) if command == &["ls", "-la"]
+        ));
+        let cli = parse(&["container", "run", "dev", "uname", "-a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Container {
+                action: Some(ContainerCmd::Exec { ref command, .. })
+            }) if command == &["uname", "-a"]
+        ));
+        assert!(parse(&["container", "new", "x", "--network", "bridge"]).is_err());
+        let cli = parse(&["container", "enter", "dev"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Container {
+                action: Some(ContainerCmd::Enter { ref user, .. })
+            }) if user == "root"
+        ));
+    }
 }

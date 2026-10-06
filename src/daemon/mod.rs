@@ -2,6 +2,7 @@
 
 mod auth;
 mod components;
+mod containers;
 mod cores;
 mod github;
 mod logs;
@@ -26,6 +27,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use self::auth::Authorizer;
 use self::components::ComponentsHandle;
+use self::containers::ContainerManager;
 use self::cores::CoreManager;
 use self::logs::LogHub;
 use self::profiles::ProfileManager;
@@ -64,11 +66,14 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
         Supervisor::spawn(config.clone(), logs.clone(), components.startup_gate());
     let profiles = ProfileManager::new(config.clone(), logs.clone(), handle.clone());
     profiles.spawn_updater();
+    let containers = ContainerManager::new(config.clone(), logs.clone());
+    containers.spawn_autostart();
     let ctx = Arc::new(Ctx {
         supervisor: handle.clone(),
         components: components.clone(),
         cores: CoreManager::new(config.clone(), logs.clone()),
         profiles,
+        containers: containers.clone(),
         logs: logs.clone(),
         auth,
         config: config.clone(),
@@ -109,8 +114,12 @@ pub async fn run(config: DaemonConfig, allow_non_root: bool) -> Result<()> {
         }
     }
 
-    components.shutdown().await;
-    handle.shutdown().await;
+    // Containers are stopped (when they are) alongside sing-box and the
+    // components, so that the slowest decides how long shutdown takes.
+    tokio::join!(containers.shutdown(), async {
+        components.shutdown().await;
+        handle.shutdown().await;
+    });
     let _ = supervisor.await;
     let _ = std::fs::remove_file(&config.socket);
     Ok(())
@@ -160,6 +169,7 @@ struct Ctx {
     components: ComponentsHandle,
     cores: Arc<CoreManager>,
     profiles: Arc<ProfileManager>,
+    containers: Arc<ContainerManager>,
     logs: Arc<LogHub>,
     auth: Arc<Authorizer>,
     config: DaemonConfig,
@@ -234,6 +244,7 @@ where
             status.active_core = ctx.cores.active();
             status.active_profile = ctx.profiles.active();
             status.update_in_progress = ctx.cores.busy();
+            status.containers = Some(ctx.containers.summary());
             return send(&mut write, &Response::Status(Box::new(status))).await;
         }
         Request::Logs { tail, follow } => {
@@ -269,6 +280,33 @@ where
                 requested(request_name(&profile_request));
             }
             let response = handle_profile(&ctx.profiles, profile_request).await;
+            return send(&mut write, &response).await;
+        }
+        container_request @ (Request::ContainerList
+        | Request::ContainerGet { .. }
+        | Request::ContainerAdd { .. }
+        | Request::ContainerSave { .. }
+        | Request::ContainerSet { .. }
+        | Request::ContainerRemove { .. }
+        | Request::ContainerAdopt { .. }
+        | Request::ContainerControl { .. }
+        | Request::ContainerInstall { .. }
+        | Request::ContainerExec { .. }
+        | Request::ContainerImages { .. }
+        | Request::ContainerCheck
+        | Request::ContainerScan
+        | Request::ContainerRuntimeUpdate { .. }
+        | Request::ContainerRuntimeImport { .. }) => {
+            if !matches!(
+                container_request,
+                Request::ContainerList
+                    | Request::ContainerGet { .. }
+                    | Request::ContainerImages { .. }
+            ) {
+                requested(request_name(&container_request));
+            }
+            let privileged = uid == 0 || uid == nix::unistd::Uid::effective().as_raw();
+            let response = handle_container(&ctx.containers, container_request, privileged).await;
             return send(&mut write, &response).await;
         }
         Request::Start => Op::Start,
@@ -469,6 +507,120 @@ async fn handle_profile(profiles: &ProfileManager, request: Request) -> Response
             Some(p) => Response::done(fl!("profiles-adopted", name = p.name, id = p.id)),
             None => Response::done(fl!("profiles-nothing-to-adopt")),
         })),
+        other => Response::error(fl!(
+            "daemon-unexpected-request",
+            name = request_name(&other)
+        )),
+    }
+}
+
+/// Container requests. Whatever decides what runs as root inside a
+/// container (configurations, root filesystems, commands, the runtime
+/// binary) is reserved for root; starting and stopping registered
+/// containers is open to every client, like starting sing-box.
+async fn handle_container(
+    containers: &ContainerManager,
+    request: Request,
+    privileged: bool,
+) -> Response {
+    let root_only = matches!(
+        request,
+        Request::ContainerAdd { .. }
+            | Request::ContainerSave { .. }
+            | Request::ContainerRemove { .. }
+            | Request::ContainerAdopt { .. }
+            | Request::ContainerInstall { .. }
+            | Request::ContainerExec { .. }
+            | Request::ContainerScan
+            | Request::ContainerRuntimeImport { .. }
+    );
+    if root_only && !privileged {
+        return Response::error(fl!("containers-root-only", action = request_name(&request)));
+    }
+    let saved = |(container, message)| Response::ContainerSaved {
+        container: Box::new(container),
+        message,
+    };
+    match request {
+        Request::ContainerList => Response::Containers(Box::new(containers.overview().await)),
+        Request::ContainerGet { id } => {
+            result(containers.get(&id).await.map(|(container, content)| {
+                Response::ContainerContent {
+                    container: Box::new(container),
+                    content,
+                }
+            }))
+        }
+        Request::ContainerAdd {
+            name,
+            content,
+            file,
+            network,
+        } => result(
+            containers
+                .add(name, content, file, network)
+                .await
+                .map(saved),
+        ),
+        Request::ContainerSave { id, content, force } => {
+            result(containers.save(&id, &content, force).await.map(saved))
+        }
+        Request::ContainerSet {
+            id,
+            name,
+            autostart,
+        } => result(containers.set(&id, name, autostart).map(Response::done)),
+        Request::ContainerRemove { id, purge } => {
+            result(containers.remove(&id, purge).await.map(Response::done))
+        }
+        Request::ContainerAdopt { path } => {
+            result(containers.adopt(path).await.map(Response::done))
+        }
+        Request::ContainerControl { id, action } => {
+            result(containers.control(&id, action).await.map(Response::done))
+        }
+        Request::ContainerInstall {
+            id,
+            source,
+            size,
+            sha256,
+            force,
+        } => result(
+            containers
+                .install(&id, &source, size, sha256, force)
+                .await
+                .map(Response::done),
+        ),
+        Request::ContainerExec {
+            id,
+            command,
+            timeout,
+        } => result(
+            containers
+                .exec(&id, command, timeout)
+                .await
+                .map(Response::ContainerExec),
+        ),
+        Request::ContainerImages { refresh } => result(
+            containers
+                .images(refresh)
+                .await
+                .map(Response::ContainerImages),
+        ),
+        Request::ContainerCheck => result(containers.check().await.map(Response::done)),
+        Request::ContainerScan => result(containers.scan().await.map(Response::done)),
+        Request::ContainerRuntimeUpdate { tag, force } => result(
+            containers
+                .update_runtime(tag.as_deref(), force)
+                .await
+                .map(Response::done),
+        ),
+        Request::ContainerRuntimeImport { location, sha256 } => result(
+            containers
+                .import_runtime(&location, sha256.as_deref())
+                .await
+                .map(Response::done),
+        ),
         other => Response::error(fl!(
             "daemon-unexpected-request",
             name = request_name(&other)

@@ -96,6 +96,50 @@ pub fn text_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Shortens `text` to `width` columns, ending it with `…` when cut.
+pub fn truncate(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if text_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let w = text_width(grapheme);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// Shortens `text` to `width` columns from the front, keeping its end:
+/// `…mail.example.com`.
+pub fn truncate_start(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if text_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut tail = Vec::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let w = text_width(grapheme);
+        if used + w + 1 > width {
+            break;
+        }
+        tail.push(grapheme);
+        used += w;
+    }
+    let mut out = String::from(if width > 0 { "…" } else { "" });
+    out.extend(tail.into_iter().rev());
+    out
+}
+
 /// Pads `text` with spaces to `width` terminal columns.
 pub fn pad(text: &str, width: usize) -> String {
     let fill = width.saturating_sub(text_width(text));
@@ -192,6 +236,12 @@ pub fn shorten_url(url: &str) -> String {
 /// Blocks until the editor exits; the temporary file is readable by the
 /// current user only.
 pub fn edit_text(text: &str, name: &str) -> Result<String> {
+    edit_text_as(text, name, "json")
+}
+
+/// [`edit_text`] for a file type other than JSON, named by its extension
+/// so that the editor highlights it.
+pub fn edit_text_as(text: &str, name: &str, extension: &str) -> Result<String> {
     let (program, args) = editor_command()?;
     let name: String = name
         .chars()
@@ -204,7 +254,10 @@ pub fn edit_text(text: &str, name: &str) -> Result<String> {
         })
         .take(40)
         .collect();
-    let path = std::env::temp_dir().join(format!("singbox-board-{}-{name}.json", random_token(6)));
+    let path = std::env::temp_dir().join(format!(
+        "singbox-board-{}-{name}.{extension}",
+        random_token(6)
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -308,6 +361,16 @@ mod tests {
         assert_eq!(pad("ab", 4), "ab  ");
         assert_eq!(pad("版本", 6), "版本  ");
         assert_eq!(pad("toolong", 3), "toolong");
+    }
+
+    #[test]
+    fn truncation_counts_columns() {
+        assert_eq!(truncate("short", 5), "short");
+        assert_eq!(truncate("toolong", 5), "tool…");
+        assert_eq!(truncate("配置文件", 5), "配置…");
+        assert_eq!(truncate_start("mail.example.com", 9), "…mple.com");
+        assert_eq!(truncate_start("香港节点", 6), "…节点");
+        assert_eq!(truncate("abc", 0), "");
     }
 
     #[test]

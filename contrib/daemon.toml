@@ -137,3 +137,28 @@ mihomo_repo = "MetaCubeX/mihomo"
 
 # Extra environment variables (META_MAX_AVAILABLE_PORT, BODY_JSON_LIMIT ...).
 [http_meta.env]
+
+# ---------------------------------------------------------------------------
+# Containers: lightweight Linux system containers run by kurumi-containerd
+# (https://github.com/Tools-cx-app/kurumi-containerd). Containers and their
+# TOML configurations are kept in <components.data_dir>/containers/ and are
+# managed in the TUI ("Containers") or with `singbox-board container`.
+# The runtime is downloaded on first use (`singbox-board container runtime`).
+# ---------------------------------------------------------------------------
+[containers]
+# kurumi-containerd executable. Unset: the release downloaded into
+# <components.data_dir>/containers/runtime, else kurumi-containerd from PATH.
+# runtime = "/usr/bin/kurumi-containerd"
+repo = "Tools-cx-app/kurumi-containerd"
+# Root filesystem images for `container new --image` / `container install`,
+# laid out like images.linuxcontainers.org, e.g. the TUNA mirror
+# "https://mirrors.tuna.tsinghua.edu.cn/lxc-images".
+image_server = "https://images.linuxcontainers.org"
+# Start containers marked for autostart when the daemon starts (once per boot).
+autostart = true
+# Containers keep running when the daemon stops or restarts; they are stopped
+# cleanly when the system shuts down. Set to stop them with the daemon too.
+stop_on_shutdown = false
+# Start each container in its own transient systemd scope (machine.slice), so
+# that stopping or restarting the daemon's service does not kill it.
+systemd_scope = true

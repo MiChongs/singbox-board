@@ -19,6 +19,7 @@ i18n-embed = { version = "0.16", features = ["fluent-system"] }
 i18n-embed-fl = "0.10"
 json_comments = "0.2.2"
 jsonc-parser = { version = "0.34", features = ["serde"] }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "optimization", "xz"] }
 ksni = "0.3.6"
 nix = { version = "0.31.3", features = ["user", "signal", "process", "fs", "net"] }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
@@ -44,3 +45,6 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "encoder"] }

@@ -31,6 +31,7 @@ pub struct DaemonConfig {
     pub components: ComponentsConfig,
     pub sub_store: SubStoreConfig,
     pub http_meta: HttpMetaConfig,
+    pub containers: ContainersConfig,
 }
 
 impl Default for DaemonConfig {
@@ -50,6 +51,7 @@ impl Default for DaemonConfig {
             components: ComponentsConfig::default(),
             sub_store: SubStoreConfig::default(),
             http_meta: HttpMetaConfig::default(),
+            containers: ContainersConfig::default(),
         }
     }
 }
@@ -300,6 +302,44 @@ impl Default for HttpMetaConfig {
             mihomo_repo: "MetaCubeX/mihomo".to_owned(),
             mihomo_arch: None,
             env: BTreeMap::new(),
+        }
+    }
+}
+
+/// Containers run by kurumi-containerd (Tools-cx-app/kurumi-containerd).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContainersConfig {
+    /// kurumi-containerd executable. Unset: the release the daemon downloads
+    /// into `<components.data_dir>/containers/runtime`, else
+    /// `kurumi-containerd` from PATH.
+    pub runtime: Option<PathBuf>,
+    /// GitHub repository the runtime is downloaded from.
+    pub repo: String,
+    /// Root filesystem images (`singbox-board container images`): a server
+    /// laid out like images.linuxcontainers.org.
+    pub image_server: String,
+    /// Start containers marked for autostart once per boot, when the daemon
+    /// starts.
+    pub autostart: bool,
+    /// Stop running containers when the daemon stops. Otherwise they keep
+    /// running across daemon restarts and are only stopped when the system
+    /// shuts down.
+    pub stop_on_shutdown: bool,
+    /// Start every container in a transient systemd scope (machine.slice),
+    /// so that stopping the daemon's service does not kill it.
+    pub systemd_scope: bool,
+}
+
+impl Default for ContainersConfig {
+    fn default() -> Self {
+        Self {
+            runtime: None,
+            repo: "Tools-cx-app/kurumi-containerd".to_owned(),
+            image_server: "https://images.linuxcontainers.org".to_owned(),
+            autostart: true,
+            stop_on_shutdown: false,
+            systemd_scope: true,
         }
     }
 }

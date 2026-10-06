@@ -11,20 +11,23 @@ use ratatui::widgets::{ListState, TableState};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
+use super::connections::ConnectionsView;
+use super::containers::{
+    ContainerContentPurpose, ContainerSavePurpose, ContainersView, ShellCommand,
+};
 use super::core::CoreView;
 use super::popup::{
     ExternalEdit, Input, InputOutcome, InputPurpose, Menu, MenuAction, MenuItem, MenuOutcome,
 };
 use super::profiles::{ContentPurpose, ProfilesView, SavePurpose};
 use super::tasks::{self, EventTx};
-use crate::clash::{
-    ClashClient, Configs, Connection, Connections, DEFAULT_TEST_URL, Proxies, Proxy,
-};
+use crate::clash::{ClashClient, Configs, Connections, DEFAULT_TEST_URL, Proxies, Proxy};
 use crate::client::DaemonClient;
 use crate::i18n::fl;
 use crate::protocol::{
-    ClashApi, Component, ComponentAction, ComponentStatus, CoreReleasePage, CoreSource, CoreState,
-    LogEntry, Profile, ProfileList, Request, Status, StoredCore, UpdateInfo,
+    ClashApi, Component, ComponentAction, ComponentStatus, Container, ContainerOverview,
+    CoreReleasePage, CoreSource, CoreState, ExecResult, ImageList, LogEntry, Profile, ProfileList,
+    Request, Status, StoredCore, UpdateInfo,
 };
 use crate::substore::{Entry, Overview, provider_snippet};
 use crate::util::{error_chain, text_width};
@@ -74,6 +77,23 @@ pub enum AppEvent {
         id: u64,
         result: Result<UpdateInfo, String>,
     },
+    Containers(Result<ContainerOverview, String>),
+    ContainerContent {
+        purpose: ContainerContentPurpose,
+        result: Result<(Container, String), String>,
+    },
+    ContainerSaved {
+        id: u64,
+        purpose: ContainerSavePurpose,
+        result: Result<(Container, String), String>,
+    },
+    ContainerImages(Result<ImageList, String>),
+    ContainerExec {
+        id: u64,
+        name: String,
+        command: String,
+        result: Result<ExecResult, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +105,11 @@ pub enum Tab {
     SubStore,
     Core,
     Profiles,
+    Containers,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Overview,
         Tab::Proxies,
         Tab::Connections,
@@ -96,6 +117,7 @@ impl Tab {
         Tab::SubStore,
         Tab::Core,
         Tab::Profiles,
+        Tab::Containers,
     ];
 
     pub fn title(self) -> String {
@@ -107,6 +129,7 @@ impl Tab {
             Tab::SubStore => "Sub-Store".to_owned(),
             Tab::Core => fl!("tab-core"),
             Tab::Profiles => fl!("tab-profiles"),
+            Tab::Containers => fl!("tab-containers"),
         }
     }
 
@@ -134,6 +157,10 @@ pub enum PendingAction {
     Restart,
     Update,
     CloseAllConnections,
+    /// The connections the filter shows.
+    CloseConnections {
+        ids: Vec<String>,
+    },
     CoreInstall {
         source: String,
         tag: String,
@@ -156,6 +183,14 @@ pub enum PendingAction {
         id: String,
     },
     ProfileAdopt,
+    ContainerStop {
+        id: String,
+    },
+    ContainerRestart {
+        id: String,
+    },
+    /// Install or update kurumi-containerd.
+    ContainerRuntime,
 }
 
 pub enum Popup {
@@ -254,8 +289,7 @@ pub struct App {
     pub delays: HashMap<String, Result<u32, String>>,
     pub testing: HashSet<String>,
 
-    pub connections: Vec<Connection>,
-    pub conn_state: TableState,
+    pub connections: ConnectionsView,
     pub traffic: Traffic,
 
     pub sub_store: Option<Overview>,
@@ -270,6 +304,9 @@ pub struct App {
 
     pub core: CoreView,
     pub profiles: ProfilesView,
+    pub containers: ContainersView,
+    /// An interactive program waiting to get the terminal (a container shell).
+    pub(super) shell: Option<ShellCommand>,
     /// Text waiting to be opened in `$EDITOR` by the event loop.
     pub(super) external: Option<ExternalEdit>,
     /// Started for one profile (`singbox-board profile edit`): quit when
@@ -321,8 +358,7 @@ impl App {
             member_state: TableState::default(),
             delays: HashMap::new(),
             testing: HashSet::new(),
-            connections: Vec::new(),
-            conn_state: TableState::default(),
+            connections: ConnectionsView::default(),
             traffic: Traffic::default(),
             sub_store: None,
             sub_store_error: None,
@@ -335,6 +371,8 @@ impl App {
             clipboard: None,
             core: CoreView::default(),
             profiles: ProfilesView::default(),
+            containers: ContainersView::default(),
+            shell: None,
             external: None,
             edit_only: false,
             exit_message: None,
@@ -355,6 +393,7 @@ impl App {
     pub fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.profiles_tick();
+        self.containers_tick();
         if self
             .toast
             .as_ref()
@@ -411,7 +450,8 @@ impl App {
             AppEvent::Connections(connections) => {
                 self.clash_error = None;
                 self.traffic.update(&connections);
-                self.set_connections(connections.connections.unwrap_or_default());
+                self.connections
+                    .take(connections.connections.unwrap_or_default());
             }
             AppEvent::Proxies(proxies) => self.set_proxies(proxies),
             AppEvent::Configs(configs) => self.configs = Some(configs),
@@ -458,6 +498,7 @@ impl App {
                 self.store_refresh.notify_one();
                 self.core_refresh_after_action();
                 self.profiles_refresh_after_action();
+                self.containers_refresh_after_action();
                 match result {
                     Ok(message) => self.notify(message, false),
                     Err(err) => self.notify(err, true),
@@ -488,6 +529,22 @@ impl App {
                     Err(err) => self.notify(err, true),
                 }
             }
+            AppEvent::Containers(result) => self.containers_loaded(result),
+            AppEvent::ContainerContent { purpose, result } => {
+                self.container_content_loaded(purpose, result)
+            }
+            AppEvent::ContainerSaved {
+                id,
+                purpose,
+                result,
+            } => self.container_saved(id, purpose, result),
+            AppEvent::ContainerImages(result) => self.container_images_loaded(result),
+            AppEvent::ContainerExec {
+                id,
+                name,
+                command,
+                result,
+            } => self.container_exec_done(id, name, command, result),
         }
     }
 
@@ -525,25 +582,6 @@ impl App {
                 at: Instant::now(),
             });
         }
-    }
-
-    fn set_connections(&mut self, mut connections: Vec<Connection>) {
-        let selected = self
-            .conn_state
-            .selected()
-            .and_then(|i| self.connections.get(i))
-            .map(|c| c.id.clone());
-        connections.sort_by(|a, b| b.start.cmp(&a.start));
-        self.connections = connections;
-        let index = selected
-            .and_then(|id| self.connections.iter().position(|c| c.id == id))
-            .or(self.conn_state.selected())
-            .map(|i| i.min(self.connections.len().saturating_sub(1)));
-        self.conn_state.select(if self.connections.is_empty() {
-            None
-        } else {
-            index.or(Some(0))
-        });
     }
 
     fn set_proxies(&mut self, proxies: Proxies) {
@@ -630,7 +668,8 @@ impl App {
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+C copies in an open editor; quitting would lose the edits.
-        let editing = self.tab == Tab::Profiles && self.profiles.code.is_some();
+        let editing =
+            (self.tab == Tab::Profiles && self.profiles.code.is_some()) || self.toml_active();
         if ctrl_c && !editing && self.popup.is_none() {
             self.quit();
             return;
@@ -647,6 +686,10 @@ impl App {
         // The code editor takes every key: digits and Tab are text there.
         if self.code_active() {
             self.code_on_key(key);
+            return;
+        }
+        if self.toml_active() {
+            self.toml_on_key(key);
             return;
         }
         // The tree view takes every key but tab switching, so letters
@@ -677,16 +720,18 @@ impl App {
             _ => match self.tab {
                 Tab::Overview => {}
                 Tab::Proxies => self.on_proxies_key(key),
-                Tab::Connections => self.on_connections_key(key),
+                Tab::Connections => self.connections_on_key(key),
                 Tab::Logs => self.on_logs_key(key),
                 Tab::SubStore => self.on_store_key(key),
                 Tab::Core => self.core_on_key(key),
                 Tab::Profiles => self.profiles_on_key(key),
+                Tab::Containers => self.containers_on_key(key),
             },
         }
         match self.tab {
             Tab::Core => self.core_tab_opened(),
             Tab::Profiles => self.profiles_tab_opened(),
+            Tab::Containers => self.containers_tab_opened(),
             _ => {}
         }
     }
@@ -694,6 +739,16 @@ impl App {
     /// Quits, unless the editor has unsaved changes: then it comes to the
     /// front and asks what to do with them.
     fn quit(&mut self) {
+        if self
+            .containers
+            .editor
+            .as_mut()
+            .is_some_and(|editor| editor.dirty())
+        {
+            self.tab = Tab::Containers;
+            self.toml_command(super::toml_editor::TomlCommand::Close);
+            return;
+        }
         // Edits in the tree view reach the text when it closes.
         self.code_close_tree(false);
         let unsaved = self.profiles.code.as_mut().is_some_and(|c| c.dirty());
@@ -709,11 +764,18 @@ impl App {
     /// Pasted text goes into an open text field or the code editor.
     pub fn on_paste(&mut self, text: &str) {
         match &mut self.popup {
-            Some(Popup::Input(input)) => input.paste(text),
+            Some(Popup::Input(input)) => {
+                input.paste(text);
+                if matches!(input.purpose, InputPurpose::ConnectionFilter(_)) {
+                    self.connections.set_filter(&input.value);
+                }
+            }
             Some(_) => {}
             None => {
                 if self.code_active() {
                     self.code_on_paste(text);
+                } else if self.toml_active() {
+                    self.toml_on_paste(text);
                 }
             }
         }
@@ -722,13 +784,15 @@ impl App {
     pub fn on_mouse(&mut self, event: MouseEvent) {
         if self.popup.is_none() && self.code_active() {
             self.code_on_mouse(event);
+        } else if self.popup.is_none() && self.toml_active() {
+            self.toml_on_mouse(event);
         }
     }
 
-    /// The code editor uses the mouse; elsewhere the terminal keeps it for
+    /// The editors use the mouse; elsewhere the terminal keeps it for
     /// selecting text.
     pub fn wants_mouse(&self) -> bool {
-        self.code_active()
+        self.code_active() || self.toml_active()
     }
 
     /// Starts with one profile open in the editor and quits when it closes.
@@ -740,6 +804,46 @@ impl App {
         self.open_code_editor(profile, content);
         if let Some(code) = &mut self.profiles.code {
             code.force = force;
+        }
+    }
+
+    /// Starts with one container's configuration open in the editor and
+    /// quits when it closes.
+    pub fn start_editing_container(&mut self, container: Container, content: &str, force: bool) {
+        self.edit_only = true;
+        self.wizard_shown = true;
+        self.tab = Tab::Containers;
+        self.open_toml_editor(container, content);
+        if let Some(editor) = &mut self.containers.editor {
+            editor.force = force;
+        }
+    }
+
+    /// An interactive program that wants the terminal.
+    pub fn take_shell(&mut self) -> Option<ShellCommand> {
+        self.shell.take()
+    }
+
+    /// The shell of a container ended.
+    pub fn shell_done(
+        &mut self,
+        shell: ShellCommand,
+        result: anyhow::Result<std::process::ExitStatus>,
+    ) {
+        self.containers_refresh_after_action();
+        match result {
+            Ok(status) if status.success() => {
+                self.notify(fl!("tui-container-shell-closed", name = shell.name), false)
+            }
+            Ok(status) => self.notify(
+                fl!(
+                    "tui-container-shell-failed",
+                    name = shell.name,
+                    status = status.to_string()
+                ),
+                true,
+            ),
+            Err(err) => self.notify(error_chain(&err), true),
         }
     }
 
@@ -767,13 +871,27 @@ impl App {
             }
             Popup::EditorHelp | Popup::CodeHelp => {}
             Popup::Input(mut input) => match input.on_key(key) {
-                InputOutcome::Editing => self.popup = Some(Popup::Input(input)),
-                InputOutcome::Cancel => {}
+                InputOutcome::Editing => {
+                    self.connections_filter_typed(&input);
+                    self.popup = Some(Popup::Input(input))
+                }
+                InputOutcome::Cancel => {
+                    if let InputPurpose::ConnectionFilter(before) = &input.purpose {
+                        self.connections.set_filter(before);
+                    }
+                }
                 InputOutcome::Submit => {
                     let value = input.value.clone();
                     let result = match &input.purpose {
+                        purpose if purpose.for_containers() => {
+                            self.containers_submit_input(purpose.clone(), value)
+                        }
                         InputPurpose::AddSource | InputPurpose::ImportCore => {
                             self.core_submit_input(input.purpose.clone(), value);
+                            Ok(())
+                        }
+                        InputPurpose::ConnectionFilter(_) => {
+                            self.connections.set_filter(&value);
                             Ok(())
                         }
                         purpose => self.profiles_submit_input(purpose.clone(), value),
@@ -816,6 +934,9 @@ impl App {
                 MenuOutcome::Chosen(MenuAction::Component(component, action)) => {
                     self.component_action(component, action)
                 }
+                MenuOutcome::Chosen(action) if action.for_containers() => {
+                    self.containers_menu_action(action)
+                }
                 MenuOutcome::Chosen(action) => self.profiles_menu_action(action),
             },
             Popup::Confirm { action, .. }
@@ -851,28 +972,6 @@ impl App {
                     self.test_delays(vec![name]);
                 }
             }
-            _ => {}
-        }
-    }
-
-    fn on_connections_key(&mut self, key: KeyEvent) {
-        let len = self.connections.len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => move_table(&mut self.conn_state, len, -1),
-            KeyCode::Down | KeyCode::Char('j') => move_table(&mut self.conn_state, len, 1),
-            KeyCode::PageUp => move_table(&mut self.conn_state, len, -20),
-            KeyCode::PageDown => move_table(&mut self.conn_state, len, 20),
-            KeyCode::Home | KeyCode::Char('g') => {
-                move_table(&mut self.conn_state, len, isize::MIN / 2)
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                move_table(&mut self.conn_state, len, isize::MAX / 2)
-            }
-            KeyCode::Char('d') | KeyCode::Delete => self.close_selected_connection(),
-            KeyCode::Char('D') => self.confirm(
-                fl!("tui-confirm-close-all"),
-                PendingAction::CloseAllConnections,
-            ),
             _ => {}
         }
     }
@@ -1109,10 +1208,21 @@ impl App {
             profile @ (PendingAction::ProfileUse { .. }
             | PendingAction::ProfileDelete { .. }
             | PendingAction::ProfileAdopt) => self.profiles_run_pending(profile),
+            container @ (PendingAction::ContainerStop { .. }
+            | PendingAction::ContainerRestart { .. }
+            | PendingAction::ContainerRuntime) => self.containers_run_pending(container),
             PendingAction::CloseAllConnections => {
                 self.clash_action(&fl!("busy-closing-connections"), |clash| async move {
                     clash.close_all_connections().await?;
                     Ok(fl!("tui-connections-closed"))
+                })
+            }
+            PendingAction::CloseConnections { ids } => {
+                self.clash_action(&fl!("busy-closing-connections"), |clash| async move {
+                    for id in &ids {
+                        clash.close_connection(id).await?;
+                    }
+                    Ok(fl!("tui-connections-closed-count", count = ids.len()))
                 })
             }
         }
@@ -1137,7 +1247,7 @@ impl App {
         });
     }
 
-    fn clash_action<F, Fut>(&mut self, label: &str, action: F)
+    pub(super) fn clash_action<F, Fut>(&mut self, label: &str, action: F)
     where
         F: FnOnce(ClashClient) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<String>> + Send,
@@ -1240,22 +1350,6 @@ impl App {
                 .await;
         });
     }
-
-    fn close_selected_connection(&mut self) {
-        let Some(connection) = self
-            .conn_state
-            .selected()
-            .and_then(|i| self.connections.get(i))
-        else {
-            return;
-        };
-        let id = connection.id.clone();
-        let target = connection.target();
-        self.clash_action(&fl!("busy-closing-connection"), move |clash| async move {
-            clash.close_connection(&id).await?;
-            Ok(fl!("tui-connection-closed", target = target))
-        });
-    }
 }
 
 /// Index of the tab a digit key selects.
@@ -1283,7 +1377,7 @@ fn move_list(state: &mut ListState, len: usize, delta: isize) {
     state.select(step(state.selected(), len, delta));
 }
 
-fn move_table(state: &mut TableState, len: usize, delta: isize) {
+pub(super) fn move_table(state: &mut TableState, len: usize, delta: isize) {
     state.select(step(state.selected(), len, delta));
 }
 

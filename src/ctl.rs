@@ -25,7 +25,7 @@ pub async fn status(client: &DaemonClient, json: bool) -> Result<()> {
 }
 
 /// Prints `label  value` rows with the values aligned.
-fn print_rows(rows: &[(String, String)]) {
+pub(crate) fn print_rows(rows: &[(String, String)]) {
     let width = rows
         .iter()
         .map(|(label, _)| text_width(label))
@@ -38,7 +38,7 @@ fn print_rows(rows: &[(String, String)]) {
 }
 
 /// `text (PID 42, running for 05:06)`
-fn with_process(text: String, pid: u32, started: u64, now: u64) -> String {
+pub(crate) fn with_process(text: String, pid: u32, started: u64, now: u64) -> String {
     fl!(
         "with-process",
         text = text,
@@ -107,6 +107,16 @@ fn print_status(status: &Status) {
             component_summary(component, now),
         ));
     }
+    if let Some(containers) = status.containers.filter(|c| c.total > 0) {
+        rows.push((
+            fl!("ctl-label-containers"),
+            fl!(
+                "ctl-containers-summary",
+                running = containers.running,
+                total = containers.total
+            ),
+        ));
+    }
     print_rows(&rows);
     if status.setup_required {
         println!("\n{}", fl!("ctl-setup-hint"));
@@ -162,7 +172,7 @@ pub async fn setup(
     .await
 }
 
-fn ask(question: &str) -> Result<bool> {
+pub(crate) fn ask(question: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         bail!(fl!("ctl-ask-no-terminal", question = question));
     }
@@ -339,7 +349,7 @@ pub async fn update(
 
 // ----- core versions --------------------------------------------------------
 
-fn paint(text: &str, code: &str) -> String {
+pub(crate) fn paint(text: &str, code: &str) -> String {
     if std::io::stdout().is_terminal() {
         format!("\x1b[{code}m{text}\x1b[0m")
     } else {
@@ -347,7 +357,7 @@ fn paint(text: &str, code: &str) -> String {
     }
 }
 
-fn checksum_text(checksum: Checksum) -> String {
+pub(crate) fn checksum_text(checksum: Checksum) -> String {
     match checksum {
         Checksum::None => paint(&checksum.label(), "33"),
         verified => paint(&format!("✓ {}", verified.label()), "32"),

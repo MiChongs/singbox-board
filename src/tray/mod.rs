@@ -26,7 +26,7 @@ use self::icon::Tone;
 use crate::clash::ClashClient;
 use crate::client::DaemonClient;
 use crate::i18n::{self, fl};
-use crate::protocol::{ClashApi, Component, CoreState, Request, Status};
+use crate::protocol::{ClashApi, Component, ContainerAction, CoreState, Request, Status};
 use crate::util::error_chain;
 
 /// Owned on the session bus while a tray runs, so that starting a second
@@ -225,6 +225,7 @@ enum Op {
     Profile,
     Update,
     Mode,
+    Container,
 }
 
 impl Op {
@@ -237,6 +238,7 @@ impl Op {
             Op::Profile => "profile",
             Op::Update => "update",
             Op::Mode => "mode",
+            Op::Container => "container",
         }
     }
 
@@ -248,6 +250,7 @@ impl Op {
             Op::Profile => fl!("busy-switching-profile"),
             Op::Update => fl!("busy-updating-profiles"),
             Op::Mode => fl!("busy-switching-mode"),
+            Op::Container => fl!("tray-busy-container"),
         }
     }
 }
@@ -258,6 +261,17 @@ struct View {
     link: Link,
     profiles: Vec<Choice>,
     mode: Option<Mode>,
+    containers: Vec<TrayContainer>,
+}
+
+/// A container in the menu.
+#[derive(Clone, Debug, PartialEq)]
+struct TrayContainer {
+    id: String,
+    name: String,
+    state: CoreState,
+    /// It has a root filesystem and can be started.
+    ready: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -385,10 +399,31 @@ async fn fetch(client: &DaemonClient, clash: &mut Option<(ClashApi, ClashClient)
             None
         }
     };
+    // Only daemons that know containers and have some are asked for them.
+    let containers = match status.containers {
+        Some(summary) if summary.total > 0 => client
+            .containers()
+            .await
+            .map(|overview| {
+                overview
+                    .containers
+                    .into_iter()
+                    .map(|c| TrayContainer {
+                        ready: c.spec.as_ref().is_some_and(|s| s.installed),
+                        id: c.id,
+                        name: c.name,
+                        state: c.state,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     View {
         link: Link::Up(Box::new(Core::new(&status))),
         profiles,
         mode,
+        containers,
     }
 }
 
@@ -495,6 +530,21 @@ impl BoardTray {
         if let Some(mode) = &self.view.mode {
             lines.push(detail(fl!("tray-label-mode"), mode.current.clone()));
         }
+        let containers = &self.view.containers;
+        if !containers.is_empty() {
+            let running = containers
+                .iter()
+                .filter(|c| c.state == CoreState::Running)
+                .count();
+            lines.push(detail(
+                fl!("ctl-label-containers"),
+                fl!(
+                    "ctl-containers-summary",
+                    running = running,
+                    total = containers.len()
+                ),
+            ));
+        }
         if matches!(core.state, CoreState::Backoff | CoreState::Failed)
             && let Some(exit) = &core.last_exit
         {
@@ -573,6 +623,65 @@ impl BoardTray {
             ..Default::default()
         }
         .into()
+    }
+
+    /// One checkbox per container: checked while it runs, a click starts
+    /// or stops it.
+    fn container_menu(&self, idle: bool) -> Option<MenuItem<Self>> {
+        let containers = &self.view.containers;
+        if containers.is_empty() {
+            return None;
+        }
+        let running = containers
+            .iter()
+            .filter(|c| c.state == CoreState::Running)
+            .count();
+        let submenu = containers
+            .iter()
+            .map(|c| {
+                let id = c.id.clone();
+                let on = c.state == CoreState::Running;
+                let settled = matches!(
+                    c.state,
+                    CoreState::Running | CoreState::Stopped | CoreState::Failed
+                );
+                CheckmarkItem {
+                    label: mnemonic_free(&c.name),
+                    checked: on,
+                    enabled: idle && settled && (on || c.ready),
+                    activate: Box::new(move |tray: &mut Self| {
+                        let action = if on {
+                            ContainerAction::Stop
+                        } else {
+                            ContainerAction::Start
+                        };
+                        let request = Request::ContainerControl {
+                            id: id.clone(),
+                            action,
+                        };
+                        tray.start(Op::Container, Job::Daemon(request));
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        Some(
+            SubMenu {
+                label: mnemonic_free(&detail(
+                    fl!("ctl-label-containers"),
+                    fl!(
+                        "ctl-containers-summary",
+                        running = running,
+                        total = containers.len()
+                    ),
+                )),
+                icon_name: "utilities-system-monitor".into(),
+                submenu,
+                ..Default::default()
+            }
+            .into(),
+        )
     }
 
     fn mode_menu(&self, idle: bool) -> Option<MenuItem<Self>> {
@@ -714,6 +823,7 @@ impl ksni::Tray for BoardTray {
                 self.profile_menu(idle),
             ]);
             items.extend(self.mode_menu(idle));
+            items.extend(self.container_menu(idle));
             items.push(MenuItem::Separator);
         }
         items.push(
@@ -817,6 +927,53 @@ mod tests {
         assert_eq!(tray(core(CoreState::Running)).details().len(), 2);
         let down = tray(Link::Down("no socket".into()));
         assert_eq!(down.details(), vec!["no socket".to_owned()]);
+    }
+
+    #[test]
+    fn containers_toggle_from_the_menu() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tray = tray(core(CoreState::Running));
+        tray.actions = tx;
+        assert!(tray.container_menu(true).is_none());
+        tray.view.containers = vec![
+            TrayContainer {
+                id: "aa".into(),
+                name: "dev_box".into(),
+                state: CoreState::Running,
+                ready: true,
+            },
+            TrayContainer {
+                id: "bb".into(),
+                name: "web".into(),
+                state: CoreState::Stopped,
+                ready: false,
+            },
+        ];
+        let Some(MenuItem::SubMenu(menu)) = tray.container_menu(true) else {
+            panic!("no container menu");
+        };
+        assert!(menu.label.contains("1"));
+        let MenuItem::Checkmark(first) = &menu.submenu[0] else {
+            panic!("not a checkbox");
+        };
+        assert!(first.checked && first.enabled);
+        assert_eq!(first.label, "dev__box");
+        let MenuItem::Checkmark(second) = &menu.submenu[1] else {
+            panic!("not a checkbox");
+        };
+        assert!(!second.enabled, "no root filesystem yet");
+        (first.activate)(&mut tray);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Action::Run(
+                Op::Container,
+                Job::Daemon(Request::ContainerControl {
+                    action: ContainerAction::Stop,
+                    ..
+                })
+            ))
+        ));
+        assert_eq!(tray.details().len(), 3);
     }
 
     #[test]

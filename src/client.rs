@@ -10,8 +10,8 @@ use tokio::net::UnixStream;
 
 use crate::i18n::{self, fl};
 use crate::protocol::{
-    CoreReleasePage, CoreSource, Envelope, LogEntry, Profile, ProfileList, Request, Response,
-    Status, StoredCore, UpdateInfo,
+    Container, ContainerOverview, CoreReleasePage, CoreSource, Envelope, ExecResult, ImageList,
+    LogEntry, Profile, ProfileList, Request, Response, Status, StoredCore, UpdateInfo,
 };
 
 #[derive(Debug, Clone)]
@@ -162,6 +162,54 @@ impl DaemonClient {
         }
     }
 
+    pub async fn containers(&self) -> Result<ContainerOverview> {
+        match self.call(Request::ContainerList).await? {
+            Response::Containers(overview) => Ok(*overview),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// A container and its configuration.
+    pub async fn container(&self, id: &str) -> Result<(Container, String)> {
+        let request = Request::ContainerGet { id: id.to_owned() };
+        match self.call(request).await? {
+            Response::ContainerContent { container, content } => Ok((*container, content)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// `container_add` or `container_save`: the container and a message.
+    pub async fn container_saved(&self, request: Request) -> Result<(Container, String)> {
+        match self.call(request).await? {
+            Response::ContainerSaved { container, message } => Ok((*container, message)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn container_exec(
+        &self,
+        id: &str,
+        command: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<ExecResult> {
+        let request = Request::ContainerExec {
+            id: id.to_owned(),
+            command,
+            timeout,
+        };
+        match self.call(request).await? {
+            Response::ContainerExec(result) => Ok(result),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn container_images(&self, refresh: bool) -> Result<ImageList> {
+        match self.call(Request::ContainerImages { refresh }).await? {
+            Response::ContainerImages(list) => Ok(list),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     pub async fn logs(&self, tail: usize, follow: bool) -> Result<LogStream> {
         Ok(LogStream {
             reader: self.open(&Request::Logs { tail, follow }).await?,
@@ -223,6 +271,21 @@ fn timeout_for(request: &Request) -> Duration {
         Request::ProfileAdd { .. } | Request::ProfileSave { .. } => 180,
         Request::ProfileUpdate { .. } => 15 * 60,
         Request::Start | Request::Restart | Request::Stop => 120,
+        // Installing a root filesystem downloads and unpacks hundreds of MiB.
+        Request::ContainerInstall { .. } => 3 * 60 * 60,
+        // Starting may download the runtime first; deleting a root
+        // filesystem may take a while.
+        Request::ContainerControl { .. }
+        | Request::ContainerRemove { .. }
+        | Request::ContainerRuntimeUpdate { .. }
+        | Request::ContainerRuntimeImport { .. } => 30 * 60,
+        Request::ContainerExec { timeout, .. } => timeout.unwrap_or(60).clamp(1, 3600) + 30,
+        Request::ContainerAdd { .. }
+        | Request::ContainerSave { .. }
+        | Request::ContainerAdopt { .. } => 180,
+        // The first check may download the runtime.
+        Request::ContainerCheck => 10 * 60,
+        Request::ContainerImages { .. } | Request::ContainerScan => 90,
         _ => 60,
     })
 }

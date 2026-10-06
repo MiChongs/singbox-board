@@ -93,10 +93,15 @@ pub struct Connection {
     pub download: u64,
     #[serde(default)]
     pub start: String,
+    /// Outbounds from the final node back to the group the rule chose.
     #[serde(default)]
     pub chains: Vec<String>,
+    /// The matching rule: `final`, `rule_set=x => route(y)` in sing-box or
+    /// `RuleSet` with the details in `rule_payload` in Clash-style forks.
     #[serde(default)]
     pub rule: String,
+    #[serde(default, rename = "rulePayload")]
+    pub rule_payload: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -104,26 +109,108 @@ pub struct Connection {
 pub struct ConnectionMetadata {
     #[serde(default)]
     pub network: String,
+    /// `inbound type/inbound tag`, e.g. `mixed/mixed-in`.
+    #[serde(default, rename = "type")]
+    pub inbound: String,
+    #[serde(default, rename = "sourceIP")]
+    pub source_ip: String,
+    #[serde(default)]
+    pub source_port: String,
     #[serde(default, rename = "destinationIP")]
     pub destination_ip: String,
     #[serde(default)]
     pub destination_port: String,
     #[serde(default)]
     pub host: String,
+    /// Domain found by sniffing when the client connected to an address.
+    #[serde(default)]
+    pub sniff_host: String,
+    /// `path (user)`, a package name or a user id.
+    #[serde(default)]
+    pub process_path: String,
+}
+
+/// `host:port`, with brackets around IPv6 addresses.
+fn host_port(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 impl Connection {
+    /// The domain the client asked for, else the sniffed one, else the address.
+    pub fn host(&self) -> &str {
+        let m = &self.metadata;
+        [&m.host, &m.sniff_host, &m.destination_ip]
+            .into_iter()
+            .find(|h| !h.is_empty())
+            .map_or("", String::as_str)
+    }
+
+    /// Whether [`Self::host`] is a domain rather than an address.
+    pub fn has_domain(&self) -> bool {
+        !self.metadata.host.is_empty() || !self.metadata.sniff_host.is_empty()
+    }
+
     pub fn target(&self) -> String {
-        let host = if self.metadata.host.is_empty() {
-            &self.metadata.destination_ip
-        } else {
-            &self.metadata.host
-        };
-        if host.contains(':') {
-            format!("[{host}]:{}", self.metadata.destination_port)
-        } else {
-            format!("{host}:{}", self.metadata.destination_port)
+        host_port(self.host(), &self.metadata.destination_port)
+    }
+
+    /// The resolved destination address, when known.
+    pub fn address(&self) -> Option<String> {
+        let m = &self.metadata;
+        (!m.destination_ip.is_empty()).then(|| host_port(&m.destination_ip, &m.destination_port))
+    }
+
+    pub fn source(&self) -> Option<String> {
+        let m = &self.metadata;
+        (!m.source_ip.is_empty()).then(|| host_port(&m.source_ip, &m.source_port))
+    }
+
+    /// Executable path (or package name) and user of the client process.
+    pub fn process(&self) -> Option<(&str, Option<&str>)> {
+        let path = self.metadata.process_path.trim();
+        if path.is_empty() {
+            return None;
         }
+        match path.rsplit_once(" (") {
+            Some((path, user)) if user.ends_with(')') => {
+                Some((path, Some(user.trim_end_matches(')'))))
+            }
+            _ => Some((path, None)),
+        }
+    }
+
+    /// File name of the client process, e.g. `curl` for `/usr/bin/curl (me)`.
+    pub fn process_name(&self) -> Option<&str> {
+        self.process()
+            .map(|(path, _)| path.rsplit('/').next().unwrap_or(path))
+    }
+
+    /// The outbound that carries the traffic: the last link of the chain.
+    pub fn outbound(&self) -> Option<&str> {
+        self.chains.first().map(String::as_str)
+    }
+
+    /// The rule without its action, with the payload of Clash-style forks:
+    /// `rule_set=geosite-cn` or `RuleSet(ai)`.
+    pub fn rule_label(&self) -> String {
+        let rule = self
+            .rule
+            .split_once(" => ")
+            .map_or(self.rule.as_str(), |(rule, _)| rule);
+        if self.rule_payload.is_empty() {
+            rule.to_owned()
+        } else {
+            format!("{rule}({})", self.rule_payload)
+        }
+    }
+
+    /// What the rule did, e.g. `route(proxy)`; sing-box only.
+    pub fn rule_action(&self) -> Option<&str> {
+        self.rule.split_once(" => ").map(|(_, action)| action)
     }
 }
 
@@ -302,5 +389,40 @@ mod tests {
         let first = &connections.connections.unwrap()[0];
         assert_eq!(first.target(), "example.com:443");
         assert_eq!(first.chains, ["direct"]);
+        assert_eq!(first.metadata.inbound, "mixed/mixed-in");
+        assert_eq!(first.source().as_deref(), Some("127.0.0.1:5000"));
+        assert_eq!(first.address(), None);
+        assert_eq!(first.process(), None);
+        assert_eq!(first.rule_label(), "final");
+    }
+
+    #[test]
+    fn connection_details() {
+        let json = r#"{"id":"y","metadata":{"network":"tcp","type":"redirect/tun-in",
+            "sourceIP":"192.168.1.2","sourcePort":"5000","destinationIP":"2001:db8::1",
+            "destinationPort":"443","host":"","sniffHost":"api.example.com",
+            "processPath":"/opt/google/chrome/chrome (alice)"},"upload":1,"download":2,
+            "start":"2026-10-05T00:00:00Z","chains":["node","auto","proxy"],
+            "rule":"RuleSet","rulePayload":"ai"}"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.target(), "api.example.com:443");
+        assert!(c.has_domain());
+        assert_eq!(c.address().as_deref(), Some("[2001:db8::1]:443"));
+        assert_eq!(
+            c.process(),
+            Some(("/opt/google/chrome/chrome", Some("alice")))
+        );
+        assert_eq!(c.process_name(), Some("chrome"));
+        assert_eq!(c.outbound(), Some("node"));
+        assert_eq!(c.rule_label(), "RuleSet(ai)");
+        assert_eq!(c.rule_action(), None);
+
+        let c = Connection {
+            rule: "rule_set=geosite-cn => route(direct)".to_owned(),
+            ..Connection::default()
+        };
+        assert_eq!(c.rule_label(), "rule_set=geosite-cn");
+        assert_eq!(c.rule_action(), Some("route(direct)"));
+        assert!(!c.has_domain());
     }
 }

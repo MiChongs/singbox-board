@@ -3,6 +3,8 @@
 mod app;
 mod buffer;
 mod code;
+mod connections;
+mod containers;
 mod core;
 mod editor;
 mod jsonc;
@@ -11,6 +13,7 @@ mod profiles;
 mod tasks;
 mod templates;
 mod theme;
+mod toml_editor;
 mod ui;
 
 use std::io::Write;
@@ -26,8 +29,15 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use self::app::App;
+use self::containers::ShellCommand;
 use crate::client::DaemonClient;
-use crate::protocol::Profile;
+use crate::protocol::{Container, Profile};
+
+/// What a session opens with besides the dashboard.
+enum Edit {
+    Profile(Profile, String, bool),
+    Container(Box<Container>, String, bool),
+}
 
 pub async fn run(client: DaemonClient) -> Result<()> {
     session(client, None).await.map(drop)
@@ -41,13 +51,24 @@ pub async fn edit(
     content: String,
     force: bool,
 ) -> Result<Option<String>> {
-    session(client, Some((profile, content, force))).await
+    session(client, Some(Edit::Profile(profile, content, force))).await
 }
 
-async fn session(
+/// Opens one container's configuration in the editor; like [`edit`].
+pub async fn edit_container(
     client: DaemonClient,
-    edit: Option<(Profile, String, bool)>,
+    container: Container,
+    content: String,
+    force: bool,
 ) -> Result<Option<String>> {
+    session(
+        client,
+        Some(Edit::Container(Box::new(container), content, force)),
+    )
+    .await
+}
+
+async fn session(client: DaemonClient, edit: Option<Edit>) -> Result<Option<String>> {
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     let mut mouse = false;
@@ -61,13 +82,17 @@ async fn session(
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     client: DaemonClient,
-    edit: Option<(Profile, String, bool)>,
+    edit: Option<Edit>,
     mouse: &mut bool,
 ) -> Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (mut app, mut background) = App::new(client, tx);
-    if let Some((profile, content, force)) = edit {
-        app.start_editing(profile, &content, force);
+    match edit {
+        Some(Edit::Profile(profile, content, force)) => app.start_editing(profile, &content, force),
+        Some(Edit::Container(container, content, force)) => {
+            app.start_editing_container(*container, &content, force)
+        }
+        None => {}
     }
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -100,8 +125,15 @@ async fn event_loop(
             // The old stream would keep reading keys meant for the editor.
             events = EventStream::new();
             set_mouse(mouse, false);
-            let result = run_editor(terminal, &edit.text, &edit.name)?;
+            let extension = if edit.container { "toml" } else { "json" };
+            let result = run_editor(terminal, &edit.text, &edit.name, extension)?;
             app.external_edit_done(edit, result);
+        }
+        if let Some(shell) = app.take_shell() {
+            events = EventStream::new();
+            set_mouse(mouse, false);
+            let result = run_shell(terminal, &shell)?;
+            app.shell_done(shell, result);
         }
     }
     background.abort_all();
@@ -134,10 +166,63 @@ fn run_editor(
     terminal: &mut ratatui::DefaultTerminal,
     text: &str,
     name: &str,
+    extension: &str,
 ) -> Result<anyhow::Result<String>> {
     let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
-    let result = tokio::task::block_in_place(|| crate::util::edit_text(text, name));
+    let result = tokio::task::block_in_place(|| crate::util::edit_text_as(text, name, extension));
+    take_back(terminal)?;
+    Ok(result)
+}
+
+/// Hands the terminal to a shell in a container (or to sudo asking for a
+/// password first) and takes it back when it exits.
+fn run_shell(
+    terminal: &mut ratatui::DefaultTerminal,
+    shell: &ShellCommand,
+) -> Result<anyhow::Result<std::process::ExitStatus>> {
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    println!(
+        "{}",
+        crate::i18n::fl!("tui-container-shell-entering", name = shell.name.clone())
+    );
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    use std::os::unix::process::CommandExt;
+    // Like system(3): Ctrl-C at sudo's prompt is for the child, not for
+    // the dashboard waiting behind it.
+    // SAFETY: changing signal dispositions; the child resets them before exec.
+    let previous = unsafe {
+        [Signal::SIGINT, Signal::SIGQUIT].map(|sig| (sig, signal(sig, SigHandler::SigIgn)))
+    };
+    let mut command = Command::new(&shell.program);
+    command
+        .args(&shell.args)
+        .envs(shell.env.iter().map(|(k, v)| (k, v)));
+    // SAFETY: signal(2) is async-signal-safe and touches no shared state.
+    unsafe {
+        command.pre_exec(|| {
+            for sig in [Signal::SIGINT, Signal::SIGQUIT] {
+                signal(sig, SigHandler::SigDfl).map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+    let result = tokio::task::block_in_place(|| command.status()).map_err(|err| {
+        anyhow::Error::new(err).context(crate::i18n::fl!("err-spawn", path = shell.program.clone()))
+    });
+    for (sig, handler) in previous {
+        if let Ok(handler) = handler {
+            // SAFETY: restoring the disposition saved above.
+            let _ = unsafe { signal(sig, handler) };
+        }
+    }
+    take_back(terminal)?;
+    Ok(result)
+}
+
+/// Re-enters the alternate screen after another program used the terminal.
+fn take_back(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     enable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
@@ -149,7 +234,7 @@ fn run_editor(
     // same but asks the terminal for the cursor position, which not every
     // terminal answers.
     *terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
-    Ok(result)
+    Ok(())
 }
 
 /// Sets the system clipboard through the terminal (OSC 52), which works in

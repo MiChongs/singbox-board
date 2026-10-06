@@ -6,9 +6,10 @@
 - **核心版本管理**：内置 MiChongs（xiaobaf14g）与 SagerNet 官方两个发布源，可添加任意 GitHub 源或导入自编译核心。可列出某个源的全部版本及本机可用的构建变体（ebpf、easytier、glibc、musl 等），一键下载、校验、切换或回退，多个版本并存，切换瞬间完成，启动失败会自动回滚。
 - **配置管理**：多份 sing-box 配置并存，可从文件或订阅地址导入（订阅按间隔自动更新，并显示服务商返回的流量与到期时间），也可用模板新建。切换前先用 sing-box 校验，启动失败自动回滚；内置全屏编辑器：语法高亮、输入时校验并标出错误位置、查找替换、按行号或 JSON 路径跳转，sing-box 校验失败时直接跳到出错的字段，并可随时切换到带模板的树形视图。
 - **可选组件**：[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理，带 Web 界面）与 [http-meta](https://github.com/xream/http-meta)（按需启动 mihomo 供 Sub-Store 脚本检测节点）。首次运行时会询问是否需要，选择后由守护进程下载、校验、以非特权用户运行并托管。
-- **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，Wayland 与 X11 下均可使用。
-- **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置。
-- **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component / core / profile`，便于脚本调用。
+- **容器**：接入 [kurumi-containerd](https://github.com/Tools-cx-app/kurumi-containerd)（轻量 Linux 系统容器运行时）。守护进程自动下载并校验运行时，可从 Debian、Ubuntu、Alpine、Arch 等发行版镜像一键创建容器，启停、进入终端、执行命令、编辑 TOML 配置（保存前由 kurumi-containerd 严格校验），实时显示每个容器的 CPU、内存与进程数；容器在守护进程重启后继续运行，开机可自动启动。
+- **系统托盘**：`singbox-board tray` 在 KDE Plasma、GNOME（AppIndicator 扩展）、Waybar 等桌面托盘中显示 sing-box 状态，可启停 sing-box、切换配置与 Clash 模式，并可启停容器，Wayland 与 X11 下均可使用。
+- **TUI 面板**：通过 Unix socket 连接守护进程，通过 Clash API 连接 sing-box，可查看状态、流量、代理组、连接、日志，以及 Sub-Store 订阅和对应的 sing-box 订阅链接；在「配置」页管理和编辑配置，在「容器」页管理容器。
+- **命令行**：`status / start / stop / restart / reload / check / logs / update / setup / component / core / profile / container`，便于脚本调用。
 
 ```
             ┌──────────────── singbox-board daemon (root) ─────────────────┐
@@ -17,8 +18,11 @@
             │   components ── spawn ──► node sub-store.bundle.js   (nobody)  │
             │                └ spawn ──► node http-meta.bundle.js  (nobody)  │
             │                              └► mihomo (按需)                   │
+            │   containers ── exec ──► kurumi-containerd start|stop|install|run│
+            │                └► 容器监控进程（systemd scope，machine.slice）  │
             │   log ring  ◄── 各子进程 stdout/stderr                          │
             │   updater   ──► GitHub Releases（sha256 校验）/ nodejs.org      │
+            │             ──► 根文件系统镜像（images.linuxcontainers.org）    │
             └──────────────────────────────────────────────────────────────┘
  TUI ── HTTP ──► Clash API (experimental.clash_api)
  TUI ── HTTP ──► Sub-Store API (127.0.0.1:3001/<密钥路径>)
@@ -123,6 +127,13 @@ singbox-board profile edit 家里               # 在内置编辑器中编辑（
 singbox-board setup                         # 选择可选组件
 singbox-board component sub-store           # 状态、Web 地址、订阅的 sing-box 链接
 singbox-board component http-meta update    # start|stop|restart|enable|disable|update
+singbox-board container                     # 列出容器（别名 ct）
+sudo singbox-board container new 开发机 --image debian/trixie --start   # 新建、安装镜像并启动
+singbox-board container images              # 本机架构可用的根文件系统镜像
+sudo singbox-board container enter 开发机    # 在容器中打开终端
+sudo singbox-board container exec 开发机 -- apt update   # 执行命令（不经过 shell）
+singbox-board container stop 开发机          # start|stop|restart；show 查看详情
+sudo singbox-board container edit 开发机     # 在内置编辑器中编辑 TOML 配置
 ```
 
 `systemctl reload singbox-board` 与 `singbox-board reload` 等价。
@@ -146,7 +157,7 @@ SINGBOX_BOARD_LANG=en singbox-board
 
 | 按键 | 功能 |
 |---|---|
-| `1`-`7` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store / Core / 配置 |
+| `1`-`8` / `Tab` | 切换：概览 / 代理 / 连接 / 日志 / Sub-Store / Core / 配置 / 容器 |
 | `s` `x` `r` | 启动 / 停止 / 重启 sing-box（停止和重启需要确认） |
 | `R` | 校验配置并热重载 |
 | `c` | 运行 `sing-box check` |
@@ -154,7 +165,8 @@ SINGBOX_BOARD_LANG=en singbox-board
 | `m` | 切换 Clash 模式 |
 | 代理页 `←→` `Enter` | 在组与节点间切换焦点 / 选择节点（Selector、URLTest、Smart） |
 | 代理页 `t` / `T` | 测试整组 / 单个节点的延迟 |
-| 连接页 `d` / `D` | 关闭选中 / 全部连接 |
+| 连接页 `Enter` `/` `o` `O` `p` | 显示或隐藏详情 / 即时筛选（`Esc` 清除）/ 切换排序（最新、速度、流量、目标）/ 反转顺序 / 暂停刷新 |
+| 连接页 `y` `d` `D` | 复制目标地址 / 关闭选中连接 / 关闭全部连接（筛选时为匹配的连接） |
 | 日志页 `↑↓` `PgUp/PgDn` `End` | 滚动；按 `End` 恢复跟随 |
 | Sub-Store 页 `←→` `Enter` | 在组件与订阅间切换焦点 / 组件操作菜单（启动、停止、更新、启用、禁用）或 provider 配置片段 |
 | Sub-Store 页 `y` `w` `p` | 复制 sing-box 订阅链接 / 复制 Web 界面地址 / 显示 provider 配置片段 |
@@ -163,6 +175,11 @@ SINGBOX_BOARD_LANG=en singbox-board
 | 配置页 `Enter` | 操作菜单：使用、编辑、更新、重命名、订阅地址与更新间隔、复制、校验、导出、删除 |
 | 配置页 `e` `E` `n` `i` | 内置编辑器 / 用 `$EDITOR` 编辑（设置了 `$VISUAL` 或 `$EDITOR` 时）/ 用模板新建 / 导入文件或订阅地址（支持粘贴） |
 | 配置页 `f` `F` `d` `A` | 更新所选订阅 / 更新全部订阅 / 删除 / 将当前配置文件收入配置库 |
+| 容器页 `Enter` `n` | 操作菜单 / 新建容器（输入名称，选择网络，再从镜像列表选择根文件系统） |
+| 容器页 `t` `o` `!` | 启动或停止 / 打开终端（非 root 时通过 sudo）/ 执行命令并查看输出 |
+| 容器页 `e` `E` `i` | 在内置编辑器中编辑 TOML 配置 / 用 `$EDITOR` 编辑 / 安装或替换根文件系统 |
+| 容器页 `a` `d` `y` | 开机自动启动开关 / 删除（可选是否同时删除文件）/ 复制根文件系统路径 |
+| 容器页 `C` `U` `A` `f` | 检查主机能力 / 安装或更新 kurumi-containerd / 登记 root 已有的 kurumi-containerd 容器 / 刷新 |
 | `?` / `q` | 帮助 / 退出 |
 
 ### 系统托盘
@@ -177,7 +194,7 @@ SINGBOX_BOARD_LANG=en singbox-board
 | Sway、Hyprland、niri 等 | 使用带托盘模块的状态栏，例如 Waybar |
 
 - **图标**：绿色表示运行中，橙色表示正在启动、停止或有操作在进行，灰色表示已停止，红色表示运行失败或无法连接守护进程。悬停提示显示当前配置、内核版本、Clash 模式与失败原因。
-- **菜单**：启动、停止、重启 sing-box；切换配置、更新全部订阅配置；切换 Clash 模式（需启用 Clash API）；打开终端管理面板（左键单击图标效果相同）；打开 Sub-Store Web 界面；登录时启动；退出。
+- **菜单**：启动、停止、重启 sing-box；切换配置、更新全部订阅配置；切换 Clash 模式（需启用 Clash API）；在「容器」子菜单中勾选即可启动或停止容器；打开终端管理面板（左键单击图标效果相同）；打开 Sub-Store Web 界面；登录时启动；退出。
 - **通知**：操作结果、失败原因以及 sing-box 意外退出会以桌面通知提示。
 - **终端**：打开管理面板时依次尝试 `xdg-terminal-exec`、`$TERMINAL`、当前桌面自带的终端（Konsole、Ptyxis、GNOME 控制台等）及其他常见终端。
 - **登录启动**：勾选「登录时启动」会写入 `~/.config/autostart/singbox-board.desktop`。安装包与一键安装脚本还会在应用菜单中添加「singbox-board」入口。
@@ -327,6 +344,69 @@ Sub-Store 可以把任意订阅或组合订阅转换为 sing-box 格式，地址
 
 sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检测流量也会被 TUN 接管。如果希望节点检测直连，可以在 TUN 入站中排除组件用户（默认 `nobody`，uid 65534）：`"exclude_uid": [65534]`；也可以添加路由规则 `{"process_path": ["/var/lib/singbox-board/http-meta/meta/http-meta"], "outbound": "direct"}`。
 
+## 容器（kurumi-containerd）
+
+[kurumi-containerd](https://github.com/Tools-cx-app/kurumi-containerd) 是用 Rust 编写的特权 Linux 系统容器运行时：mount、PID、UTS、IPC 与可选的网络命名空间，cgroup v1/v2 资源限制，绑定挂载与易失 OverlayFS，以及按 init 类型（systemd、OpenRC、runit 等）正确关机。singbox-board 把它完整接入守护进程、命令行、TUI 与托盘：
+
+- **运行时**：首次需要时，守护进程从 `Tools-cx-app/kurumi-containerd` 的 Release 下载适合本机的构建（x86_64、aarch64 为静态 musl 构建，armv7、riscv64 为 glibc 构建），用 `SHA256SUMS` 与 GitHub 摘要校验，确认 `--version` 可运行后原子替换。也可以用 `container runtime update` 主动安装或更新，用 `container runtime import` 导入自编译构建，或在 `daemon.toml` 中用 `containers.runtime` 指定系统已安装的程序。更新运行时不影响正在运行的容器。
+- **独立进程**：kurumi-containerd 会 fork 监控进程，并要求调用方是单线程进程，因此守护进程不链接它的库，而是始终调用官方程序（也不受其 GPL-3.0 许可证影响）。每个操作都会把输出与错误原因转交给客户端，诊断信息汇入日志面板（标记为 `kurumi`）。
+- **实时状态**：容器的运行状态、CPU 负载、常驻内存与进程数由守护进程直接从 kurumi-containerd 的状态文件和 procfs 读取，并像运行时本身一样校验进程身份（启动 ID、init 与监控进程的启动时间、PID 命名空间以及容器内的身份标记），不会被复用的 PID 误导。
+
+### 快速开始
+
+```bash
+sudo singbox-board container new 开发机 --image debian/trixie --start
+sudo singbox-board container enter 开发机
+```
+
+这会用模板生成配置，从镜像服务器下载 `rootfs.tar.xz` 并按其 `SHA256SUMS` 校验，交给 kurumi-containerd 安装，然后在后台启动。在 TUI 的「容器」页按 `n` 可完成同样的流程：输入名称，选择网络，再从镜像列表中选择发行版。
+
+### 目录与配置
+
+所有数据位于 `<components.data_dir>/containers/`（默认 `/var/lib/singbox-board/containers/`，仅 root 可访问）：
+
+| 路径 | 内容 |
+|---|---|
+| `registry.json` | 登记的容器：名称、配置文件位置、是否开机启动 |
+| `<ID>/container.toml`、`<ID>/rootfs/` | 由面板新建的容器的配置与根文件系统 |
+| `.kurumi-containerd/config.json` | 根据登记表生成的 kurumi-containerd 配置索引，以容器 ID 为条目名 |
+| `runtime/kurumi-containerd`、`runtime/meta.json` | 下载的运行时及其版本与校验信息 |
+
+容器配置就是 kurumi-containerd 的 TOML（[配置说明](https://github.com/Tools-cx-app/kurumi-containerd/blob/master/docs/configuration.md)）。模板带有注释，并预先写入 `uuid`，避免运行时首次使用时重写文件而丢失注释。已有的配置可以原地登记（`container add <文件> --link`，或用 `container adopt` 一次登记 root 的 `~/.kurumi-containerd/config.json` 中的全部容器），也可以保存一份副本（`container add <文件>`）。
+
+内置编辑器（`container edit` 或容器页的 `e`）提供 TOML 语法高亮、输入时校验（语法以及每份配置必需的项目）、撤销、注释切换与鼠标操作。根文件系统安装后，每次保存前守护进程都会让 kurumi-containerd 按其严格的模式校验一份副本，不接受时显示运行时给出的原因并跳到出错的行，可以选择继续编辑或强制保存。容器运行时修改配置，重启后生效。
+
+### 根文件系统
+
+`container install <容器> <来源>` 接受三种来源：
+
+- **镜像**：`debian/trixie`、`alpine/3.22` 之类，来自 `containers.image_server`（默认 images.linuxcontainers.org，国内可改用 `https://mirrors.tuna.tsinghua.edu.cn/lxc-images`）。`container images` 列出本机架构可用的镜像，下载后按镜像目录中的 `SHA256SUMS` 校验。
+- **网址**：http(s) 地址，可用 `--sha256` 指定校验值；未指定时会在日志中提示未经校验。
+- **本地压缩包**：tar、tar.gz、tar.xz、tar.zst 或 ZIP，由客户端解析为绝对路径。
+
+下载过程中容器列表显示进度。使用 ext4 镜像（`rootfs_image`）的容器需要用 `--size 8G` 指定大小；已有根文件系统时需要 `--force` 才会替换。kurumi-containerd 只把根文件系统安装到 root 所有、仅 root 可写的目录中，且上级目录不能被其他用户写入（带粘滞位的目录除外）；不满足时守护进程会在下载前说明是哪一个目录。
+
+### 网络与 sing-box
+
+- `host`（模板默认）：容器与主机共用网络，sing-box 的 TUN 与 `auto_route` 同样接管容器的流量。
+- `nat`：容器在网桥 `kurumi-br0` 后获得独立地址，模板会为每个新容器分配一个未被占用的地址（`172.28.0.2`、`172.28.0.3` 等），可用 `network_options.ports` 发布端口。转发流量在 TUN 开启时也会进入 sing-box。
+- `none`：只有回环接口。
+- `gateway` / `dhcp`：接入已有网桥，在配置中填写 `network_options.gateway_bridge`。
+
+发行版镜像通常默认在 `eth0` 上运行 DHCP 客户端，使用 `host` 网络前请确认容器内的网络服务不会改动主机网卡，必要时改用 `nat` 或 `none`。
+
+### 生命周期
+
+- 在 systemd 系统上，每次启动都放在 `machine.slice` 中独立的临时 scope（`singbox-board-container-<ID>-*.scope`）里，关机时排在守护进程服务之后停止。因此停止、重启或升级 singbox-board 都不会中断容器，而系统关机时守护进程会先按各自的 init 类型正常关闭容器。OpenRC 下监控进程本身就与服务脱离，效果相同。
+- `containers.stop_on_shutdown = true` 时，守护进程停止的同时也停止全部容器。
+- 设置为开机启动的容器（`container autostart <容器> on` 或容器页的 `a`）在每次开机后守护进程首次启动时启动一次；同一次开机内重启守护进程不会再次启动被手动停止的容器。
+- 以前台模式配置的容器（`container.foreground = true`）只能直接用 kurumi-containerd 运行，守护进程会拒绝启动并说明原因。
+- kurumi-containerd 0.2.3 会把 Alpine 等使用 busybox init 且装有 OpenRC 的系统识别为 OpenRC 并发送 `SIGPWR`，而 busybox init 不处理该信号，所以停止这类容器要等满 `runtime.stop_timeout_seconds`（默认 15 秒）后才会强制结束。
+
+### 权限
+
+启动、停止与查看容器对所有可连接守护进程的用户开放，与启停 sing-box 一致。新建、导入、编辑、删除容器，安装根文件系统，在容器中执行命令，以及导入运行时都决定了以 root 身份运行的内容，只允许 root（例如 `sudo singbox-board`）。以普通用户打开的 TUI 会在容器页提示这一点，打开终端时会通过 `sudo singbox-board container enter` 切换到 root。
+
 ## 配置
 
 完整的带注释配置见 [`contrib/daemon.toml`](contrib/daemon.toml)，也可以用 `singbox-board daemon --print-default-config` 输出。常用项：
@@ -349,6 +429,10 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 | `sub_store.env.SUB_STORE_CORS_ALLOWED_ORIGINS` | Sub-Store 允许的跨域来源。默认在上游列表之外自动加入前端自身的地址（按 `host`/`port` 推出）；通过域名或反向代理访问 Web 界面时需在此补上对应来源，否则保存会返回 `403 CORS origin not allowed` |
 | `http_meta.host` / `http_meta.port` / `authorization` | http-meta 监听地址（默认 `127.0.0.1:9876`）与访问凭据 |
 | `http_meta.mihomo_arch` | 指定 mihomo 构建，例如 `amd64-v3` |
+| `containers.runtime` / `containers.repo` | 指定 kurumi-containerd 程序路径 / 下载运行时的 GitHub 仓库（默认 `Tools-cx-app/kurumi-containerd`） |
+| `containers.image_server` | 根文件系统镜像服务器，默认 `https://images.linuxcontainers.org` |
+| `containers.autostart` / `containers.stop_on_shutdown` | 是否在开机后启动标记为开机启动的容器 / 守护进程停止时是否同时停止容器 |
+| `containers.systemd_scope` | 是否把容器放在独立的 systemd scope 中，使其不随守护进程服务停止 |
 
 ## 安全设计
 
@@ -358,6 +442,7 @@ sing-box 开启 TUN + `auto_route` 时，http-meta 启动的 mihomo 发出的检
 - sing-box 子进程运行在独立的进程组，并设置了 `PR_SET_PDEATHSIG`，守护进程退出后不会留下无人托管的 sing-box。
 - **`singbox-board` 组等同于 root**：组成员可以导入和编辑配置，而 sing-box 以 root 运行，配置能决定它读写哪些文件（例如 `log.output`、`external_ui`、本地规则集路径）。请只把可信用户加入该组。导入本地文件时由客户端以调用者自身的权限读取，守护进程不会替客户端读取任意路径。
 - 配置库目录仅 root 可访问，配置文件权限为 `0600`；订阅地址中的令牌不会写入日志。
+- 容器的配置、根文件系统与运行时目录仅 root 可访问。决定容器内以 root 身份运行内容的请求（新建、编辑、安装、执行命令、导入运行时）只接受 root；客户端以 root 身份打开容器终端前，会确认守护进程报告的运行时程序属于 root 且其他用户不可写。删除容器的文件前会确认其下没有仍处于挂载状态的路径，原地登记的配置文件永远不会被删除。
 
 ## 发布
 
@@ -392,4 +477,4 @@ singbox-board daemon -c ./dev.toml --allow-non-root
 SINGBOX_BOARD_SOCKET=/path/to/daemon.sock singbox-board
 ```
 
-控制协议为单连接单请求的 NDJSON，例如 `{"cmd":"status"}`、`{"cmd":"logs","tail":100,"follow":true}`、`{"cmd":"profile_list"}`，单行请求上限 16 MiB（配置内容随请求传输），定义见 `src/protocol.rs`。
+控制协议为单连接单请求的 NDJSON，例如 `{"cmd":"status"}`、`{"cmd":"logs","tail":100,"follow":true}`、`{"cmd":"profile_list"}`、`{"cmd":"container_control","id":"<ID>","action":"start"}`，单行请求上限 16 MiB（配置内容随请求传输），定义见 `src/protocol.rs`。
