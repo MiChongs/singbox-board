@@ -4,9 +4,14 @@
 //! foreground so the UI stays readable on light themes; colour carries
 //! meaning (state, accents) and highlights carry their own fg/bg pair.
 
+use ratatui::Frame;
+use ratatui::layout::{Margin, Offset, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding};
+use ratatui::widgets::{
+    Block, BorderType, LineGauge, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow,
+};
 
 use crate::protocol::CoreState;
 use crate::util::pad;
@@ -17,6 +22,8 @@ pub const DIM: Color = Color::Rgb(127, 132, 156);
 pub const BORDER: Color = Color::Rgb(88, 91, 112);
 pub const SURFACE: Color = Color::Rgb(49, 50, 68);
 pub const SURFACE2: Color = Color::Rgb(69, 71, 90);
+/// Background of the title and status bars.
+pub const MANTLE: Color = Color::Rgb(24, 24, 37);
 pub const CRUST: Color = Color::Rgb(17, 17, 27);
 pub const ACCENT: Color = Color::Rgb(203, 166, 247);
 pub const BLUE: Color = Color::Rgb(137, 180, 250);
@@ -69,6 +76,19 @@ pub fn state_pill(state: CoreState) -> Span<'static> {
     pill(state.label(), state_color(state))
 }
 
+/// The state as a coloured dot and word, for places where a pill would
+/// be too loud.
+pub fn state_dot(state: CoreState) -> Vec<Span<'static>> {
+    let color = state_color(state);
+    vec![
+        Span::styled("● ", Style::new().fg(color)),
+        Span::styled(
+            state.label(),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
 /// A key cap for hints: ` k `.
 pub fn key(text: &str) -> Span<'static> {
     Span::styled(
@@ -96,6 +116,118 @@ pub fn panel(title: &str, focused: bool) -> Block<'static> {
         .border_style(Style::new().fg(border))
         .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .padding(Padding::horizontal(1))
+}
+
+/// A small titled box, like the stats above the connections.
+pub fn card(title: impl Into<String>, color: Color) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(Span::styled(
+            format!(" {} ", title.into()),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(1))
+}
+
+/// The frame of a dialog: a coloured border, the title on a matching
+/// pill and a shadow that lifts it off the dimmed screen behind.
+pub fn dialog(title: &str, color: Color) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(color))
+        .title(Line::from(Span::styled(
+            format!(" {title} "),
+            Style::new()
+                .fg(CRUST)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .padding(Padding::horizontal(1))
+        .shadow(
+            Shadow::overlay()
+                .style(Style::new().fg(SURFACE2).bg(CRUST))
+                .offset(Offset::new(2, 1)),
+        )
+}
+
+/// `k text` pairs for the bottom border of a dialog.
+pub fn dialog_keys(keys: &[(&str, String)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, text)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(key(k));
+        spans.push(Span::styled(format!(" {text}"), Style::new().fg(SUBTEXT)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans).right_aligned()
+}
+
+/// Fades everything drawn so far, so that a dialog drawn next stands out.
+pub fn backdrop(frame: &mut Frame) {
+    for cell in &mut frame.buffer_mut().content {
+        cell.fg = match cell.fg {
+            Color::Rgb(r, g, b) => blend((r, g, b), (30, 30, 46), 0.62),
+            _ => BORDER,
+        };
+        if let Color::Rgb(r, g, b) = cell.bg {
+            cell.bg = blend((r, g, b), (17, 17, 27), 0.55);
+        }
+        cell.modifier.remove(Modifier::BOLD);
+    }
+}
+
+fn blend(from: (u8, u8, u8), to: (u8, u8, u8), amount: f32) -> Color {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount) as u8;
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+/// A thumb on the right border of the bordered `area` when `total` rows
+/// do not fit the `viewport` rows shown from `offset`.
+pub fn scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    (total, offset, viewport): (usize, usize, usize),
+    focused: bool,
+) {
+    if viewport == 0 || total <= viewport {
+        return;
+    }
+    let mut state = ScrollbarState::new(total - viewport + 1)
+        .position(offset)
+        .viewport_content_length(viewport);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("┃")
+            .thumb_style(Style::new().fg(if focused { ACCENT } else { DIM })),
+        area.inner(Margin::new(0, 1)),
+        &mut state,
+    );
+}
+
+/// A one-line gauge: `label ━━━━━━────`.
+pub fn meter(ratio: f64, color: Color, label: impl Into<Line<'static>>) -> LineGauge<'static> {
+    LineGauge::default()
+        .ratio(ratio.clamp(0.0, 1.0))
+        .label(label)
+        .filled_symbol(symbols::line::THICK_HORIZONTAL)
+        .unfilled_symbol(symbols::line::HORIZONTAL)
+        .filled_style(Style::new().fg(color))
+        .unfilled_style(Style::new().fg(SURFACE2))
+}
+
+/// Green while there is room, then yellow, then red.
+pub fn usage_color(ratio: f64) -> Color {
+    match ratio {
+        r if r >= 0.9 => RED,
+        r if r >= 0.7 => YELLOW,
+        _ => GREEN,
+    }
 }
 
 /// Highlight of the selected table/list row.
@@ -131,4 +263,31 @@ pub fn delay_color(ms: u32) -> Color {
         300..800 => YELLOW,
         _ => RED,
     }
+}
+
+/// Signal bars for a delay: four for a fast node, none for a timeout.
+pub fn signal(delay: Option<Result<u32, ()>>) -> Vec<Span<'static>> {
+    const BARS: [&str; 4] = ["▂", "▄", "▆", "█"];
+    let (lit, color) = match delay {
+        None => (0, DIM),
+        Some(Err(())) => (0, RED),
+        Some(Ok(ms)) => (
+            match ms {
+                0..150 => 4,
+                150..300 => 3,
+                300..800 => 2,
+                _ => 1,
+            },
+            delay_color(ms),
+        ),
+    };
+    BARS.iter()
+        .enumerate()
+        .map(|(i, bar)| {
+            Span::styled(
+                *bar,
+                Style::new().fg(if i < lit { color } else { SURFACE2 }),
+            )
+        })
+        .collect()
 }

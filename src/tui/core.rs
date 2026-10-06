@@ -723,11 +723,22 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
             ])
         })
         .collect();
+    let total = items.len() * 3;
     let list = List::new(items)
         .block(panel(&fl!("tui-panel-sources"), focused))
         .highlight_style(selected(focused))
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(list, area, &mut app.core.source_state);
+    theme::scrollbar(
+        frame,
+        area,
+        (
+            total,
+            app.core.source_state.offset() * 3,
+            usize::from(area.height.saturating_sub(2)),
+        ),
+        focused,
+    );
 }
 
 fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -805,6 +816,7 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    let viewport = usize::from(block.inner(area).height.saturating_sub(1));
     let rows: Vec<Row> = app
         .core
         .visible()
@@ -854,6 +866,7 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
             ])
         })
         .collect();
+    let total = rows.len();
     let table = Table::new(
         rows,
         [
@@ -876,6 +889,12 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.core.release_state);
+    theme::scrollbar(
+        frame,
+        area,
+        (total, app.core.release_state.offset(), viewport),
+        focused,
+    );
 }
 
 fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -966,6 +985,16 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.core.installed_state);
+    theme::scrollbar(
+        frame,
+        area,
+        (
+            app.core.installed.len(),
+            app.core.installed_state.offset(),
+            usize::from(area.height.saturating_sub(3)),
+        ),
+        focused,
+    );
 }
 
 /// Footer hints for the Core tab, depending on the focused pane.

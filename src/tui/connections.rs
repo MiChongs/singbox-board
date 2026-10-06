@@ -8,17 +8,16 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Sparkline, Table};
-use ratatui::widgets::{TableState, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, TableState};
 
 use super::app::{App, PendingAction, Popup, move_table};
 use super::popup::{Input, InputPurpose};
 use super::theme::{
-    ACCENT, BLUE, BORDER, DIM, DOWN, GREEN, MARK, PEACH, RED, SKY, SPINNER, SUBTEXT, SURFACE2,
-    TEXT, UP, YELLOW, chip, dim, header_row, label, panel, pill,
+    ACCENT, BLUE, DIM, DOWN, GREEN, MARK, PEACH, RED, SKY, SPINNER, SUBTEXT, SURFACE2, TEXT, UP,
+    YELLOW, card, chip, dim, header_row, label, panel, pill, scrollbar,
 };
 use crate::clash::Connection;
 use crate::i18n::fl;
@@ -413,18 +412,6 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// A small titled box of the stats row.
-fn card(title: String, color: Color) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(BORDER))
-        .title(Line::from(Span::styled(
-            format!(" {title} "),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        )))
-        .padding(Padding::horizontal(1))
-}
-
 fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
     let mut constraints = vec![
         Constraint::Fill(3),
@@ -462,7 +449,7 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_count_card(frame: &mut Frame, area: Rect, app: &App) {
+pub(super) fn draw_count_card(frame: &mut Frame, area: Rect, app: &App) {
     let view = &app.connections;
     let title = fl!("conn-card-connections");
     let memory = format!(
@@ -917,30 +904,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some((icon, color, title, hint)) = empty_state(app) {
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let mut lines = vec![Line::from(vec![
-            Span::styled(format!("{icon}  "), Style::new().fg(color)),
-            Span::styled(title, Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
-        ])];
-        if !hint.is_empty() {
-            lines.push(Line::raw(""));
-            lines.extend(
-                hint.lines()
-                    .map(|line| Line::from(Span::styled(line.to_owned(), Style::new().fg(DIM)))),
-            );
-        }
-        let text = Text::from(lines);
-        let rows = text.height() as u16 + 1;
-        let [_, message] = Layout::vertical([
-            Constraint::Length(inner.height.saturating_sub(rows) / 2),
-            Constraint::Min(0),
-        ])
-        .areas(inner);
-        frame.render_widget(
-            Paragraph::new(text)
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true }),
-            message,
-        );
+        super::ui::empty_state(frame, inner, (icon, color), &title, &hint);
         return;
     }
 
@@ -986,7 +950,18 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
         // A background alone keeps the colours of the selected row.
         .row_highlight_style(Style::new().bg(SURFACE2).add_modifier(Modifier::BOLD))
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
+    let total = view.rows.len();
     frame.render_stateful_widget(table, area, &mut app.connections.state);
+    scrollbar(
+        frame,
+        area,
+        (
+            total,
+            app.connections.state.offset(),
+            usize::from(inner.height.saturating_sub(1)),
+        ),
+        true,
+    );
 }
 
 /// Icon, colour, title and hint of a table without rows.

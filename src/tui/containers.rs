@@ -1432,6 +1432,16 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(Style::new().add_modifier(Modifier::BOLD))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.containers.state);
+    theme::scrollbar(
+        frame,
+        area,
+        (
+            count,
+            app.containers.state.offset(),
+            usize::from(area.height.saturating_sub(3)),
+        ),
+        true,
+    );
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
@@ -1443,13 +1453,14 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let history = app.containers.history.get(&container.id);
-    let graph_rows = if container.running() && inner.height > 18 {
-        4
-    } else {
-        0
+    let live = container.live.as_ref().filter(|_| container.running());
+    let memory_limit = container.spec.as_ref().and_then(|s| s.memory_limit);
+    // A gauge for the CPU, one for the memory when it is limited, and the
+    // load over time when there is room.
+    let gauge_rows = match live {
+        Some(_) if inner.height > 12 => 2 + u16::from(memory_limit.is_some()),
+        _ => 0,
     };
-    let [text_area, graph_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(graph_rows)]).areas(inner);
 
     // Rows of label and value; the labels are aligned to the longest one
     // that can appear, and paths are shortened to the width left.
@@ -1475,9 +1486,7 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         .max()
         .unwrap_or(0)
         + 2;
-    let room = usize::from(text_area.width)
-        .saturating_sub(width + 2)
-        .max(8);
+    let room = usize::from(inner.width).saturating_sub(width + 2).max(8);
     let path = |text: &str| crate::util::truncate_start(text, room);
     let mut rows: Vec<(String, Vec<Span<'static>>)> = Vec::new();
     let mut row = |label: String, value: Vec<Span<'static>>| rows.push((label, value));
@@ -1498,10 +1507,13 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
             .load
             .get(&container.id)
             .map_or_else(|| "-".to_owned(), |l| format!("{l:.1}%"));
-        row(
-            "CPU".to_owned(),
-            vec![Span::styled(load, Style::new().fg(BLUE).bold())],
-        );
+        // The gauge below shows it when there is room.
+        if gauge_rows == 0 {
+            row(
+                "CPU".to_owned(),
+                vec![Span::styled(load, Style::new().fg(BLUE).bold())],
+            );
+        }
         let memory = match container.spec.as_ref().and_then(|s| s.memory_limit) {
             Some(limit) => format!("{} / {}", fmt_bytes(live.memory), fmt_bytes(limit)),
             None => fmt_bytes(live.memory),
@@ -1625,26 +1637,89 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .map(|(label, value)| Line::from([vec![theme::label(&label, width)], value].concat()))
         .collect();
+    // The gauges follow the text, and the load graph takes what is left.
+    let text_rows = lines
+        .iter()
+        .map(|line| {
+            line.width()
+                .max(1)
+                .div_ceil(usize::from(inner.width).max(1))
+        })
+        .sum::<usize>() as u16;
+    let graph_rows = match inner.height.saturating_sub(text_rows + gauge_rows) {
+        rows if gauge_rows > 0 && rows >= 5 => rows,
+        _ => 0,
+    };
+    let [text_area, gauge_area, graph_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(gauge_rows),
+        Constraint::Length(graph_rows),
+    ])
+    .areas(inner);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
+
+    if let Some(live) = live.filter(|_| gauge_rows > 0) {
+        let rows = gauge_area.rows().skip(1);
+        let load = app
+            .containers
+            .load
+            .get(&container.id)
+            .copied()
+            .unwrap_or(0.0);
+        // Percent of the CPUs the container may use, or of one.
+        let capacity = container
+            .spec
+            .as_ref()
+            .and_then(|s| s.cpu_limit)
+            .map_or(100.0, |cpu| cpu as f64 / 10.0);
+        let cpu = load / capacity;
+        let mut label = vec![
+            theme::label("CPU", width),
+            Span::styled(format!("{load:>6.1}%"), Style::new().fg(BLUE).bold()),
+        ];
+        if capacity != 100.0 {
+            label.push(dim(format!(" / {capacity:.0}%")));
+        }
+        let mut gauges = vec![theme::meter(
+            cpu,
+            theme::usage_color(cpu),
+            Line::from(label),
+        )];
+        if let Some(limit) = memory_limit {
+            let used = live.memory as f64 / limit.max(1) as f64;
+            gauges.push(theme::meter(
+                used,
+                theme::usage_color(used),
+                Line::from(vec![
+                    theme::label(&fl!("field-memory"), width),
+                    Span::styled(
+                        format!("{:>6.1}%", used * 100.0),
+                        Style::new().fg(TEAL).bold(),
+                    ),
+                    dim(format!(" / {}", fmt_bytes(limit))),
+                ]),
+            ));
+        }
+        for (gauge, row) in gauges.into_iter().zip(rows) {
+            frame.render_widget(gauge, row);
+        }
+    }
 
     if graph_rows > 0 {
         let data: Vec<u64> = history
             .map(|h| h.iter().copied().collect())
             .unwrap_or_default();
-        let width = usize::from(graph_area.width);
+        let block = theme::card(fl!("tui-container-load-graph"), BLUE);
+        let spark = block.inner(graph_area);
+        let width = usize::from(spark.width);
         let shown = &data[data.len().saturating_sub(width)..];
-        let [title, spark] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(graph_area);
-        frame.render_widget(
-            Paragraph::new(Line::from(dim(fl!("tui-container-load-graph")))),
-            title,
-        );
         frame.render_widget(
             Sparkline::default()
+                .block(block)
                 .data(shown)
                 .max(1000)
                 .style(Style::new().fg(BLUE)),
-            spark,
+            graph_area,
         );
     }
 }

@@ -9,7 +9,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use serde_json::Value;
 
 use super::app::{App, AppEvent, PendingAction, Popup, Tab};
@@ -1411,6 +1413,16 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(true))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.profiles.state);
+    theme::scrollbar(
+        frame,
+        area,
+        (
+            count,
+            app.profiles.state.offset(),
+            usize::from(area.height.saturating_sub(3)),
+        ),
+        true,
+    );
 }
 
 const SUMMARY_FIELD: usize = 10;
@@ -1529,96 +1541,127 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(block, area);
         return;
     };
+    // Labels as wide as the longest one, at least the usual ten columns.
+    let width = [
+        fl!("detail-state"),
+        fl!("detail-created"),
+        fl!("detail-updated"),
+        fl!("detail-url"),
+        fl!("detail-interval"),
+        fl!("detail-fetched"),
+        fl!("detail-last-error"),
+        fl!("detail-usage"),
+    ]
+    .iter()
+    .map(|label| crate::util::text_width(label) + 2)
+    .max()
+    .unwrap_or(0)
+    .max(DETAIL_FIELD);
     let mut lines = vec![
         field(
             "ID",
-            DETAIL_FIELD,
+            width,
             Span::styled(p.id.clone(), Style::new().fg(SUBTEXT)),
         ),
         field(
             &fl!("detail-state"),
-            DETAIL_FIELD,
+            width,
             if p.active {
-                Span::styled(fl!("tui-profile-in-use"), Style::new().fg(GREEN).bold())
+                Span::styled(
+                    format!("● {}", fl!("tui-profile-in-use")),
+                    Style::new().fg(GREEN).bold(),
+                )
             } else {
                 dim(fl!("tui-profile-not-in-use"))
             },
         ),
         field(
             &fl!("detail-created"),
-            DETAIL_FIELD,
+            width,
             dim(local_time(p.created_at, "%Y-%m-%d %H:%M")),
         ),
         field(
             &fl!("detail-updated"),
-            DETAIL_FIELD,
+            width,
             dim(local_time(p.updated_at, "%Y-%m-%d %H:%M")),
         ),
     ];
+    let mut usage = None;
     if let Some(url) = &p.url {
         lines.push(field(
             &fl!("detail-url"),
-            DETAIL_FIELD,
-            Span::styled(crate::util::shorten_url(url), Style::new().fg(SUBTEXT)),
+            width,
+            Span::styled(crate::util::shorten_url(url), Style::new().fg(BLUE)),
         ));
         lines.push(field(
             &fl!("detail-interval"),
-            DETAIL_FIELD,
+            width,
             Span::raw(interval_label(p.interval)),
         ));
         lines.push(field(
             &fl!("detail-fetched"),
-            DETAIL_FIELD,
+            width,
             dim(p
                 .fetched_at
                 .map(|t| local_time(t, "%Y-%m-%d %H:%M"))
                 .unwrap_or_else(|| fl!("none"))),
         ));
-        if let Some(usage) = &p.usage {
-            lines.push(field(
-                &fl!("detail-usage"),
-                DETAIL_FIELD,
-                Span::raw(usage_label(usage)),
-            ));
-            if usage.total > 0 {
-                lines.push(usage_bar(
-                    usage.upload + usage.download,
-                    usage.total,
-                    area.width,
-                ));
-            }
-        }
         if let Some(err) = &p.last_error {
             lines.push(field(
                 &fl!("detail-last-error"),
-                DETAIL_FIELD,
-                Span::styled(err.clone(), Style::new().fg(YELLOW)),
+                width,
+                Span::styled(format!("⚠ {err}"), Style::new().fg(YELLOW)),
             ));
         }
+        if let Some(info) = &p.usage {
+            lines.push(field(
+                &fl!("detail-usage"),
+                width,
+                Span::raw(usage_label(info)),
+            ));
+            if info.total > 0 {
+                usage =
+                    Some((info.upload.saturating_add(info.download)) as f64 / info.total as f64);
+            }
+        }
     }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
-        area,
-    );
-}
-
-fn usage_bar(used: u64, total: u64, width: u16) -> Line<'static> {
-    let width = (width as usize)
-        .saturating_sub(DETAIL_FIELD + 12)
-        .clamp(8, 40);
-    let ratio = (used as f64 / total as f64).clamp(0.0, 1.0);
-    let filled = (ratio * width as f64).round() as usize;
-    let color = match ratio {
-        r if r >= 0.9 => RED,
-        r if r >= 0.7 => YELLOW,
-        _ => GREEN,
-    };
-    Line::from(vec![
-        Span::raw(" ".repeat(DETAIL_FIELD)),
-        Span::styled("█".repeat(filled), Style::new().fg(color)),
-        Span::styled("░".repeat(width - filled), Style::new().fg(DIM)),
-        dim(format!(" {:.0}%", ratio * 100.0)),
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The gauge goes under the text, which the panel may have to cut.
+    let width = usize::from(inner.width).max(1);
+    let text_rows = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>() as u16;
+    let gauge_rows = if usage.is_some() { 2 } else { 0 };
+    let [text_area, gauge_area] = Layout::vertical([
+        Constraint::Length(text_rows.min(inner.height.saturating_sub(gauge_rows))),
+        Constraint::Length(gauge_rows),
     ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
+    if let Some(ratio) = usage {
+        let ratio = ratio.clamp(0.0, 1.0);
+        frame.render_widget(
+            Gauge::default()
+                .ratio(ratio)
+                .use_unicode(true)
+                .label(Span::styled(
+                    format!("{:.1}%", ratio * 100.0),
+                    Style::new().fg(TEXT).bold(),
+                ))
+                .gauge_style(
+                    Style::new()
+                        .fg(theme::usage_color(ratio))
+                        .bg(theme::SURFACE),
+                ),
+            Rect {
+                y: gauge_area.y + 1,
+                height: 1,
+                ..gauge_area
+            },
+        );
+    }
 }
 
 fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1667,6 +1710,16 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .editor_state
         .select(if rows.is_empty() { None } else { Some(cursor) });
     frame.render_stateful_widget(list, tree_area, &mut app.profiles.editor_state);
+    theme::scrollbar(
+        frame,
+        tree_area,
+        (
+            rows.len(),
+            app.profiles.editor_state.offset(),
+            usize::from(tree_area.height.saturating_sub(2)),
+        ),
+        true,
+    );
     frame.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })

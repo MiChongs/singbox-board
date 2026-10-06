@@ -33,7 +33,8 @@ use crate::substore::{Entry, Overview, provider_snippet};
 use crate::util::{error_chain, text_width};
 
 const MAX_LOG_LINES: usize = 5000;
-const HISTORY_POINTS: usize = 300;
+/// Traffic samples kept, one a second.
+pub(super) const HISTORY_POINTS: usize = 300;
 const TOAST_TTL: Duration = Duration::from_secs(5);
 const DELAY_TIMEOUT_MS: u32 = 5000;
 const DELAY_CONCURRENCY: usize = 8;
