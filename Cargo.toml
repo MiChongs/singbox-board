@@ -1,6 +1,6 @@
 [package]
 name = "singbox-board"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "Root daemon and TUI dashboard for MiChongs/sing-box (xiaobaf14g)"
 repository = "https://github.com/MiChongs/sing-box"

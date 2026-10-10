@@ -2631,7 +2631,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "singbox-board"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
