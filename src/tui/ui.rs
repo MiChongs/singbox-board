@@ -1,5 +1,6 @@
 //! Rendering. Pure functions of [`App`] state.
 
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -7,28 +8,32 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Axis, Block, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, Paragraph, Row, Table,
-    Tabs, Wrap,
+    Tabs, TitlePosition, Wrap,
 };
 
 use super::app::{App, Focus, Popup, StoreFocus, Tab};
 use super::connections as connections_view;
 use super::containers as containers_view;
 use super::core as core_view;
+use super::mouse::{Hits, Pane, Parts, Target, below, hint_key};
 use super::popup::{Input, InputPurpose, Menu};
 use super::profiles as profiles_view;
 use super::theme::{
     ACCENT, BLUE, BORDER, CRUST, DIM, DOWN, GREEN, MANTLE, MARK, PEACH, RED, SKY, SPINNER, SUBTEXT,
     SURFACE2, TEAL, TEXT, UP, YELLOW, backdrop, card, chip, delay_color, dialog, dialog_keys, dim,
-    field, header_row, key, label, panel, pill, scrollbar, selected, signal, state_color,
-    state_dot,
+    field, header_row, key, label, pane_keys, panel, pill, scrollbar, selected, signal,
+    state_color, state_dot,
 };
 use crate::i18n::fl;
 use crate::protocol::{
     Component, ComponentStatus, CoreState, LogEntry, LogSource, variant_label, version_label,
 };
-use crate::util::{fmt_bytes, fmt_clock, fmt_duration, fmt_speed, join_list, now_unix, text_width};
+use crate::util::{
+    fmt_bytes, fmt_clock, fmt_duration, fmt_speed, join_list, now_unix, pad, text_width,
+};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.hits.clear();
     let [header, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -60,20 +65,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.popup.is_some() && !live_filter {
         backdrop(frame);
     }
+    // A dialog takes the clicks; beside it they close it.
+    if app.popup.is_some() {
+        app.hits.clear();
+    }
+    let hits = &app.hits;
     match &app.popup {
-        Some(Popup::Help) => draw_help(frame),
-        Some(Popup::Confirm { message, .. }) => draw_confirm(frame, message),
+        Some(Popup::Help) => draw_help(frame, hits),
+        Some(Popup::Confirm { message, .. }) => draw_confirm(frame, hits, message),
         Some(Popup::Message {
             title,
             body,
             error,
             copy,
-        }) => draw_message(frame, title, body, *error, copy.is_some()),
-        Some(Popup::Setup { sub_store }) => draw_setup(frame, *sub_store),
-        Some(Popup::Menu(menu)) => draw_menu(frame, menu),
-        Some(Popup::Input(input)) => draw_input(frame, input),
-        Some(Popup::EditorHelp) => draw_editor_help(frame),
-        Some(Popup::CodeHelp) => draw_code_help(frame),
+        }) => draw_message(frame, hits, (title, body), *error, copy.is_some()),
+        Some(Popup::Setup { sub_store }) => draw_setup(frame, hits, *sub_store),
+        Some(Popup::Menu(menu)) => draw_menu(frame, hits, menu),
+        Some(Popup::Input(input)) => draw_input(frame, hits, input),
+        Some(Popup::EditorHelp) => draw_editor_help(frame, hits),
+        Some(Popup::CodeHelp) => draw_code_help(frame, hits),
         None => {}
     }
 }
@@ -275,12 +285,23 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
     if width > usize::from(area.width.saturating_sub(2)) {
         lines = titles(true);
     }
+    let area = area.inner(Margin::new(1, 0));
+    // Where `Tabs` puts the titles: one after the other, a space apart.
+    let mut x = area.x;
+    for (tab, line) in Tab::ALL.iter().zip(&lines) {
+        let width = line.width() as u16;
+        app.hits.add(
+            Rect::new(x, area.y, width, 1).intersection(area),
+            Target::Tab(*tab),
+        );
+        x = x.saturating_add(width + 1);
+    }
     let tabs = Tabs::new(lines)
         .select(app.tab.index())
         .padding("", "")
         .divider(Span::styled(" ", Style::new()))
         .highlight_style(Style::new().fg(CRUST).bg(ACCENT).bold());
-    frame.render_widget(tabs, area.inner(Margin::new(1, 0)));
+    frame.render_widget(tabs, area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -342,28 +363,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     let right_width = right.as_ref().map_or(0, |span| span.width());
 
-    // As many hints as fit beside the toast, the tab's own first.
+    // As many hints as fit beside the toast, the tab's own first. A
+    // click on one presses its key.
     let room = usize::from(area.width).saturating_sub(right_width + 1);
-    let mut spans = vec![Span::raw(" ")];
-    let mut used = 1;
+    let mut parts = Parts::default();
+    parts.text(Span::raw(" "));
     for (i, (k, label)) in keys.iter().chain(global.iter()).enumerate() {
-        let mut item = Vec::new();
-        if i == keys.len() && !keys.is_empty() {
-            item.push(Span::styled("│  ", Style::new().fg(SURFACE2)));
-        }
-        item.push(key(k));
-        item.push(Span::styled(
-            format!(" {label}  "),
-            Style::new().fg(SUBTEXT),
-        ));
-        let width = spans_width(&item);
-        if used + width > room {
+        let separator = (i == keys.len() && !keys.is_empty())
+            .then(|| Span::styled("│  ", Style::new().fg(SURFACE2)));
+        let cap = key(k);
+        let text = Span::styled(format!(" {label}"), Style::new().fg(SUBTEXT));
+        let width = separator.as_ref().map_or(0, Span::width) + cap.width() + text.width() + 2;
+        if usize::from(parts.width()) + width > room {
             break;
         }
-        used += width;
-        spans.extend(item);
+        if let Some(separator) = separator {
+            parts.text(separator);
+        }
+        parts.button([cap, text], hint_key(k).map(Target::Key));
+        parts.text(Span::raw("  "));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(parts.line()), area);
+    parts.register(&app.hits, area.x, area.y, area);
 
     if let Some(span) = right {
         let width = (right_width as u16).min(area.width);
@@ -414,6 +435,8 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     if logs_area.height >= 3 {
+        // The whole log is a click away.
+        app.hits.add(logs_area, Target::Tab(Tab::Logs));
         let block = panel(&fl!("tui-panel-recent-logs"), false);
         let inner = block.inner(logs_area);
         frame.render_widget(block, logs_area);
@@ -511,6 +534,7 @@ fn draw_overview_cards(frame: &mut Frame, area: Rect, app: &App) {
             area,
         );
     }
+    app.hits.add(count_area, Target::Tab(Tab::Connections));
     connections_view::draw_count_card(frame, count_area, app);
 }
 
@@ -790,6 +814,8 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    app.hits.add(groups_area, Target::Pane(Pane::Groups));
+    app.hits.add(members_area, Target::Pane(Pane::Members));
     let items: Vec<ListItem> = app
         .groups
         .iter()
@@ -828,6 +854,12 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(selected(groups_focused))
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(list, groups_area, &mut app.group_state);
+    app.hits.rows(
+        Pane::Groups,
+        groups_area,
+        groups_area.inner(Margin::new(1, 1)),
+        (app.groups.len(), app.group_state.offset(), 2),
+    );
     scrollbar(
         frame,
         groups_area,
@@ -880,13 +912,19 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let members_focused = app.focus == Focus::Members;
-    let hint = if selectable {
-        format!("⏎ {}  t {}", fl!("key-select"), fl!("key-test"))
-    } else {
-        format!("t {}", fl!("key-test"))
-    };
-    let mut block = panel(&group_name, members_focused)
-        .title_top(Line::from(dim(format!(" {hint} "))).right_aligned());
+    let mut hints = Vec::new();
+    if selectable {
+        hints.push(("⏎", fl!("key-select")));
+    }
+    hints.push(("t", fl!("key-test")));
+    let hints = pane_keys(Some(Pane::Members), &hints);
+    hints.title(
+        &app.hits,
+        members_area,
+        TitlePosition::Top,
+        Alignment::Right,
+    );
+    let mut block = panel(&group_name, members_focused).title_top(hints.line().right_aligned());
     if !kind.is_empty() {
         block = block.title_bottom(Line::from(vec![
             Span::raw(" "),
@@ -901,7 +939,8 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
             Line::from(dim(format!(" {} / {} ", index + 1, members.len()))).right_aligned(),
         );
     }
-    let viewport = usize::from(block.inner(members_area).height.saturating_sub(1));
+    let inner = block.inner(members_area);
+    let viewport = usize::from(inner.height.saturating_sub(1));
     let table = Table::new(
         rows,
         [
@@ -924,6 +963,12 @@ fn draw_proxies(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(members_focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, members_area, &mut app.member_state);
+    app.hits.rows(
+        Pane::Members,
+        members_area,
+        below(inner, 1),
+        (members.len(), app.member_state.offset(), 1),
+    );
     scrollbar(
         frame,
         members_area,
@@ -1018,26 +1063,32 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 }
 
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
-    let follow = if app.log_scroll == 0 {
-        Span::styled(
+    app.hits.add(area, Target::Pane(Pane::Logs));
+    let mut status = Parts::default();
+    if app.log_scroll == 0 {
+        status.text(Span::styled(
             format!(" ● {} ", fl!("tui-logs-following")),
             Style::new().fg(GREEN),
-        )
+        ));
     } else {
-        Span::styled(
-            format!(" ⏸ {} ", fl!("tui-logs-scrolled", lines = app.log_scroll)),
-            Style::new().fg(YELLOW),
-        )
-    };
-    let mut status = vec![follow];
+        // A click follows again.
+        status.button(
+            [Span::styled(
+                format!(" ⏸ {} ", fl!("tui-logs-scrolled", lines = app.log_scroll)),
+                Style::new().fg(YELLOW),
+            )],
+            Some(Target::Key(KeyEvent::from(KeyCode::End))),
+        );
+    }
     if !app.logs_connected {
-        status.push(Span::styled(
+        status.text(Span::styled(
             format!("✕ {} ", fl!("tui-logs-disconnected")),
             Style::new().fg(RED),
         ));
     }
+    status.title(&app.hits, area, TitlePosition::Top, Alignment::Right);
     let block = panel(&fl!("tui-panel-logs", count = app.logs.len()), true)
-        .title_top(Line::from(status).right_aligned());
+        .title_top(status.line().right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let height = inner.height as usize;
@@ -1045,6 +1096,11 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
     let start = end.saturating_sub(height);
     let lines: Vec<Line> = app.logs.range(start..end).map(log_line).collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    if app.logs.len() > height {
+        // One position for each first line shown.
+        app.hits
+            .scrollbar(Pane::Logs, area, app.logs.len() - height + 1);
+    }
     scrollbar(frame, area, (app.logs.len(), start, height), true);
 }
 
@@ -1064,6 +1120,9 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
     let [components_area, entries_area] =
         Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).areas(area);
     let now = now_unix();
+    app.hits
+        .add(components_area, Target::Pane(Pane::Components));
+    app.hits.add(entries_area, Target::Pane(Pane::Entries));
 
     let rows: Vec<Row> = Component::ALL
         .iter()
@@ -1101,6 +1160,16 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let focused = app.store_focus == StoreFocus::Components;
+    let hints = pane_keys(Some(Pane::Components), &[("⏎", fl!("key-actions"))]);
+    hints.title(
+        &app.hits,
+        components_area,
+        TitlePosition::Top,
+        Alignment::Right,
+    );
+    let block =
+        panel(&fl!("tui-panel-components"), focused).title_top(hints.line().right_aligned());
+    let inner = block.inner(components_area);
     let table = Table::new(
         rows,
         [
@@ -1123,14 +1192,18 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         .style(header_row())
         .bottom_margin(1),
     )
-    .block(
-        panel(&fl!("tui-panel-components"), focused)
-            .title_top(Line::from(dim(format!(" ⏎ {} ", fl!("key-actions")))).right_aligned()),
-    )
+    .block(block)
     // A background highlight would hide the state pills; bold only.
     .row_highlight_style(Style::new().add_modifier(ratatui::style::Modifier::BOLD))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, components_area, &mut app.comp_state);
+    // Below the header and the blank line after it.
+    app.hits.rows(
+        Pane::Components,
+        components_area,
+        below(inner, 2),
+        (Component::ALL.len(), app.comp_state.offset(), 1),
+    );
 
     let focused = app.store_focus == StoreFocus::Entries;
     let running = app
@@ -1143,12 +1216,20 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
         None => fl!("tui-panel-subscriptions"),
     };
-    let hint = format!(
-        " y {}  p {} ",
-        fl!("key-copy-url"),
-        fl!("key-provider-snippet")
+    let hints = pane_keys(
+        Some(Pane::Entries),
+        &[
+            ("y", fl!("key-copy-url")),
+            ("p", fl!("key-provider-snippet")),
+        ],
     );
-    let block = panel(&title, focused).title_top(Line::from(dim(hint)).right_aligned());
+    hints.title(
+        &app.hits,
+        entries_area,
+        TitlePosition::Top,
+        Alignment::Right,
+    );
+    let block = panel(&title, focused).title_top(hints.line().right_aligned());
     let message = if !app
         .component(Component::SubStore)
         .is_some_and(|c| c.enabled)
@@ -1200,7 +1281,8 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let total = rows.len();
-    let viewport = usize::from(block.inner(entries_area).height.saturating_sub(1));
+    let inner = block.inner(entries_area);
+    let viewport = usize::from(inner.height.saturating_sub(1));
     let table = Table::new(
         rows,
         [
@@ -1223,6 +1305,12 @@ fn draw_sub_store(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, entries_area, &mut app.entry_state);
+    app.hits.rows(
+        Pane::Entries,
+        entries_area,
+        below(inner, 1),
+        (total, app.entry_state.offset(), 1),
+    );
     scrollbar(
         frame,
         entries_area,
@@ -1286,13 +1374,14 @@ fn wrapped_rows(lines: &[Line], width: u16) -> u16 {
 }
 
 /// A section title (empty key) or a `key  description` row.
-fn help_lines(rows: &[(&'static str, String)]) -> Vec<Line<'static>> {
+fn help_lines(rows: &[(impl AsRef<str>, String)]) -> Vec<Line<'static>> {
     help_lines_with(rows, 13)
 }
 
-fn help_lines_with(rows: &[(&'static str, String)], key_width: usize) -> Vec<Line<'static>> {
+fn help_lines_with(rows: &[(impl AsRef<str>, String)], key_width: usize) -> Vec<Line<'static>> {
     rows.iter()
         .map(|(k, desc)| {
+            let k = k.as_ref();
             if k.is_empty() && desc.is_empty() {
                 Line::raw("")
             } else if k.is_empty() {
@@ -1302,7 +1391,10 @@ fn help_lines_with(rows: &[(&'static str, String)], key_width: usize) -> Vec<Lin
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(format!("  {k:<key_width$} "), Style::new().fg(BLUE).bold()),
+                    Span::styled(
+                        format!("  {} ", pad(k, key_width)),
+                        Style::new().fg(BLUE).bold(),
+                    ),
                     Span::styled(desc.clone(), Style::new().fg(SUBTEXT)),
                 ])
             }
@@ -1313,14 +1405,15 @@ fn help_lines_with(rows: &[(&'static str, String)], key_width: usize) -> Vec<Lin
 /// A dialog of two columns of key help.
 fn draw_help_columns(
     frame: &mut Frame,
+    hits: &Hits,
     title: &str,
     (left, right): (Vec<Line<'static>>, Vec<Line<'static>>),
-    width: u16,
-    note: Option<String>,
+    (width, note): (u16, Option<String>),
 ) {
     let note_rows = if note.is_some() { 2 } else { 0 };
     let height = left.len().max(right.len()) as u16 + 2 + note_rows;
     let area = popup_area(frame, width, height);
+    hits.add(area, Target::Dialog);
     frame.render_widget(Clear, area);
     let block = dialog(title, ACCENT)
         .title_bottom(Line::from(dim(format!(" {} ", fl!("help-close-hint")))).right_aligned());
@@ -1341,9 +1434,9 @@ fn draw_help_columns(
     }
 }
 
-fn draw_help(frame: &mut Frame) {
+fn draw_help(frame: &mut Frame, hits: &Hits) {
     let blank = || ("", String::new());
-    let left = help_lines(&[
+    let mut left = help_lines(&[
         ("", fl!("help-global")),
         ("1-8 / Tab", fl!("help-switch-tab")),
         ("s / x / r", fl!("help-start-stop-restart")),
@@ -1352,6 +1445,16 @@ fn draw_help(frame: &mut Frame) {
         ("u", fl!("help-update")),
         ("m", fl!("help-mode")),
         ("q / Ctrl-C", fl!("help-quit")),
+        blank(),
+    ]);
+    left.extend(help_lines(&[
+        (String::new(), fl!("help-mouse")),
+        (fl!("help-mouse-click-key"), fl!("help-mouse-click")),
+        (fl!("help-mouse-double-key"), fl!("help-mouse-double")),
+        (fl!("help-mouse-wheel-key"), fl!("help-mouse-wheel")),
+        ("M".to_owned(), fl!("help-mouse-toggle")),
+    ]));
+    left.extend(help_lines(&[
         blank(),
         ("", fl!("help-proxies")),
         ("←→ ↑↓", fl!("help-groups-nodes")),
@@ -1368,7 +1471,7 @@ fn draw_help(frame: &mut Frame) {
         blank(),
         ("", fl!("help-logs")),
         ("PgUp/Dn End", fl!("help-scroll")),
-    ]);
+    ]));
     let right = help_lines(&[
         ("", "Sub-Store".to_owned()),
         ("←→", fl!("help-store-panes")),
@@ -1399,10 +1502,10 @@ fn draw_help(frame: &mut Frame) {
         ("a / d", fl!("help-containers-delete")),
         ("C / U / A", fl!("help-containers-host")),
     ]);
-    draw_help_columns(frame, &fl!("help-title"), (left, right), 110, None);
+    draw_help_columns(frame, hits, &fl!("help-title"), (left, right), (110, None));
 }
 
-fn draw_confirm(frame: &mut Frame, message: &str) {
+fn draw_confirm(frame: &mut Frame, hits: &Hits, message: &str) {
     let mut lines: Vec<Line> = vec![Line::raw("")];
     for (i, line) in message.lines().enumerate() {
         lines.push(if i == 0 {
@@ -1412,46 +1515,79 @@ fn draw_confirm(frame: &mut Frame, message: &str) {
         });
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
+    let mut buttons = Parts::default();
+    buttons.button(
+        [Span::styled(
             format!("  y  {}  ", fl!("key-confirm")),
             Style::new().fg(CRUST).bg(YELLOW).bold(),
-        ),
-        Span::raw("    "),
-        Span::styled(
+        )],
+        Some(Target::Key(KeyEvent::from(KeyCode::Char('y')))),
+    );
+    buttons.text(Span::raw("    "));
+    buttons.button(
+        [Span::styled(
             format!("  n  {}  ", fl!("key-cancel")),
             Style::new().fg(TEXT).bg(SURFACE2).bold(),
-        ),
-    ]));
-    let width: u16 = 72;
-    let height = wrapped_rows(&lines, width) + 3;
-    let text = Text::from(lines);
-    let area = popup_area(frame, width, height);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
-            .block(dialog(&format!("⚠ {}", fl!("tui-panel-confirm")), YELLOW)),
-        area,
+        )],
+        Some(Target::Key(KeyEvent::from(KeyCode::Char('n')))),
     );
+    let width: u16 = 72;
+    // The message, the buttons and a blank row under them.
+    let height = wrapped_rows(&lines, width) + 4;
+    let area = popup_area(frame, width, height);
+    hits.add(area, Target::Dialog);
+    frame.render_widget(Clear, area);
+    let block = dialog(&format!("⚠ {}", fl!("tui-panel-confirm")), YELLOW);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [text_area, buttons_area, _] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        text_area,
+    );
+    let x = buttons_area.x + buttons_area.width.saturating_sub(buttons.width()) / 2;
+    frame.render_widget(
+        Paragraph::new(buttons.line()),
+        Rect {
+            x,
+            width: buttons.width(),
+            ..buttons_area
+        }
+        .intersection(buttons_area),
+    );
+    buttons.register(hits, x, buttons_area.y, buttons_area);
 }
 
-fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool, copyable: bool) {
+fn draw_message(
+    frame: &mut Frame,
+    hits: &Hits,
+    (title, body): (&str, &str),
+    error: bool,
+    copyable: bool,
+) {
     let screen = frame.area();
     let width = (screen.width * 4 / 5).max(40);
     let lines = body.lines().count() as u16;
     let height = (lines + 4).min(screen.height * 4 / 5).max(5);
     let rect = popup_area(frame, width, height);
+    hits.add(rect, Target::Dialog);
     frame.render_widget(Clear, rect);
     let (color, icon) = if error { (RED, "✕") } else { (GREEN, "✓") };
-    let hint = if copyable {
-        fl!("tui-hint-copy-close")
-    } else {
-        fl!("tui-hint-close")
-    };
-    let block = dialog(&format!("{icon} {title}"), color)
-        .title_bottom(Line::from(dim(format!(" {hint} "))).right_aligned());
+    let mut keys = Vec::new();
+    if copyable {
+        keys.push(("y", fl!("key-copy")));
+    }
+    keys.push(("Esc", fl!("key-close")));
+    let keys = dialog_keys(&keys);
+    keys.title(hits, rect, TitlePosition::Bottom, Alignment::Right);
+    let block = dialog(&format!("{icon} {title}"), color).title_bottom(keys.line().right_aligned());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(
@@ -1462,7 +1598,7 @@ fn draw_message(frame: &mut Frame, title: &str, body: &str, error: bool, copyabl
     );
 }
 
-fn draw_input(frame: &mut Frame, input: &Input) {
+fn draw_input(frame: &mut Frame, hits: &Hits, input: &Input) {
     let (before, after) = input.split();
     let mut field = vec![Span::styled("❯ ", Style::new().fg(ACCENT).bold())];
     if input.value.is_empty() {
@@ -1499,12 +1635,15 @@ fn draw_input(frame: &mut Frame, input: &Input) {
     let error_rows = u16::from(input.error.is_some());
     let height = 1 + hint_rows + 3 + error_rows + 2;
     let area = popup_area(frame, width, height);
+    hits.add(area, Target::Dialog);
     frame.render_widget(Clear, area);
-    let block = dialog(&input.title, ACCENT).title_bottom(dialog_keys(&[
+    let keys = dialog_keys(&[
         ("⏎", fl!("key-submit")),
         ("Esc", fl!("key-cancel")),
         ("^U", fl!("key-clear")),
-    ]));
+    ]);
+    keys.title(hits, area, TitlePosition::Bottom, Alignment::Right);
+    let block = dialog(&input.title, ACCENT).title_bottom(keys.line().right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [_, hint_area, field_area, error_area] = Layout::vertical([
@@ -1518,15 +1657,14 @@ fn draw_input(frame: &mut Frame, input: &Input) {
         frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), hint_area);
     }
     let border = if input.error.is_some() { RED } else { SURFACE2 };
-    frame.render_widget(
-        Paragraph::new(Line::from(field)).block(
-            Block::bordered()
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::new().fg(border))
-                .padding(ratatui::widgets::Padding::horizontal(1)),
-        ),
-        field_area,
-    );
+    let block = Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::new().fg(border))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    // The text starts after the prompt.
+    let text = block.inner(field_area);
+    hits.add(field_area, Target::Field(text.x + 2));
+    frame.render_widget(Paragraph::new(Line::from(field)).block(block), field_area);
     if let Some(err) = &input.error {
         frame.render_widget(
             Paragraph::new(Span::styled(format!("✕ {err}"), Style::new().fg(RED))),
@@ -1535,7 +1673,7 @@ fn draw_input(frame: &mut Frame, input: &Input) {
     }
 }
 
-fn draw_setup(frame: &mut Frame, sub_store: Option<bool>) {
+fn draw_setup(frame: &mut Frame, hits: &Hits, sub_store: Option<bool>) {
     let (name, about, question) = match sub_store {
         None => (
             "Sub-Store",
@@ -1577,20 +1715,23 @@ fn draw_setup(frame: &mut Frame, sub_store: Option<bool>) {
     let width: u16 = 76;
     let height = wrapped_rows(&lines, width) + 2;
     let area = popup_area(frame, width, height);
+    hits.add(area, Target::Dialog);
     frame.render_widget(Clear, area);
+    let keys = dialog_keys(&[
+        ("y", fl!("key-yes")),
+        ("n", fl!("key-no")),
+        ("Esc", fl!("key-ask-later")),
+    ]);
+    keys.title(hits, area, TitlePosition::Bottom, Alignment::Right);
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            dialog(&fl!("setup-title"), ACCENT).title_bottom(dialog_keys(&[
-                ("y", fl!("key-yes")),
-                ("n", fl!("key-no")),
-                ("Esc", fl!("key-ask-later")),
-            ])),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(dialog(&fl!("setup-title"), ACCENT).title_bottom(keys.line().right_aligned())),
         area,
     );
 }
 
-fn draw_menu(frame: &mut Frame, menu: &Menu) {
+fn draw_menu(frame: &mut Frame, hits: &Hits, menu: &Menu) {
     let label_width = menu
         .items
         .iter()
@@ -1611,7 +1752,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu) {
     let screen = frame.area();
     let width = ((label_width + detail_width + 10) as u16)
         .max(text_width(&menu.title) as u16 + 8)
-        .max(keys.width() as u16 + 4)
+        .max(keys.width() + 4)
         .clamp(40, screen.width.saturating_sub(4).max(40));
     let body: Vec<Line> = menu
         .body
@@ -1630,8 +1771,10 @@ fn draw_menu(frame: &mut Frame, menu: &Menu) {
     };
     let height = (menu.items.len() as u16 + body_rows + 2).min(screen.height.saturating_sub(2));
     let area = popup_area(frame, width, height);
+    hits.add(area, Target::Dialog);
     frame.render_widget(Clear, area);
-    let block = dialog(&menu.title, ACCENT).title_bottom(keys);
+    keys.title(hits, area, TitlePosition::Bottom, Alignment::Right);
+    let block = dialog(&menu.title, ACCENT).title_bottom(keys.line().right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [body_area, list_area] =
@@ -1661,6 +1804,12 @@ fn draw_menu(frame: &mut Frame, menu: &Menu) {
         list_area,
         &mut state,
     );
+    hits.rows(
+        Pane::Menu,
+        area,
+        list_area,
+        (menu.items.len(), state.offset(), 1),
+    );
     scrollbar(
         frame,
         area,
@@ -1673,7 +1822,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu) {
     );
 }
 
-fn draw_editor_help(frame: &mut Frame) {
+fn draw_editor_help(frame: &mut Frame, hits: &Hits) {
     let blank = || ("", String::new());
     let left = help_lines(&[
         ("", fl!("help-editor-move")),
@@ -1698,19 +1847,25 @@ fn draw_editor_help(frame: &mut Frame) {
         ("K / J", fl!("help-editor-reorder")),
         ("y", fl!("help-editor-copy")),
     ]);
-    draw_help_columns(frame, &fl!("help-editor-title"), (left, right), 104, None);
+    draw_help_columns(
+        frame,
+        hits,
+        &fl!("help-editor-title"),
+        (left, right),
+        (104, None),
+    );
 }
 
-fn draw_code_help(frame: &mut Frame) {
+fn draw_code_help(frame: &mut Frame, hits: &Hits) {
     let [left, right] = super::code::help_rows();
     let left = help_lines_with(&left, 13);
     let right = help_lines_with(&right, 13);
     draw_help_columns(
         frame,
+        hits,
         &fl!("help-code-title"),
         (left, right),
-        116,
-        Some(fl!("help-code-note")),
+        (116, Some(fl!("help-code-note"))),
     );
 }
 

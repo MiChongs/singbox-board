@@ -8,16 +8,17 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, TableState, TitlePosition, Wrap};
 
 use super::app::{App, AppEvent, PendingAction, Popup, Tab, move_table};
+use super::mouse::{Pane, Target, below};
 use super::popup::{ExternalEdit, Input, InputPurpose, Menu, MenuAction, MenuItem};
 use super::theme::{
     self, ACCENT, BLUE, GREEN, MARK, PEACH, RED, SKY, SUBTEXT, TEAL, TEXT, YELLOW, chip, dim,
-    panel, pill,
+    pane_keys, panel, pill,
 };
 use super::toml_editor::{self, TomlEditor};
 use crate::ctl_container::{network_text, runtime_text};
@@ -1327,9 +1328,13 @@ fn draw_runtime(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Containers));
     let count = app.containers.containers().len();
+    let hints = pane_keys(None, &[("⏎", fl!("key-actions"))]);
+    hints.title(&app.hits, area, TitlePosition::Top, Alignment::Right);
     let block = panel(&fl!("tui-panel-containers", count = count), true)
-        .title_top(Line::from(dim(format!(" ⏎ {} ", fl!("key-actions")))).right_aligned());
+        .title_top(hints.line().right_aligned());
+    let inner = block.inner(area);
     if count == 0 {
         let text = if app.containers.overview.is_some() {
             vec![
@@ -1432,6 +1437,12 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(Style::new().add_modifier(Modifier::BOLD))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.containers.state);
+    app.hits.rows(
+        Pane::Containers,
+        area,
+        below(inner, 1),
+        (count, app.containers.state.offset(), 1),
+    );
     theme::scrollbar(
         frame,
         area,

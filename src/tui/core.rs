@@ -3,14 +3,17 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, TitlePosition, Wrap,
+};
 
 use super::app::{App, AppEvent, PendingAction, Popup};
+use super::mouse::{Pane, Parts, Target, below};
 use super::popup::{Input, InputPurpose};
 use super::theme::{
     self, ACCENT, BLUE, GREEN, MARK, PEACH, SUBTEXT, TEXT, YELLOW, chip, dim, panel, pill, selected,
@@ -309,7 +312,7 @@ impl App {
         }
     }
 
-    fn core_move(&mut self, delta: isize) {
+    pub(super) fn core_move(&mut self, delta: isize) {
         match self.core.focus {
             CoreFocus::Sources => {
                 let before = self.core.source_state.selected();
@@ -332,6 +335,16 @@ impl App {
                 let next = step(self.core.installed_state.selected(), len, delta);
                 self.core.installed_state.select(next);
             }
+        }
+    }
+
+    /// Picks a build variant of the selected release.
+    pub(super) fn core_pick_variant(&mut self, index: usize) {
+        if let Some(release) = self.core.selected_release()
+            && index < release.variants.len()
+        {
+            let tag = release.tag.clone();
+            self.core.variant_pick.insert(tag, index);
         }
     }
 
@@ -700,6 +713,7 @@ fn draw_active(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Sources));
     let focused = app.core.focus == CoreFocus::Sources;
     let active_source = app.core.active().map(|c| c.source.clone());
     let items: Vec<ListItem> = app
@@ -729,6 +743,12 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(selected(focused))
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(list, area, &mut app.core.source_state);
+    app.hits.rows(
+        Pane::Sources,
+        area,
+        area.inner(Margin::new(1, 1)),
+        (app.core.sources.len(), app.core.source_state.offset(), 3),
+    );
     theme::scrollbar(
         frame,
         area,
@@ -742,6 +762,7 @@ fn draw_sources(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Releases));
     let focused = app.core.focus == CoreFocus::Releases;
     let source = app.core.releases_for.clone().unwrap_or_default();
     let title = if source.is_empty() {
@@ -769,26 +790,34 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
     block = block.title_top(Line::from(dim(format!(" {shown} "))).right_aligned());
 
     if let Some(release) = app.core.selected_release() {
+        // A click on a variant picks it.
         let chosen = app.core.variant_index(release);
-        let mut spans = vec![dim(format!(" {} ", fl!("tui-variants")))];
+        let mut variants = Parts::default();
+        variants.text(dim(format!(" {} ", fl!("tui-variants"))));
         if release.variants.is_empty() {
-            spans.push(dim(format!("{} ", fl!("no-build-for-platform"))));
+            variants.text(dim(format!("{} ", fl!("no-build-for-platform"))));
         }
         for (i, variant) in release.variants.iter().enumerate() {
             let label = variant_label(&variant.name);
-            spans.push(if i == chosen {
-                Span::styled(
-                    format!(" {label} "),
-                    Style::new().fg(theme::CRUST).bg(BLUE).bold(),
-                )
+            let style = if i == chosen {
+                Style::new().fg(theme::CRUST).bg(BLUE).bold()
             } else {
-                Span::styled(format!(" {label} "), Style::new().fg(SUBTEXT))
-            });
+                Style::new().fg(SUBTEXT)
+            };
+            variants.button(
+                [Span::styled(format!(" {label} "), style)],
+                Some(Target::Variant(i)),
+            );
         }
         if release.variants.len() > 1 {
-            spans.push(dim(format!(" v {} ", fl!("key-next"))));
+            let next = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+            variants.button(
+                [dim(format!(" v {} ", fl!("key-next")))],
+                Some(Target::PaneKey(Pane::Releases, next)),
+            );
         }
-        block = block.title_bottom(Line::from(spans));
+        variants.title(&app.hits, area, TitlePosition::Bottom, Alignment::Left);
+        block = block.title_bottom(variants.line());
     }
 
     if app.core.releases.is_empty() {
@@ -816,7 +845,8 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let viewport = usize::from(block.inner(area).height.saturating_sub(1));
+    let inner = block.inner(area);
+    let viewport = usize::from(inner.height.saturating_sub(1));
     let rows: Vec<Row> = app
         .core
         .visible()
@@ -889,6 +919,12 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.core.release_state);
+    app.hits.rows(
+        Pane::Releases,
+        area,
+        below(inner, 1),
+        (total, app.core.release_state.offset(), 1),
+    );
     theme::scrollbar(
         frame,
         area,
@@ -898,6 +934,7 @@ fn draw_releases(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Installed));
     let focused = app.core.focus == CoreFocus::Installed;
     let total: u64 = app.core.installed.iter().map(|c| c.size).sum();
     let block = panel(
@@ -920,6 +957,7 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
         );
         return;
     }
+    let inner = block.inner(area);
     let rows: Vec<Row> = app
         .core
         .installed
@@ -985,6 +1023,16 @@ fn draw_installed(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(focused))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.core.installed_state);
+    app.hits.rows(
+        Pane::Installed,
+        area,
+        below(inner, 1),
+        (
+            app.core.installed.len(),
+            app.core.installed_state.offset(),
+            1,
+        ),
+    );
     theme::scrollbar(
         frame,
         area,

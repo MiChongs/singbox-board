@@ -8,16 +8,17 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, TableState, TitlePosition};
 
 use super::app::{App, PendingAction, Popup, move_table};
+use super::mouse::{Pane, Parts, Target, below};
 use super::popup::{Input, InputPurpose};
 use super::theme::{
     ACCENT, BLUE, DIM, DOWN, GREEN, MARK, PEACH, RED, SKY, SPINNER, SUBTEXT, SURFACE2, TEXT, UP,
-    YELLOW, card, chip, dim, header_row, label, panel, pill, scrollbar,
+    YELLOW, card, chip, dim, header_row, label, pane_keys, panel, pill, scrollbar,
 };
 use crate::clash::Connection;
 use crate::i18n::fl;
@@ -227,6 +228,18 @@ impl ConnectionsView {
         self.arrange(keep);
     }
 
+    /// Sorts by `key`, or reverses the order when it already sorts by it.
+    pub fn sort_by(&mut self, key: SortKey) {
+        if self.sort == key {
+            self.toggle_reverse();
+            return;
+        }
+        let keep = self.selected().map(|c| c.id.clone());
+        self.sort = key;
+        self.reverse = false;
+        self.arrange(keep);
+    }
+
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused
@@ -407,8 +420,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
         draw_stats(frame, stats_area, app);
     }
     draw_table(frame, table_area, app);
-    if let Some((left, right)) = details {
-        draw_details(frame, details_area, left, right);
+    if let Some(details) = details {
+        draw_details(frame, details_area, app, details);
     }
 }
 
@@ -771,6 +784,17 @@ impl Column {
         }
     }
 
+    /// The order a click on the column's header sorts by.
+    fn sort(self) -> Option<SortKey> {
+        match self {
+            Column::Target => Some(SortKey::Host),
+            Column::DownRate | Column::UpRate => Some(SortKey::Rate),
+            Column::Download | Column::Upload => Some(SortKey::Traffic),
+            Column::Age => Some(SortKey::Newest),
+            _ => None,
+        }
+    }
+
     fn numeric(self) -> bool {
         matches!(
             self,
@@ -863,6 +887,7 @@ fn cell(app: &App, c: &Connection, column: Column, width: usize) -> Cell<'static
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Connections));
     let view = &app.connections;
     let title = if view.filter.is_empty() {
         fl!("tui-panel-connections", count = view.list.len())
@@ -873,28 +898,39 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
             count = view.list.len()
         )
     };
-    let mut status = vec![Span::raw(" ")];
+    // The badges press the keys that change them.
+    let press = |c: char| Some(Target::Key(KeyEvent::from(KeyCode::Char(c))));
+    let mut status = Parts::default();
+    status.text(Span::raw(" "));
     if view.paused {
-        status.push(pill(fl!("conn-paused"), YELLOW));
-        status.push(Span::raw(" "));
+        status.button([pill(fl!("conn-paused"), YELLOW)], press('p'));
+        status.text(Span::raw(" "));
     }
     if !view.filter.is_empty() {
-        status.push(chip(
-            fl!("conn-filter-label", filter = view.filter.clone()),
-            YELLOW,
-        ));
-        status.push(Span::raw(" "));
+        status.button(
+            [chip(
+                fl!("conn-filter-label", filter = view.filter.clone()),
+                YELLOW,
+            )],
+            press('/'),
+        );
+        status.text(Span::raw(" "));
     }
     let arrow = if view.sort.descending() != view.reverse {
         "▼"
     } else {
         "▲"
     };
-    status.push(dim(format!(
-        "{} {arrow} ",
-        fl!("conn-sort-label", key = view.sort.label())
-    )));
-    let mut block = panel(&title, true).title_top(Line::from(status).right_aligned());
+    status.button(
+        [dim(format!(
+            "{} {arrow}",
+            fl!("conn-sort-label", key = view.sort.label())
+        ))],
+        press('o'),
+    );
+    status.text(Span::raw(" "));
+    status.title(&app.hits, area, TitlePosition::Top, Alignment::Right);
+    let mut block = panel(&title, true).title_top(status.line().right_aligned());
     if let Some(index) = view.state.selected().filter(|_| !view.rows.is_empty()) {
         block = block.title_bottom(
             Line::from(dim(format!(" {} / {} ", index + 1, view.rows.len()))).right_aligned(),
@@ -944,6 +980,16 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
             )
         })
         .collect();
+    // A click on a header sorts by its column. The table puts the columns
+    // after the highlight mark, a space apart.
+    let mut x = inner.x + u16::from(view.state.selected().is_some());
+    for (column, width) in columns.iter().zip(&widths) {
+        if let Some(key) = column.sort() {
+            let header = Rect::new(x, inner.y, *width, 1).intersection(inner);
+            app.hits.add(header, Target::Sort(key));
+        }
+        x = x.saturating_add(width + 1);
+    }
     let table = Table::new(rows, widths.iter().map(|&w| Constraint::Length(w)))
         .header(Row::new(columns.iter().map(|c| Cell::from(c.header()))).style(header_row()))
         .block(block)
@@ -952,6 +998,12 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     let total = view.rows.len();
     frame.render_stateful_widget(table, area, &mut app.connections.state);
+    app.hits.rows(
+        Pane::Connections,
+        area,
+        below(inner, 1),
+        (total, app.connections.state.offset(), 1),
+    );
     scrollbar(
         frame,
         area,
@@ -1166,20 +1218,18 @@ fn detail_lines(app: &App, c: &Connection, width: u16) -> DetailLines {
     }
 }
 
-fn draw_details(
-    frame: &mut Frame,
-    area: Rect,
-    left: Vec<Line<'static>>,
-    right: Vec<Line<'static>>,
-) {
-    let hint = format!(
-        " ⏎ {}  y {}  d {} ",
-        fl!("key-hide"),
-        fl!("key-copy-target"),
-        fl!("key-close")
+fn draw_details(frame: &mut Frame, area: Rect, app: &App, (left, right): DetailLines) {
+    let hints = pane_keys(
+        None,
+        &[
+            ("⏎", fl!("key-hide")),
+            ("y", fl!("key-copy-target")),
+            ("d", fl!("key-close")),
+        ],
     );
-    let block = panel(&fl!("tui-panel-connection-details"), false)
-        .title_top(Line::from(dim(hint)).right_aligned());
+    hints.title(&app.hits, area, TitlePosition::Top, Alignment::Right);
+    let block =
+        panel(&fl!("tui-panel-connection-details"), false).title_top(hints.line().right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if right.is_empty() {

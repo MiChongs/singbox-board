@@ -6,11 +6,11 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, TitlePosition, Wrap,
 };
 use serde_json::Value;
 
@@ -19,11 +19,12 @@ use super::code::{self, CodeEditor};
 use super::editor::{
     Editor, InsertTarget, Path, Seg, display_path, get, index_of, is_container, parse_scalar,
 };
+use super::mouse::{Pane, Target, below};
 use super::popup::{ExternalEdit, Input, InputPurpose, Menu, MenuAction, MenuItem, ProfileAction};
 use super::templates;
 use super::theme::{
     self, ACCENT, BLUE, DIM, GREEN, MARK, PEACH, RED, SKY, SUBTEXT, TEXT, YELLOW, chip, dim, field,
-    panel, selected,
+    pane_keys, panel, selected,
 };
 use crate::i18n::fl;
 use crate::profile::{self, Summary, interval_label, item_label, local_time, usage_label};
@@ -381,7 +382,7 @@ impl App {
         }
     }
 
-    fn profiles_move(&mut self, len: usize, delta: isize) {
+    pub(super) fn profiles_move(&mut self, len: usize, delta: isize) {
         if len == 0 {
             return;
         }
@@ -1329,16 +1330,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.hits.add(area, Target::Pane(Pane::Profiles));
     let count = app.profiles.profiles().len();
-    let block = panel(&fl!("tui-panel-profiles", count = count), true).title_top(
-        Line::from(dim(format!(
-            " ⏎ {}  n {}  i {} ",
-            fl!("key-actions"),
-            fl!("key-new"),
-            fl!("key-import")
-        )))
-        .right_aligned(),
+    let hints = pane_keys(
+        None,
+        &[
+            ("⏎", fl!("key-actions")),
+            ("n", fl!("key-new")),
+            ("i", fl!("key-import")),
+        ],
     );
+    hints.title(&app.hits, area, TitlePosition::Top, Alignment::Right);
+    let block = panel(&fl!("tui-panel-profiles", count = count), true)
+        .title_top(hints.line().right_aligned());
+    let inner = block.inner(area);
     if count == 0 {
         let text = match (&app.profiles.error, &app.profiles.list) {
             (Some(err), _) => Line::from(Span::styled(err.clone(), Style::new().fg(RED))),
@@ -1413,6 +1418,12 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(selected(true))
     .highlight_symbol(Span::styled(MARK, Style::new().fg(ACCENT)));
     frame.render_stateful_widget(table, area, &mut app.profiles.state);
+    app.hits.rows(
+        Pane::Profiles,
+        area,
+        below(inner, 1),
+        (count, app.profiles.state.offset(), 1),
+    );
     theme::scrollbar(
         frame,
         area,
@@ -1670,6 +1681,7 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let [tree_area, detail_area] =
         Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(area);
+    app.hits.add(tree_area, Target::Pane(Pane::Tree));
     let rows = editor.rows();
     let mut title = format!(
         "{} · {}",
@@ -1710,6 +1722,20 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .editor_state
         .select(if rows.is_empty() { None } else { Some(cursor) });
     frame.render_stateful_widget(list, tree_area, &mut app.profiles.editor_state);
+    let offset = app.profiles.editor_state.offset();
+    let inner = tree_area.inner(Margin::new(1, 1));
+    app.hits
+        .rows(Pane::Tree, tree_area, inner, (rows.len(), offset, 1));
+    // The ▸ and ▾ of containers open and close them; they come after the
+    // padding, the highlight mark and the indentation.
+    let marker = inner.x + 2;
+    for (y, (index, row)) in (inner.y..inner.bottom()).zip(rows.iter().enumerate().skip(offset)) {
+        if get(&editor.root, &row.path).is_some_and(is_container) {
+            let x = marker.saturating_add((2 * row.depth).min(usize::from(inner.width)) as u16);
+            let fold = Rect::new(x, y, 2, 1).intersection(inner);
+            app.hits.add(fold, Target::Fold(index));
+        }
+    }
     theme::scrollbar(
         frame,
         tree_area,

@@ -8,6 +8,7 @@ mod containers;
 mod core;
 mod editor;
 mod jsonc;
+mod mouse;
 mod popup;
 mod profiles;
 mod tasks;
@@ -23,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind, MouseEventKind,
 };
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
 use futures::StreamExt;
@@ -99,14 +100,22 @@ async fn event_loop(
     }
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut redraw = true;
 
     while !app.should_quit {
         set_mouse(mouse, app.wants_mouse());
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        if redraw {
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        }
+        redraw = true;
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
                 Some(Ok(Event::Paste(text))) => app.on_paste(&text),
+                // The Windows console reports every move; nothing changes.
+                Some(Ok(Event::Mouse(event))) if event.kind == MouseEventKind::Moved => {
+                    redraw = false
+                }
                 Some(Ok(Event::Mouse(event))) => app.on_mouse(event),
                 Some(Ok(_)) => {}
                 Some(Err(err)) => return Err(err.into()),
@@ -143,24 +152,36 @@ async fn event_loop(
     Ok(app.take_exit_message())
 }
 
-/// Turns mouse reporting on or off: clicks, drags and the wheel, but not
-/// plain motion, which would only cost redraws.
+/// Turns mouse reporting on or off.
 fn set_mouse(on: &mut bool, want: bool) {
-    if *on == want {
-        return;
+    if *on != want && mouse_capture(want).is_ok() {
+        *on = want;
     }
-    let sequence = if want {
+}
+
+/// Clicks, drags and the wheel, but not plain motion, which would only
+/// cost redraws.
+#[cfg(unix)]
+fn mouse_capture(on: bool) -> std::io::Result<()> {
+    let sequence = if on {
         "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
     } else {
         "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
     };
     let mut stdout = std::io::stdout();
-    if stdout
-        .write_all(sequence.as_bytes())
-        .and_then(|()| stdout.flush())
-        .is_ok()
-    {
-        *on = want;
+    stdout.write_all(sequence.as_bytes())?;
+    stdout.flush()
+}
+
+/// The console reports the mouse in its input records once its mode
+/// says so, which crossterm sets (and restores) instead of sequences.
+#[cfg(windows)]
+fn mouse_capture(on: bool) -> std::io::Result<()> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    if on {
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+    } else {
+        crossterm::execute!(std::io::stdout(), DisableMouseCapture)
     }
 }
 

@@ -13,6 +13,7 @@ use ratatui::widgets::{
     Block, BorderType, LineGauge, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow,
 };
 
+use super::mouse::{Pane, Parts, Target, hint_key};
 use crate::protocol::CoreState;
 use crate::util::pad;
 
@@ -151,18 +152,44 @@ pub fn dialog(title: &str, color: Color) -> Block<'static> {
         )
 }
 
-/// `k text` pairs for the bottom border of a dialog.
-pub fn dialog_keys(keys: &[(&str, String)]) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
+/// `k text` pairs for the bottom border of a dialog; a click on one
+/// presses its key.
+pub fn dialog_keys(keys: &[(&str, String)]) -> Parts {
+    let mut parts = Parts::default();
+    parts.text(Span::raw(" "));
     for (i, (k, text)) in keys.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("  "));
+            parts.text(Span::raw("  "));
         }
-        spans.push(key(k));
-        spans.push(Span::styled(format!(" {text}"), Style::new().fg(SUBTEXT)));
+        parts.button(
+            [
+                key(k),
+                Span::styled(format!(" {text}"), Style::new().fg(SUBTEXT)),
+            ],
+            hint_key(k).map(Target::Key),
+        );
     }
-    spans.push(Span::raw(" "));
-    Line::from(spans).right_aligned()
+    parts.text(Span::raw(" "));
+    parts
+}
+
+/// Quiet `k text` pairs for the top border of a pane; a click on one
+/// focuses the pane and presses its key.
+pub fn pane_keys(pane: Option<Pane>, keys: &[(&str, String)]) -> Parts {
+    let mut parts = Parts::default();
+    parts.text(Span::raw(" "));
+    for (i, (k, text)) in keys.iter().enumerate() {
+        if i > 0 {
+            parts.text(Span::raw("  "));
+        }
+        let target = hint_key(k).map(|key| match pane {
+            Some(pane) => Target::PaneKey(pane, key),
+            None => Target::Key(key),
+        });
+        parts.button([dim(format!("{k} {text}"))], target);
+    }
+    parts.text(Span::raw(" "));
+    parts
 }
 
 /// Fades everything drawn so far, so that a dialog drawn next stands out.

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::widgets::{ListState, TableState};
 use tokio::sync::{Notify, watch};
@@ -16,6 +16,7 @@ use super::containers::{
     ContainerContentPurpose, ContainerSavePurpose, ContainersView, ShellCommand,
 };
 use super::core::CoreView;
+use super::mouse::{Click, Hits, Target};
 use super::popup::{
     ExternalEdit, Input, InputOutcome, InputPurpose, Menu, MenuAction, MenuItem, MenuOutcome,
 };
@@ -332,6 +333,15 @@ pub struct App {
     pub busy: Vec<(u64, String)>,
     next_action: u64,
     pub frame: usize,
+
+    /// Whether the dashboard takes the mouse (`M` hands it back to the
+    /// terminal for selecting text).
+    pub(super) mouse: bool,
+    /// What the frame on screen does where it is clicked.
+    pub(super) hits: Hits,
+    pub(super) last_click: Option<Click>,
+    /// The scrollbar a drag started on.
+    pub(super) dragging: Option<Target>,
 }
 
 impl App {
@@ -393,6 +403,10 @@ impl App {
             busy: Vec::new(),
             next_action: 0,
             frame: 0,
+            mouse: true,
+            hits: Hits::default(),
+            last_click: None,
+            dragging: None,
         };
         (app, background)
     }
@@ -730,6 +744,7 @@ impl App {
             KeyCode::Char('c') => self.daemon_action(&fl!("busy-checking"), Request::Check),
             KeyCode::Char('u') => self.check_update(),
             KeyCode::Char('m') => self.cycle_mode(),
+            KeyCode::Char('M') => self.toggle_mouse(),
             _ => match self.tab {
                 Tab::Overview => {}
                 Tab::Proxies => self.on_proxies_key(key),
@@ -741,6 +756,11 @@ impl App {
                 Tab::Containers => self.containers_on_key(key),
             },
         }
+        self.tab_opened();
+    }
+
+    /// Loads what the open tab shows the first time it is opened.
+    pub(super) fn tab_opened(&mut self) {
         match self.tab {
             Tab::Core => self.core_tab_opened(),
             Tab::Profiles => self.profiles_tab_opened(),
@@ -792,20 +812,6 @@ impl App {
                 }
             }
         }
-    }
-
-    pub fn on_mouse(&mut self, event: MouseEvent) {
-        if self.popup.is_none() && self.code_active() {
-            self.code_on_mouse(event);
-        } else if self.popup.is_none() && self.toml_active() {
-            self.toml_on_mouse(event);
-        }
-    }
-
-    /// The editors use the mouse; elsewhere the terminal keeps it for
-    /// selecting text.
-    pub fn wants_mouse(&self) -> bool {
-        self.code_active() || self.toml_active()
     }
 
     /// Starts with one profile open in the editor and quits when it closes.
@@ -1161,7 +1167,7 @@ impl App {
         self.clipboard.take()
     }
 
-    fn move_proxy_cursor(&mut self, delta: isize) {
+    pub(super) fn move_proxy_cursor(&mut self, delta: isize) {
         match self.focus {
             Focus::Groups => {
                 let len = self.groups.len();

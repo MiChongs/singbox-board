@@ -3,6 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
 
 use super::code::CodeCommand;
 use super::containers::{ContainerMenu, ContainersGlobal};
@@ -93,6 +94,20 @@ impl Input {
     /// The text before and after the cursor.
     pub fn split(&self) -> (&str, &str) {
         self.value.split_at(self.byte(self.cursor))
+    }
+
+    /// Puts the cursor on the character drawn `column` columns after the
+    /// start of the text, or after the text.
+    pub fn click(&mut self, column: u16) {
+        let mut width = 0;
+        self.cursor = self
+            .value
+            .chars()
+            .position(|c| {
+                width += c.width().unwrap_or(0);
+                width > usize::from(column)
+            })
+            .unwrap_or_else(|| self.value.chars().count());
     }
 
     /// Inserts pasted text; line breaks become spaces in a one-line field.
@@ -376,5 +391,22 @@ mod tests {
         input.paste("a\u{3000}b");
         input.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(input.value, "a\u{3000}");
+    }
+
+    #[test]
+    fn clicks_put_the_cursor_on_a_character() {
+        let mut input =
+            Input::new(String::new(), String::new(), InputPurpose::Search).value("a配置b");
+        input.click(0);
+        assert_eq!(input.cursor, 0);
+        // Both columns of a wide character are that character.
+        input.click(2);
+        assert_eq!(input.cursor, 1);
+        input.click(3);
+        assert_eq!(input.cursor, 2);
+        input.click(5);
+        assert_eq!(input.cursor, 3);
+        input.click(40);
+        assert_eq!(input.cursor, 4);
     }
 }
